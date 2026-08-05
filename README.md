@@ -277,21 +277,6 @@ cargo test --workspace
   variant in `smith-core/src/event.rs`, an emitter in `agent.rs` or `main.rs`,
   and a handler arm in `smith-tui/src/app.rs::on_agent_event`.
 
-## Roadmap
-
-Done: multi-provider streaming chat, built-in file + shell + web tools,
-permission model, SQLite session persistence, MCP client, markdown rendering,
-and the `/model`, `/permission`, `/usage`, `/plan`, `/goal`, `/loop` commands.
-
-Next up:
-
-- [ ] `/kanban` — todo/doing/done board tied to `/goal` and `/plan`
-- [ ] `/ultraplan` — deep multi-step planning producing a persistent artifact
-
-Known gaps: MCP tool calls use a fixed 30s timeout with no cancellation of the
-underlying server process on repeated timeouts; LaTeX math renders as literal
-delimiters in the terminal.
-
 ## License
 
 [MIT](LICENSE) © Pedro Canedo
