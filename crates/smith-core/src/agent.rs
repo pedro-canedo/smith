@@ -17,7 +17,7 @@ use crate::event::{
     TaskStatus, TurnLimitKind, UserQuestion,
 };
 use crate::message::{
-    CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent, Usage,
+    CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition, Usage,
 };
 use crate::permission_detail::format_permission_detail;
 use crate::provider::{LlmProvider, ProviderError};
@@ -357,6 +357,15 @@ pub struct Agent {
     /// next real message has none of that risk and reaches the model at
     /// exactly the same moment.
     pending_notes: Vec<String>,
+    /// How many reasoning tags [`ReasoningFilter`] has removed from this
+    /// session's replies.
+    ///
+    /// The reasoning itself is discarded rather than surfaced — there is no
+    /// `AgentEvent` for it yet, and inventing one is a bigger change than
+    /// "stop corrupting the transcript" warrants. Counting it is the honest
+    /// minimum: the fact that a model is reasoning in the text channel is
+    /// observable, and whoever adds a thinking pane later has the hook.
+    reasoning_tags_stripped: u32,
 }
 
 impl Agent {
@@ -393,6 +402,7 @@ impl Agent {
             checkpointer: None,
             turn_seq: None,
             pending_notes: Vec::new(),
+            reasoning_tags_stripped: 0,
         }
     }
 
@@ -707,19 +717,26 @@ impl Agent {
         &self.tool_ctx
     }
 
+    /// Reasoning tags removed from this session's replies — see the field.
+    /// Non-zero means the model is emitting `<think>` blocks in its text
+    /// channel and they were kept out of the transcript.
+    pub fn reasoning_tags_stripped(&self) -> u32 {
+        self.reasoning_tags_stripped
+    }
+
     /// If `message` is a single, otherwise-final text reply that's actually a
     /// tool call in disguise — `{"name": ..., "arguments": {...}}` or the flat
-    /// `{"action": "<tool>", ...}` form, naming a *known* tool specifically,
-    /// not just JSON-shaped text — rebuild it as a real `ToolUse` so the
-    /// normal tool-execution path picks it up. `None` for anything that
-    /// doesn't match, which is the overwhelming majority of replies — this
-    /// only exists for providers/models that fall back to printing the call
-    /// instead of using the structured channel.
+    /// `{"action": "<tool>", ...}` form, resolving to exactly one *registered*
+    /// tool via [`resolve_tool_name`], not just JSON-shaped text — rebuild it
+    /// as a real `ToolUse` so the normal tool-execution path picks it up.
+    /// `None` for anything that doesn't match, which is the overwhelming
+    /// majority of replies — this only exists for providers/models that fall
+    /// back to printing the call instead of using the structured channel.
     fn recover_text_tool_call(&self, message: &Message) -> Option<Message> {
         let [ContentBlock::Text { text }] = message.content.as_slice() else {
             return None;
         };
-        let known: HashSet<String> = self.tools.tool_defs().into_iter().map(|d| d.name).collect();
+        let known = self.tools.tool_defs();
         let (name, arguments, before, after) = find_fallback_tool_call(text, &known)?;
 
         let mut content = Vec::new();
@@ -880,15 +897,21 @@ impl Agent {
                 }
             };
 
-            let (mut assistant_message, mut stop_reason, usage) =
-                match consume_stream(stream, &events, cancel.clone()).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
-                        let _ = events.send(AgentEvent::Error(e));
-                        return false;
-                    }
-                };
+            let outcome = match consume_stream(stream, &events, cancel.clone()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
+                    let _ = events.send(AgentEvent::Error(e));
+                    return false;
+                }
+            };
+            let StreamOutcome {
+                message: mut assistant_message,
+                mut stop_reason,
+                usage,
+                reasoning_tags_stripped,
+            } = outcome;
+            self.reasoning_tags_stripped += reasoning_tags_stripped;
 
             // Some local models (small/quantized ones especially) don't
             // reliably use the provider's structured tool-calling channel —
@@ -1225,11 +1248,14 @@ impl Agent {
             }
         }
 
-        let (message, stop_reason, usage) = result?;
-        if stop_reason == StopReason::Cancelled {
+        let outcome = result?;
+        if outcome.stop_reason == StopReason::Cancelled {
             return Err("compaction cancelled".to_string());
         }
-        let text = message.text();
+        // Reasoning stripped out of a *summary* is deliberately not counted:
+        // the counter reports on what the user's own turns produced, and this
+        // request is internal plumbing they never see.
+        let (text, usage) = (outcome.message.text(), outcome.usage);
         if text.trim().is_empty() {
             return Err("the summarising request returned no text".to_string());
         }
@@ -1627,7 +1653,7 @@ pub fn parse_tasks(input: &serde_json::Value) -> Result<Vec<Task>, String> {
 /// braces inside string values.
 fn find_fallback_tool_call(
     text: &str,
-    known_tools: &HashSet<String>,
+    known_tools: &[ToolDefinition],
 ) -> Option<(String, serde_json::Value, String, String)> {
     for (i, byte) in text.bytes().enumerate() {
         if byte != b'{' {
@@ -1662,29 +1688,32 @@ fn find_fallback_tool_call(
 ///    `{"action": "web_search", "query": "terms"}`. Small local models follow
 ///    a single flat object far more reliably than a nested one, and it is the
 ///    shape the system prompt asks for by name.
+///
+/// The name is matched through [`resolve_tool_name`] rather than compared
+/// byte-for-byte, and the arguments through [`align_arguments`] — a model weak
+/// enough to print its call as text is usually also weak enough to get the
+/// spelling of the name and the keys slightly wrong.
 fn parse_tool_call_envelope(
     value: &serde_json::Value,
-    known_tools: &HashSet<String>,
+    known_tools: &[ToolDefinition],
 ) -> Option<(String, serde_json::Value)> {
     let named = value.get("name").and_then(|v| v.as_str());
     let arguments = value.get("arguments").filter(|v| v.is_object());
     if let (Some(name), Some(arguments)) = (named, arguments) {
-        if known_tools.contains(name) {
-            return Some((name.to_string(), arguments.clone()));
+        if let Some(def) = resolve_tool_name(name, known_tools) {
+            return Some((def.name.clone(), align_arguments(def, arguments.clone())));
         }
     }
 
     let name = value.get("action").and_then(|v| v.as_str())?;
-    if !known_tools.contains(name) {
-        return None;
-    }
+    let def = resolve_tool_name(name, known_tools)?;
     let fields = value.as_object()?;
     // `{"action": "x", "arguments": {...}}` is the two envelopes crossed, and
     // a model that emits it means the inner object — not a lone `arguments`
     // key as the argument itself.
     if fields.len() == 2 {
         if let Some(arguments) = fields.get("arguments").filter(|v| v.is_object()) {
-            return Some((name.to_string(), arguments.clone()));
+            return Some((def.name.clone(), align_arguments(def, arguments.clone())));
         }
     }
     let arguments = fields
@@ -1692,7 +1721,372 @@ fn parse_tool_call_envelope(
         .filter(|(key, _)| key.as_str() != "action")
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    Some((name.to_string(), serde_json::Value::Object(arguments)))
+    Some((
+        def.name.clone(),
+        align_arguments(def, serde_json::Value::Object(arguments)),
+    ))
+}
+
+/// Shortest fragment of a name we will accept as a prefix/suffix of a
+/// registered tool. Three characters (`run`, `web`, `ask`) carry too little
+/// signal to be worth the risk of dispatching the wrong tool off them.
+const MIN_PARTIAL_TOOL_NAME: usize = 4;
+
+/// Folds a name to the form the match is made on: ASCII lowercase, with every
+/// run of non-alphanumerics collapsed to a single `_` and camelCase humps
+/// treated as the same boundary. `Web-Search`, `WEB_SEARCH`, `web search` and
+/// `webSearch` all become `web_search`.
+///
+/// Splitting on case is a deterministic rewrite of the *same* identifier, not
+/// a similarity judgement — which is the line this whole module draws.
+fn normalize_ident(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev: Option<char> = None;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            let hump = ch.is_ascii_uppercase()
+                && prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit());
+            if hump && !out.ends_with('_') {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+        prev = Some(ch);
+    }
+    out.trim_matches('_').to_string()
+}
+
+/// Whether `want` is a whole leading or trailing *segment* of `name` — the
+/// only partial match we accept. Anchoring on `_` boundaries is what keeps
+/// `earch` from reaching `web_search` while letting `search` through.
+fn is_segment_affix(name: &str, want: &str) -> bool {
+    name.strip_prefix(want).is_some_and(|r| r.starts_with('_'))
+        || name.strip_suffix(want).is_some_and(|r| r.ends_with('_'))
+}
+
+/// Maps the tool name a model *wrote* in a text envelope onto a registered
+/// tool, in three widening passes. This decides which tool runs, so an
+/// ambiguous or unrecognised name resolves to `None` — never to a best guess.
+///
+/// 1. Exact. The overwhelming majority, and free.
+/// 2. Equal after [`normalize_ident`]. Case, hyphens and spaces are
+///    presentation, not identity: no two tools can differ only in them without
+///    already being indistinguishable to a user, and the ambiguity check below
+///    covers the case where a registry somehow does contain both.
+/// 3. A whole-segment prefix or suffix, and only when exactly one registered
+///    tool matches — `search` → `web_search`. This is the case actually
+///    observed in the wild (a model writing the bare verb). Two candidates —
+///    `write` against both `write_file` and `write_tasks` — must fail rather
+///    than pick one, because picking is how the wrong side effect happens.
+///
+/// Edit-distance/fuzzy matching is deliberately *not* a fourth pass. Its whole
+/// premise is that a close-enough name is the right name, which is exactly the
+/// judgement that must not be made here: at distance 2, `run_bash` is reachable
+/// from names that have nothing to do with running a shell, and the cost of a
+/// false positive (an arbitrary tool executing) is unbounded while the benefit
+/// (recovering from a typo no observed model actually makes) is small.
+fn resolve_tool_name<'a>(written: &str, known: &'a [ToolDefinition]) -> Option<&'a ToolDefinition> {
+    if let Some(def) = known.iter().find(|d| d.name == written) {
+        return Some(def);
+    }
+
+    let want = normalize_ident(written);
+    if want.is_empty() {
+        return None;
+    }
+
+    let mut normalized = known.iter().filter(|d| normalize_ident(&d.name) == want);
+    if let Some(first) = normalized.next() {
+        // Anything reaching here is decided by this pass alone: a second
+        // candidate is an ambiguity, not an invitation to keep looking.
+        return normalized.next().is_none().then_some(first);
+    }
+
+    if want.len() < MIN_PARTIAL_TOOL_NAME {
+        return None;
+    }
+    let mut affixes = known
+        .iter()
+        .filter(|d| is_segment_affix(&normalize_ident(&d.name), &want));
+    let first = affixes.next()?;
+    affixes.next().is_none().then_some(first)
+}
+
+/// Renames arguments the model invented onto the property names the tool
+/// actually declares — `max_results` onto `num_results` — using the same
+/// unique-or-nothing discipline as [`resolve_tool_name`].
+///
+/// Unknown keys are **passed through**, never dropped. Dropping is the one
+/// option that silently changes what the call means: a tool that would have
+/// rejected `{"path": "/", "recursive": true}` instead runs the unqualified
+/// version. A tool's own input validation is the right place to refuse a key
+/// it doesn't understand, and it can only do that if it sees it.
+///
+/// The renaming is driven entirely by the schema each tool publishes, so it
+/// stays in this layer — `smith-tools` needs no per-tool alias table, and MCP
+/// tools nobody here has heard of get the same treatment.
+fn align_arguments(def: &ToolDefinition, arguments: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(fields) = arguments else {
+        return arguments;
+    };
+    let Some(declared) = def
+        .input_schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+    else {
+        return serde_json::Value::Object(fields);
+    };
+
+    // Trailing segment rather than any segment: the last word of an argument
+    // name is what carries its meaning (`max_results` and `num_results` are the
+    // same thing), while a shared *leading* word usually marks two genuinely
+    // different arguments (`file_path` vs `file_mode`).
+    let tail = |name: &str| {
+        normalize_ident(name)
+            .rsplit('_')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let names: Vec<&String> = declared.keys().collect();
+    let unique = |predicate: &dyn Fn(&str) -> bool| {
+        let mut matched = names.iter().filter(|d| predicate(d));
+        let first = matched.next()?;
+        matched.next().is_none().then(|| (*first).clone())
+    };
+
+    let supplied: HashSet<&String> = fields.keys().collect();
+    let mut aliased: Vec<(String, String)> = Vec::new();
+    for key in fields.keys() {
+        if declared.contains_key(key) {
+            continue;
+        }
+        let normalized = normalize_ident(key);
+        let want_tail = tail(key);
+        let target = unique(&|d| normalize_ident(d) == normalized).or_else(|| {
+            (!want_tail.is_empty())
+                .then(|| unique(&|d| tail(d) == want_tail))
+                .flatten()
+        });
+        // An alias never displaces a key the model also supplied correctly,
+        // and two aliases never race for the same target — in both cases the
+        // rename is ambiguous, so the key stays as written.
+        if let Some(target) = target {
+            if !supplied.contains(&target) && !aliased.iter().any(|(_, t)| *t == target) {
+                aliased.push((key.clone(), target));
+            }
+        }
+    }
+
+    let mut aligned = fields;
+    for (from, to) in aliased {
+        if let Some(value) = aligned.remove(&from) {
+            aligned.insert(to, value);
+        }
+    }
+    serde_json::Value::Object(aligned)
+}
+
+/// Reasoning markup a model may emit in the *text* channel when the provider
+/// exposes no separate reasoning stream — the shape every open reasoning
+/// fine-tune has converged on.
+const REASONING_TAGS: [&str; 3] = ["think", "thinking", "reasoning"];
+
+/// What [`ReasoningFilter::scan_tag`] made of the `<` it is sitting on.
+enum TagScan {
+    /// The buffer ends mid-candidate; hold it and wait for the next delta.
+    Incomplete,
+    /// Ordinary text that merely starts with `<`.
+    NotATag,
+    Tag {
+        len: usize,
+        open: bool,
+    },
+}
+
+/// Removes `<think>`/`<thinking>`/`<reasoning>` blocks from a *streamed* text
+/// channel, so reasoning never reaches the transcript, history, or the next
+/// request's prompt.
+///
+/// It lives here, in the one funnel every provider's text deltas pass through,
+/// rather than in each adapter. The leak is a property of the *model*, not of
+/// the wire format: the same weights served over Ollama, an OpenAI-compatible
+/// proxy, or anything else emit the same tags, so a per-adapter fix would have
+/// to be written once per adapter and would still miss the next one. Providers
+/// that do have a real reasoning channel are unaffected — they never put the
+/// tags in the text channel in the first place.
+///
+/// Two rules keep it from eating legitimate text, and both fail *open* (a tag
+/// survives) rather than closed (prose is deleted):
+///
+/// - Nothing inside a ``` fenced block is markup, and neither is a tag
+///   immediately preceded by a backtick — which is how a document about
+///   reasoning tags, including this codebase's own, writes them.
+/// - A closing tag with no opener removes only the tag. The opener is usually
+///   lost upstream (consumed as a role marker by a chat template), so the
+///   surrounding text is the model's real output and deleting it back to the
+///   start of the message would throw away the reply.
+struct ReasoningFilter {
+    /// Text held back because it may be the start of a tag or fence marker
+    /// that continues in the next delta.
+    buf: String,
+    /// Open blocks. Counted rather than a flag so a nested tag can't close the
+    /// outer block early.
+    depth: u32,
+    in_fence: bool,
+    at_line_start: bool,
+    /// Last raw character consumed, for the backtick check.
+    prev: Option<char>,
+    /// Tags removed so far — reported so a caller can note that reasoning was
+    /// dropped rather than silently losing the fact.
+    stripped: u32,
+}
+
+impl ReasoningFilter {
+    fn new() -> Self {
+        Self {
+            buf: String::new(),
+            depth: 0,
+            in_fence: false,
+            at_line_start: true,
+            prev: None,
+            stripped: 0,
+        }
+    }
+
+    /// Feeds one streamed delta; returns the part safe to emit now.
+    fn push(&mut self, delta: &str) -> String {
+        self.buf.push_str(delta);
+        self.drain(false)
+    }
+
+    /// Flushes at end of stream. Anything still inside an unclosed block is
+    /// dropped: the model marked it as reasoning itself, and a truncated
+    /// thought is the least useful thing that could reach the transcript. If
+    /// that empties the message, `run_turn`'s empty-turn retry picks it up.
+    fn finish(&mut self) -> String {
+        self.drain(true)
+    }
+
+    fn emit(&mut self, s: &str, out: &mut String) {
+        if self.depth == 0 {
+            out.push_str(s);
+        }
+        self.advance(s);
+    }
+
+    /// Line/backtick bookkeeping, which tracks the *raw* stream — suppressed
+    /// text still moves the cursor.
+    fn advance(&mut self, s: &str) {
+        for ch in s.chars() {
+            self.at_line_start = ch == '\n' || (self.at_line_start && ch.is_whitespace());
+            self.prev = Some(ch);
+        }
+    }
+
+    fn drain(&mut self, eos: bool) -> String {
+        let buf = std::mem::take(&mut self.buf);
+        let mut out = String::new();
+        let mut cursor = 0;
+
+        while cursor < buf.len() {
+            let rest = &buf[cursor..];
+            let Some(off) = rest.find(['<', '`']) else {
+                self.emit(rest, &mut out);
+                cursor = buf.len();
+                break;
+            };
+            if off > 0 {
+                self.emit(&rest[..off], &mut out);
+                cursor += off;
+                continue;
+            }
+
+            if rest.starts_with('`') {
+                let run = rest.chars().take_while(|c| *c == '`').count();
+                if run == rest.len() && !eos {
+                    // The run may continue into the next delta and only then
+                    // reach the three that open a fence.
+                    break;
+                }
+                if run >= 3 && self.at_line_start {
+                    self.in_fence = !self.in_fence;
+                }
+                self.emit(&rest[..run], &mut out);
+                cursor += run;
+                continue;
+            }
+
+            match self.scan_tag(rest, eos) {
+                TagScan::Incomplete => break,
+                TagScan::NotATag => {
+                    self.emit("<", &mut out);
+                    cursor += 1;
+                }
+                TagScan::Tag { len, open } => {
+                    if open {
+                        self.depth += 1;
+                    } else {
+                        self.depth = self.depth.saturating_sub(1);
+                    }
+                    self.stripped += 1;
+                    // Consumed but never emitted — `advance` still runs so the
+                    // line/backtick state stays aligned with the raw stream.
+                    self.advance(&rest[..len]);
+                    cursor += len;
+                }
+            }
+        }
+
+        self.buf = buf[cursor..].to_string();
+        out
+    }
+
+    /// Classifies the `<` at the head of `rest`.
+    fn scan_tag(&self, rest: &str, eos: bool) -> TagScan {
+        if self.in_fence || self.prev == Some('`') {
+            return TagScan::NotATag;
+        }
+        let after = &rest[1..];
+        let (open, body) = match after.strip_prefix('/') {
+            Some(body) => (false, body),
+            None => (true, after),
+        };
+        let name_len = body
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(body.len());
+        let name = body[..name_len].to_ascii_lowercase();
+        // Bounded by the longest tag name, so a stray `<` can never hold the
+        // stream open indefinitely.
+        if !REASONING_TAGS.iter().any(|t| t.starts_with(&name)) {
+            return TagScan::NotATag;
+        }
+        if name_len == body.len() {
+            // Ran out of input mid-name.
+            return if eos {
+                TagScan::NotATag
+            } else {
+                TagScan::Incomplete
+            };
+        }
+        if !body[name_len..].starts_with('>') || !REASONING_TAGS.contains(&name.as_str()) {
+            return TagScan::NotATag;
+        }
+        let len = 1 + usize::from(!open) + name_len + 1;
+        TagScan::Tag { len, open }
+    }
+}
+
+/// One provider response, drained.
+struct StreamOutcome {
+    message: Message,
+    stop_reason: StopReason,
+    usage: Usage,
+    /// Reasoning tags removed from the text channel on the way through — see
+    /// [`ReasoningFilter`].
+    reasoning_tags_stripped: u32,
 }
 
 /// Drains a provider's StreamEvent stream, forwarding text deltas as AgentEvents
@@ -1708,7 +2102,7 @@ async fn consume_stream(
     >,
     events: &mpsc::UnboundedSender<AgentEvent>,
     cancel: CancellationToken,
-) -> Result<(Message, StopReason, Usage), String> {
+) -> Result<StreamOutcome, String> {
     use futures::StreamExt;
 
     let mut text = String::new();
@@ -1716,6 +2110,7 @@ async fn consume_stream(
     let mut current_tool: Option<usize> = None;
     let mut stop_reason = StopReason::EndTurn;
     let mut total_usage = Usage::default();
+    let mut reasoning = ReasoningFilter::new();
 
     loop {
         let item = tokio::select! {
@@ -1731,8 +2126,15 @@ async fn consume_stream(
         };
         match item.map_err(|e| e.to_string())? {
             StreamEvent::TextDelta(delta) => {
-                text.push_str(&delta);
-                let _ = events.send(AgentEvent::AssistantTextDelta(delta));
+                // Filtered *before* it is forwarded, not just before it is
+                // stored: the transcript is built from these deltas, so
+                // stripping only the accumulated copy would still put the tags
+                // on screen.
+                let visible = reasoning.push(&delta);
+                if !visible.is_empty() {
+                    text.push_str(&visible);
+                    let _ = events.send(AgentEvent::AssistantTextDelta(visible));
+                }
             }
             StreamEvent::ToolUseStart { id, name } => {
                 tool_uses.push((id, name, String::new()));
@@ -1758,6 +2160,18 @@ async fn consume_stream(
         }
     }
 
+    let tail = reasoning.finish();
+    if !tail.is_empty() {
+        text.push_str(&tail);
+        let _ = events.send(AgentEvent::AssistantTextDelta(tail));
+    }
+    // Removing a block leaves the blank lines that framed it. Only trimmed
+    // when something was actually removed, so an untouched reply keeps
+    // whatever whitespace the model chose.
+    if reasoning.stripped > 0 {
+        text = text.trim().to_string();
+    }
+
     let mut content = Vec::new();
     if !text.is_empty() {
         content.push(ContentBlock::Text { text });
@@ -1771,7 +2185,12 @@ async fn consume_stream(
         content.push(ContentBlock::ToolUse { id, name, input });
     }
 
-    Ok((Message::assistant(content), stop_reason, total_usage))
+    Ok(StreamOutcome {
+        message: Message::assistant(content),
+        stop_reason,
+        usage: total_usage,
+        reasoning_tags_stripped: reasoning.stripped,
+    })
 }
 
 #[cfg(test)]
@@ -2054,7 +2473,7 @@ mod tests {
 
     #[test]
     fn finds_fallback_tool_call_that_is_the_whole_message() {
-        let known: HashSet<String> = ["write_file".to_string()].into_iter().collect();
+        let known = defs(&["write_file"]);
         let text = r#"{"name": "write_file", "arguments": {"path": "a.txt", "content": "hi"}}"#;
         let (name, args, before, after) = find_fallback_tool_call(text, &known).unwrap();
         assert_eq!(name, "write_file");
@@ -2065,7 +2484,7 @@ mod tests {
 
     #[test]
     fn finds_fallback_tool_call_with_leading_prose() {
-        let known: HashSet<String> = ["write_file".to_string()].into_iter().collect();
+        let known = defs(&["write_file"]);
         let text = "Sure, I'll create that file now.\n\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\"}}";
         let (name, _args, before, after) = find_fallback_tool_call(text, &known).unwrap();
         assert_eq!(name, "write_file");
@@ -2075,14 +2494,14 @@ mod tests {
 
     #[test]
     fn ignores_json_naming_an_unregistered_tool() {
-        let known: HashSet<String> = ["write_file".to_string()].into_iter().collect();
+        let known = defs(&["write_file"]);
         let text = r#"{"name": "delete_everything", "arguments": {}}"#;
         assert!(find_fallback_tool_call(text, &known).is_none());
     }
 
     #[test]
     fn ignores_plain_text_with_no_json() {
-        let known: HashSet<String> = ["write_file".to_string()].into_iter().collect();
+        let known = defs(&["write_file"]);
         assert!(find_fallback_tool_call("just a normal reply", &known).is_none());
     }
 
@@ -2091,7 +2510,7 @@ mod tests {
     /// arguments.
     #[test]
     fn finds_the_flat_action_envelope() {
-        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let known = defs(&["web_search"]);
         let text = r#"{"action": "web_search", "query": "rust 2024 edition"}"#;
         let (name, args, before, after) = find_fallback_tool_call(text, &known).unwrap();
         assert_eq!(name, "web_search");
@@ -2102,7 +2521,7 @@ mod tests {
 
     #[test]
     fn action_envelope_keeps_every_field_but_the_action_itself() {
-        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let known = defs(&["web_search"]);
         let text = r#"{"action": "web_search", "query": "rust", "num_results": 5}"#;
         let (_name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
         assert_eq!(args, serde_json::json!({"query": "rust", "num_results": 5}));
@@ -2112,7 +2531,7 @@ mod tests {
     /// not a literal `arguments` argument.
     #[test]
     fn action_envelope_unwraps_a_nested_arguments_object() {
-        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let known = defs(&["web_search"]);
         let text = r#"{"action": "web_search", "arguments": {"query": "rust"}}"#;
         let (_name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
         assert_eq!(args, serde_json::json!({"query": "rust"}));
@@ -2123,19 +2542,178 @@ mod tests {
     /// would turn quoted data into tool calls.
     #[test]
     fn ignores_an_action_naming_an_unregistered_tool() {
-        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let known = defs(&["web_search"]);
         let text = r#"{"action": "delete_everything", "path": "/"}"#;
         assert!(find_fallback_tool_call(text, &known).is_none());
     }
 
     #[test]
     fn finds_the_action_envelope_after_prose() {
-        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let known = defs(&["web_search"]);
         let text = "I need to look this up.\n\n{\"action\": \"web_search\", \"query\": \"rust\"}";
         let (name, _args, before, after) = find_fallback_tool_call(text, &known).unwrap();
         assert_eq!(name, "web_search");
         assert_eq!(before, "I need to look this up.");
         assert!(after.is_empty());
+    }
+
+    // --- tolerant tool-name resolution -------------------------------------
+
+    /// Case, hyphens and spacing are presentation, not identity.
+    #[test]
+    fn tool_names_normalise_across_case_and_separators() {
+        let known = defs(&["web_search"]);
+        for written in [
+            "Web-Search",
+            "WEB_SEARCH",
+            "web search",
+            "webSearch",
+            "WebSearch",
+            " web_search\n",
+        ] {
+            let resolved = resolve_tool_name(written, &known);
+            assert_eq!(
+                resolved.map(|d| d.name.as_str()),
+                Some("web_search"),
+                "{written} should resolve"
+            );
+        }
+    }
+
+    /// Normalisation erases separators, not letters: a name that is merely
+    /// *similar* stays unresolved.
+    #[test]
+    fn a_merely_similar_name_is_not_accepted() {
+        let known = defs(&["web_search"]);
+        for written in ["websearch", "web_serch", "websearcher", "search_web"] {
+            assert!(
+                resolve_tool_name(written, &known).is_none(),
+                "{written} should not resolve"
+            );
+        }
+    }
+
+    /// The observed failure: the model wrote the bare verb.
+    #[test]
+    fn an_unambiguous_bare_verb_resolves_to_the_one_tool_that_matches() {
+        let known = defs(&["web_search", "read_file", "run_bash"]);
+        assert_eq!(
+            resolve_tool_name("search", &known).map(|d| d.name.as_str()),
+            Some("web_search")
+        );
+        assert_eq!(
+            resolve_tool_name("read", &known).map(|d| d.name.as_str()),
+            Some("read_file")
+        );
+    }
+
+    /// The safety property: two plausible tools must fail, not be chosen
+    /// between. `write` is genuinely ambiguous, and guessing is how the wrong
+    /// side effect happens.
+    #[test]
+    fn an_ambiguous_fragment_resolves_to_nothing() {
+        let known = defs(&["write_file", "write_tasks"]);
+        assert!(resolve_tool_name("write", &known).is_none());
+    }
+
+    /// Fragments have to be anchored on a `_` boundary, or `run_bash` becomes
+    /// reachable from any string that happens to share letters with it.
+    #[test]
+    fn a_fragment_that_is_not_a_whole_segment_never_matches() {
+        let known = defs(&["web_search", "run_bash"]);
+        assert!(resolve_tool_name("earch", &known).is_none());
+        assert!(resolve_tool_name("_bas", &known).is_none());
+        // Three characters carry too little signal to dispatch on.
+        assert!(resolve_tool_name("run", &known).is_none());
+    }
+
+    #[test]
+    fn an_unrelated_name_still_resolves_to_nothing() {
+        let known = defs(&["web_search", "run_bash", "read_file"]);
+        for written in ["delete_everything", "shell", "browse", ""] {
+            assert!(
+                resolve_tool_name(written, &known).is_none(),
+                "{written} should not resolve"
+            );
+        }
+    }
+
+    /// End of the road for the observed session: `"action": "search"` with
+    /// `web_search` registered is a real call.
+    #[test]
+    fn the_action_envelope_accepts_a_tolerated_name() {
+        let known = defs(&["web_search", "run_bash"]);
+        let text = r#"{"action": "search", "query": "guerra na ucrânia"}"#;
+        let (name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(name, "web_search");
+        assert_eq!(args["query"], "guerra na ucrânia");
+    }
+
+    #[test]
+    fn an_ambiguous_action_dispatches_nothing() {
+        let known = defs(&["write_file", "write_tasks"]);
+        let text = r#"{"action": "write", "path": "a.txt"}"#;
+        assert!(find_fallback_tool_call(text, &known).is_none());
+    }
+
+    // --- argument alignment ------------------------------------------------
+
+    /// The rest of the observed envelope: the model invented `max_results` and
+    /// `region`. The first is unambiguously the schema's `num_results`; the
+    /// second matches nothing and is passed through for the tool itself to
+    /// ignore or reject. Neither is dropped here.
+    #[test]
+    fn unknown_argument_keys_are_aliased_when_unambiguous_and_kept_otherwise() {
+        let known = vec![def_with_properties(
+            "web_search",
+            serde_json::json!({"query": {}, "num_results": {}}),
+        )];
+        let text = r#"{"action": "search", "query": "x", "region": "pt-br", "max_results": 10}"#;
+        let (name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(name, "web_search");
+        assert_eq!(
+            args,
+            serde_json::json!({"query": "x", "region": "pt-br", "num_results": 10})
+        );
+    }
+
+    /// An alias must never displace a value the model also supplied correctly.
+    #[test]
+    fn an_alias_never_overwrites_a_correctly_named_argument() {
+        let known = vec![def_with_properties(
+            "web_search",
+            serde_json::json!({"query": {}, "num_results": {}}),
+        )];
+        let text = r#"{"action": "web_search", "query": "x", "num_results": 3, "max_results": 9}"#;
+        let (_name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(args["num_results"], 3);
+        assert_eq!(args["max_results"], 9);
+    }
+
+    /// Two candidates for the same rename is the same ambiguity as two
+    /// candidate tools, and gets the same answer: leave it alone.
+    #[test]
+    fn an_ambiguous_alias_leaves_the_key_as_written() {
+        let known = vec![def_with_properties(
+            "edit_file",
+            serde_json::json!({"old_text": {}, "new_text": {}}),
+        )];
+        let text = r#"{"action": "edit_file", "text": "hello"}"#;
+        let (_name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(args, serde_json::json!({"text": "hello"}));
+    }
+
+    /// Case and separators on argument names get the same treatment as tool
+    /// names.
+    #[test]
+    fn argument_names_normalise_across_case_and_separators() {
+        let known = vec![def_with_properties(
+            "write_file",
+            serde_json::json!({"path": {}, "content": {}}),
+        )];
+        let text = r#"{"name": "write_file", "arguments": {"Path": "a.txt", "CONTENT": "hi"}}"#;
+        let (_name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(args, serde_json::json!({"path": "a.txt", "content": "hi"}));
     }
 
     /// End to end through a real turn: the model replies with nothing but the
@@ -2148,10 +2726,10 @@ mod tests {
             text_reply(r#"{"action": "web_search", "query": "rust 2024 edition"}"#),
             text_reply("Here's what I found."),
         ]));
-        let tools = Arc::new(RecordingToolsNamed {
-            name: "web_search".to_string(),
-            executed: executed.clone(),
-        });
+        let tools = Arc::new(RecordingToolsNamed::new(
+            defs(&["web_search"]),
+            executed.clone(),
+        ));
         let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
             .with_permission_policy(PermissionPolicy::Skip);
@@ -2208,10 +2786,10 @@ mod tests {
             text_reply(r#"{"name": "write_file", "arguments": {"path": "a.txt"}}"#),
             text_reply("done"),
         ]));
-        let tools = Arc::new(RecordingToolsNamed {
-            name: "write_file".to_string(),
-            executed: executed.clone(),
-        });
+        let tools = Arc::new(RecordingToolsNamed::new(
+            defs(&["write_file"]),
+            executed.clone(),
+        ));
         let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
             .with_permission_policy(PermissionPolicy::Skip);
@@ -2245,22 +2823,354 @@ mod tests {
         assert!(saw_tool_call_started);
     }
 
-    /// Like `RecordingTools`, but advertises a real `tool_defs()` entry
-    /// under a caller-chosen name — needed so `recover_text_tool_call`'s
-    /// known-tool-name check actually matches.
+    // --- reasoning tags in the text channel --------------------------------
+
+    /// Runs `chunks` through the filter as if they were streamed deltas,
+    /// returning the visible text and how many tags were removed.
+    fn strip_reasoning(chunks: &[&str]) -> (String, u32) {
+        let mut filter = ReasoningFilter::new();
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push_str(&filter.push(chunk));
+        }
+        out.push_str(&filter.finish());
+        (out, filter.stripped)
+    }
+
+    #[test]
+    fn a_think_block_is_removed_from_the_text_channel() {
+        let (out, stripped) = strip_reasoning(&["<think>let me work this out</think>The answer."]);
+        assert_eq!(out, "The answer.");
+        assert_eq!(stripped, 2);
+    }
+
+    #[test]
+    fn every_reasoning_tag_spelling_is_recognised() {
+        for tag in ["think", "thinking", "reasoning"] {
+            let (out, _) = strip_reasoning(&[&format!("<{tag}>hidden</{tag}>shown")]);
+            assert_eq!(out, "shown", "<{tag}> should have been stripped");
+        }
+        // Casing is the model's whim, not a signal.
+        let (out, _) = strip_reasoning(&["<Think>hidden</THINK>shown"]);
+        assert_eq!(out, "shown");
+    }
+
+    /// A nested tag must not close the outer block early and leak the rest of
+    /// the reasoning.
+    #[test]
+    fn nested_blocks_close_in_order() {
+        let (out, _) = strip_reasoning(&["<think>a<think>b</think>c</think>visible"]);
+        assert_eq!(out, "visible");
+    }
+
+    /// Exactly what the failing session produced: a closing tag whose opener
+    /// never arrived. Only the tag goes.
+    #[test]
+    fn a_stray_closing_tag_is_removed_without_eating_the_text_around_it() {
+        let (out, stripped) = strip_reasoning(&["first thought\n</think>\nthe actual answer"]);
+        assert_eq!(out, "first thought\n\nthe actual answer");
+        assert_eq!(stripped, 1);
+        // And a later, properly-opened block still works — the stray close
+        // must not have left the depth counter underwater.
+        let (out, _) = strip_reasoning(&["a</think>b<think>c</think>d"]);
+        assert_eq!(out, "abd");
+    }
+
+    /// The model opened a block and the stream ended inside it. That text is
+    /// reasoning by the model's own marking, so it is dropped rather than
+    /// handed to the user as a truncated thought.
+    #[test]
+    fn an_unclosed_block_swallows_the_rest_of_the_stream() {
+        let (out, stripped) = strip_reasoning(&["visible <think>still musing about"]);
+        assert_eq!(out, "visible ");
+        assert_eq!(stripped, 1);
+    }
+
+    /// Deltas break wherever the transport happens to flush, so a tag can
+    /// arrive in pieces — including one character at a time.
+    #[test]
+    fn a_tag_split_across_deltas_is_still_recognised() {
+        let (out, _) = strip_reasoning(&["Answer: <thi", "nk>hidden</thin", "k>forty-two"]);
+        assert_eq!(out, "Answer: forty-two");
+
+        let mut filter = ReasoningFilter::new();
+        let mut out = String::new();
+        for ch in "ok<think>no</think>yes".chars() {
+            out.push_str(&filter.push(&ch.to_string()));
+        }
+        out.push_str(&filter.finish());
+        assert_eq!(out, "okyes");
+    }
+
+    /// Text that only talks *about* the tags — as this codebase's own docs and
+    /// commit messages now do — must survive intact.
+    #[test]
+    fn prose_mentioning_the_tags_is_left_alone() {
+        let prose = "Reasoning models emit `<think>` and `</think>` in the text channel.";
+        let (out, stripped) = strip_reasoning(&[prose]);
+        assert_eq!(out, prose);
+        assert_eq!(stripped, 0);
+
+        let fenced = "Example:\n\n```\n<think>\nmusing\n</think>\n```\n\nThat's the shape.";
+        let (out, stripped) = strip_reasoning(&[fenced]);
+        assert_eq!(out, fenced);
+        assert_eq!(stripped, 0);
+    }
+
+    /// `<` is ordinary punctuation far more often than it is a reasoning tag.
+    #[test]
+    fn angle_brackets_that_are_not_reasoning_tags_are_untouched() {
+        let text = "if 1 < 2 then <div> and <thinker> and </thoughts> stay put";
+        let (out, stripped) = strip_reasoning(&[text]);
+        assert_eq!(out, text);
+        assert_eq!(stripped, 0);
+    }
+
+    /// Drives one turn to completion with permissions out of the way and hands
+    /// the agent back for assertions on history.
+    async fn run_one_turn(provider: Arc<ScriptedProvider>, tools: Arc<dyn ToolExecutor>) -> Agent {
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
+            .with_permission_policy(PermissionPolicy::Skip);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "go".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+        agent
+    }
+
+    /// The point of doing this in `consume_stream`: reasoning is gone from the
+    /// message *and* therefore from history, so it is never re-sent.
+    #[tokio::test]
+    async fn a_think_block_never_reaches_history() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply(
+            "<think>The user wants a number. 42 is fine.</think>The answer is 42.",
+        )]));
+        let agent = run_one_turn(provider, Arc::new(NoTools)).await;
+
+        assert_eq!(agent.history().last().unwrap().text(), "The answer is 42.");
+        for message in agent.history() {
+            assert!(
+                !message.text().contains("think"),
+                "reasoning survived into history: {:?}",
+                message.text()
+            );
+        }
+        assert_eq!(agent.reasoning_tags_stripped(), 2);
+    }
+
+    /// The other half of the leak: the chat pane is painted from the deltas,
+    /// not from the final message, so a tag straddling two of them has to be
+    /// caught on the way *out* as well as on the way into history.
+    #[tokio::test]
+    async fn a_tag_split_across_deltas_never_reaches_the_event_stream() {
+        let provider = Arc::new(ScriptedProvider::streams([vec![
+            StreamEvent::TextDelta("The answer is <thi".into()),
+            StreamEvent::TextDelta("nk>should I say 42?</thi".into()),
+            StreamEvent::TextDelta("nk>42.".into()),
+            StreamEvent::MessageComplete {
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        ]]));
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(
+            provider,
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            tool_ctx,
+        );
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "go".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let streamed: String = std::iter::from_fn(|| events_rx.try_recv().ok())
+            .filter_map(|e| match e {
+                AgentEvent::AssistantTextDelta(delta) => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "The answer is 42.");
+        assert_eq!(agent.history().last().unwrap().text(), "The answer is 42.");
+    }
+
+    /// The dangerous half of the leak: a model musing about a call must not
+    /// have that call executed.
+    #[tokio::test]
+    async fn an_envelope_inside_a_think_block_is_not_executed() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(ScriptedProvider::streams([text_reply(
+            r#"<think>I could run {"action": "web_search", "query": "x"} here.</think>No need to search."#,
+        )]));
+        let tools = Arc::new(RecordingToolsNamed::new(
+            defs(&["web_search"]),
+            executed.clone(),
+        ));
+        let agent = run_one_turn(provider, tools.clone()).await;
+
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "a tool call the model was only thinking about must not run"
+        );
+        assert_eq!(agent.history().last().unwrap().text(), "No need to search.");
+    }
+
+    /// The verbatim failing session: a stray `</think>` between two copies of
+    /// an envelope naming `search` rather than `web_search`. Both defects at
+    /// once — the search must actually run.
+    #[tokio::test]
+    async fn the_observed_failure_now_runs_the_search() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let envelope = r#"{
+  "action": "search",
+  "query": "últimas notícias guerra na Ucrânia",
+  "region": "pt-br",
+  "max_results": 10
+}"#;
+        let provider = Arc::new(ScriptedProvider::streams([
+            text_reply(&format!("{envelope}\n</think>\n{envelope}")),
+            text_reply("Here are the headlines."),
+        ]));
+        let tools = Arc::new(RecordingToolsNamed::new(
+            vec![
+                def_with_properties(
+                    "web_search",
+                    serde_json::json!({"query": {}, "num_results": {}}),
+                ),
+                def_with_properties("run_bash", serde_json::json!({"command": {}})),
+            ],
+            executed.clone(),
+        ));
+        let agent = run_one_turn(provider, tools.clone()).await;
+
+        let calls = tools.calls();
+        assert_eq!(calls.len(), 1, "expected exactly one dispatch: {calls:?}");
+        assert_eq!(calls[0].0, "web_search");
+        assert_eq!(calls[0].1["query"], "últimas notícias guerra na Ucrânia");
+        // Aliased onto the schema's own name...
+        assert_eq!(calls[0].1["num_results"], 10);
+        // ...while a key the schema knows nothing about is still handed over
+        // for the tool to judge, not silently dropped here.
+        assert_eq!(calls[0].1["region"], "pt-br");
+        assert_eq!(
+            agent.history().last().unwrap().text(),
+            "Here are the headlines."
+        );
+    }
+
+    /// Normalisation end to end, not just in the resolver.
+    #[tokio::test]
+    async fn a_differently_spelled_tool_name_is_recovered_and_executed() {
+        for written in ["Web-Search", "WEB_SEARCH"] {
+            let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let provider = Arc::new(ScriptedProvider::streams([
+                text_reply(&format!(r#"{{"action": "{written}", "query": "rust"}}"#)),
+                text_reply("done"),
+            ]));
+            let tools = Arc::new(RecordingToolsNamed::new(
+                defs(&["web_search"]),
+                executed.clone(),
+            ));
+            run_one_turn(provider, tools.clone()).await;
+
+            let calls = tools.calls();
+            assert_eq!(calls.len(), 1, "{written} should have dispatched once");
+            assert_eq!(calls[0].0, "web_search");
+        }
+    }
+
+    /// The safety property, end to end: nothing runs, and the turn ends with
+    /// the JSON still sitting there as text rather than a guessed side effect.
+    #[tokio::test]
+    async fn an_action_naming_two_equally_plausible_tools_is_not_executed() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(ScriptedProvider::streams([text_reply(
+            r#"{"action": "write", "path": "a.txt", "content": "hi"}"#,
+        )]));
+        let tools = Arc::new(RecordingToolsNamed::new(
+            defs(&["write_file", "write_tasks"]),
+            executed.clone(),
+        ));
+        let agent = run_one_turn(provider, tools.clone()).await;
+
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "an ambiguous name must not pick a tool"
+        );
+        assert!(agent.history().last().unwrap().text().contains("\"write\""));
+    }
+
+    /// Tool definitions with no declared properties — enough for the
+    /// name-matching tests, which never look at a schema.
+    fn defs(names: &[&str]) -> Vec<ToolDefinition> {
+        names
+            .iter()
+            .map(|name| ToolDefinition {
+                name: (*name).to_string(),
+                description: "test tool".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            })
+            .collect()
+    }
+
+    /// One definition that actually declares its arguments — what
+    /// `align_arguments` keys off.
+    fn def_with_properties(name: &str, properties: serde_json::Value) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: "test tool".into(),
+            input_schema: serde_json::json!({"type": "object", "properties": properties}),
+        }
+    }
+
+    /// Like `RecordingTools`, but advertises real `tool_defs()` entries under
+    /// caller-chosen names — needed so `recover_text_tool_call`'s tool-name
+    /// resolution has something to resolve against. Records every dispatch, so
+    /// a test can assert not just *that* something ran but *which* tool did.
     struct RecordingToolsNamed {
-        name: String,
+        defs: Vec<ToolDefinition>,
         executed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        calls: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl RecordingToolsNamed {
+        fn new(
+            defs: Vec<ToolDefinition>,
+            executed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            Self {
+                defs,
+                executed,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, serde_json::Value)> {
+            self.calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl ToolExecutor for RecordingToolsNamed {
-        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
-            vec![crate::message::ToolDefinition {
-                name: self.name.clone(),
-                description: "test tool".into(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }]
+        fn tool_defs(&self) -> Vec<ToolDefinition> {
+            self.defs.clone()
         }
 
         fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
@@ -2269,13 +3179,17 @@ mod tests {
 
         async fn execute(
             &self,
-            _name: &str,
-            _input: serde_json::Value,
+            name: &str,
+            input: serde_json::Value,
             _ctx: &ToolContext,
             _cancel: CancellationToken,
         ) -> ToolResult {
             self.executed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), input.clone()));
             ToolResult::ok("wrote")
         }
     }

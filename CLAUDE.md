@@ -202,6 +202,31 @@ can call a tool by replying with nothing but
 before the turn ends, so it flows through the ordinary permission/execution
 path. Two envelopes are accepted — that flat one, where the remaining
 top-level fields *are* the arguments, and the nested
-`{"name": ..., "arguments": {...}}` form. Both only fire when the named tool
-is actually registered: an `action` field is common enough in ordinary JSON
-that dispatching on it blindly would turn quoted data into tool calls.
+`{"name": ..., "arguments": {...}}` form. Both only fire when the name
+resolves to exactly one registered tool: an `action` field is common enough in
+ordinary JSON that dispatching on it blindly would turn quoted data into tool
+calls.
+
+Resolution (`resolve_tool_name`) is tolerant but never speculative. It accepts
+an exact name, a name equal after normalisation (`Web-Search`, `WEB_SEARCH`,
+`webSearch` → `web_search`), or a whole-segment prefix/suffix of at least four
+characters (`search` → `web_search`) — and only when **one** registered tool
+matches. `write` against both `write_file` and `write_tasks` resolves to
+nothing rather than to a guess, and edit-distance matching is deliberately
+absent. Arguments get the same treatment from `align_arguments`, which renames
+an invented key onto the schema's own property when that is unambiguous
+(`max_results` → `num_results`); keys it can't place are passed through for the
+tool to reject, never dropped here.
+
+### Reasoning tags in the text channel
+
+Reasoning models emit `<think>`/`<thinking>`/`<reasoning>` blocks in the
+*text* channel whenever the provider has no separate reasoning stream.
+`ReasoningFilter` (`smith-core/src/agent.rs`) strips them inside
+`consume_stream` — one shared place, because the leak follows the model, not
+the wire format — before the deltas are forwarded *or* accumulated, so nothing
+reaches the transcript, history, or the next request. It works on streamed
+deltas (a tag may straddle two), leaves anything inside a ``` fence or
+immediately after a backtick alone, and removes a stray closing tag without
+eating the text around it. The reasoning itself is discarded; `Agent::
+reasoning_tags_stripped()` counts what was removed.
