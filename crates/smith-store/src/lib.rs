@@ -9,4 +9,6 @@ pub mod models;
 pub mod session;
 
 pub use models::{is_known_provider, known_models};
-pub use session::{SessionError, SessionStore, SessionSummary};
+pub use session::{
+    SessionError, SessionStore, SessionSummary, TurnRecord, TurnTotals, SCHEMA_VERSION,
+};

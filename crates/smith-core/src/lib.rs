@@ -1,9 +1,11 @@
 //! Domain types, provider/tool traits, and the agent orchestration loop.
 
 pub mod agent;
+pub mod context;
 pub mod event;
 pub mod message;
 pub mod permission_detail;
+pub mod pricing;
 pub mod provider;
 pub mod redact;
 pub mod retry;
@@ -12,8 +14,10 @@ pub mod testkit;
 pub mod tool;
 
 pub use agent::{
-    parse_tasks, Agent, NoTools, PermissionAsk, QuestionAsk, ToolExecutor, TurnLimits,
+    parse_tasks, Agent, CompactionConfig, CompactionOutcome, NoTools, PermissionAsk, QuestionAsk,
+    ToolExecutor, TurnAccounting, TurnLimits,
 };
+pub use context::{carry_over, CarryOver, ContextUsage, COMPACT_THRESHOLD};
 pub use event::{
     Action, AgentEvent, AgentPhase, LoopStopReason, PermissionDecision, PermissionRequest,
     ProgressReporter, ResourceStats, Task, TaskStatus, TurnLimitKind, UserQuestion,

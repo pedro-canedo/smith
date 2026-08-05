@@ -14,7 +14,7 @@ use smith_core::{
     Redactor, RetryPolicy, ToolContext, TurnLimits,
 };
 use smith_provider::{AnthropicProvider, OpenAiProvider};
-use smith_store::SessionStore;
+use smith_store::{SessionStore, TurnRecord, TurnTotals};
 use smith_tools::ToolRegistry;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -172,6 +172,44 @@ impl Persistence {
         let session_id = self.ensure_session_id();
         let _ = self.store.set_goal(&session_id, goal);
     }
+
+    /// Writes one `turns` row with the cost the agent computed while the turn
+    /// was running. Nothing here consults a price table — that is what makes
+    /// the stored number a historical fact rather than a re-derivation.
+    fn record_turn(&mut self, turn: &TurnRecord) {
+        let session_id = self.ensure_session_id();
+        let _ = self.store.record_turn(&session_id, turn);
+    }
+
+    /// The totals a resumed session starts from, or zero for a fresh one.
+    fn turn_totals(&self) -> TurnTotals {
+        self.session_id
+            .as_deref()
+            .and_then(|id| self.store.turn_totals(id).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Persists whatever the turn that just finished added: new messages, and its
+/// own token/cost accounting.
+///
+/// One function because the two must not drift apart — a turn whose messages
+/// are saved but whose cost is not comes back on `--resume` looking free.
+fn persist_turn(state: &mut OrchestratorState) {
+    let history = state.agent.history().to_vec();
+    let turn = state.agent.last_turn().cloned();
+    let Some(persistence) = state.persistence.as_mut() else {
+        return;
+    };
+    persistence.persist_new_messages(&history);
+    if let Some(turn) = turn {
+        persistence.record_turn(&TurnRecord {
+            provider: turn.provider,
+            model: turn.model,
+            usage: turn.usage,
+            cost_usd: turn.cost_usd,
+        });
+    }
 }
 
 /// Connects to every configured MCP server and registers its tools into
@@ -274,12 +312,20 @@ impl OrchestratorState {
         // `/model`, which is the least visible way to lose a configured cap.
         let limits = self.agent.limits();
         let retry_policy = self.agent.retry_policy();
+        let compaction = self.agent.compaction();
+        // Money already spent does not become unspent because the user typed
+        // `/model` — and the persisted `turns` rows still record it, so
+        // dropping it here would only make the display disagree with the
+        // database.
+        let session_usage = self.agent.session_usage();
+        let session_cost = self.agent.session_cost_usd();
 
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
             .with_system(SYSTEM_PROMPT)
             .with_context_provider(context_provider(self.memory.clone()))
             .with_limits(limits)
             .with_retry_policy(retry_policy)
+            .with_compaction(compaction)
             // Rebuilt from config rather than carried over, so a key added
             // since startup is covered too. Forgetting it here would silently
             // disable redaction for the rest of the session.
@@ -290,6 +336,7 @@ impl OrchestratorState {
         agent.seed_history(history);
         agent.seed_allowed_session_tools(allowed);
         agent.seed_tasks(tasks);
+        agent.seed_session_totals(session_usage, session_cost);
 
         self.agent = agent;
         self.provider_kind = new_kind;
@@ -343,9 +390,7 @@ async fn run_loop(
             )
             .await;
         let history = guard.agent.history().to_vec();
-        if let Some(p) = guard.persistence.as_mut() {
-            p.persist_new_messages(&history);
-        }
+        persist_turn(&mut guard);
         drop(guard);
 
         if cancel.is_cancelled() {
@@ -495,6 +540,14 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     if !seeded_tasks.is_empty() {
         agent.seed_tasks(seeded_tasks);
     }
+    // `--resume` restores the accumulated cost from what those turns actually
+    // cost when they ran, read straight out of the `turns` table. Recomputing
+    // it from the current price table here is exactly the bug that makes a
+    // resumed session disagree with the one it resumed.
+    if let Some(p) = persistence.as_ref() {
+        let totals = p.turn_totals();
+        agent.seed_session_totals(totals.usage, totals.cost_usd);
+    }
     let state = Arc::new(Mutex::new(OrchestratorState {
         agent,
         persistence,
@@ -523,10 +576,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                         .run_turn(text, event_tx, permission_tx, question_tx, cancel)
                         .await;
 
-                    let history = guard.agent.history().to_vec();
-                    if let Some(p) = guard.persistence.as_mut() {
-                        p.persist_new_messages(&history);
-                    }
+                    persist_turn(&mut guard);
                 });
             }
             Action::CancelGeneration => {
@@ -607,10 +657,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                         .run_turn(prompt, event_tx.clone(), permission_tx, question_tx, cancel)
                         .await;
 
-                    let history = guard.agent.history().to_vec();
-                    if let Some(p) = guard.persistence.as_mut() {
-                        p.persist_new_messages(&history);
-                    }
+                    persist_turn(&mut guard);
                 });
             }
             Action::ApprovePlan => {
@@ -631,10 +678,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                         .agent
                         .run_turn(prompt, event_tx.clone(), permission_tx, question_tx, cancel)
                         .await;
-                    let history = guard.agent.history().to_vec();
-                    if let Some(p) = guard.persistence.as_mut() {
-                        p.persist_new_messages(&history);
-                    }
+                    persist_turn(&mut guard);
                 });
             }
             Action::RejectPlan => {
@@ -656,6 +700,38 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                         p.save_goal(goal.as_deref());
                     }
                     let _ = event_tx.send(AgentEvent::GoalChanged(goal));
+                });
+            }
+            Action::Compact => {
+                // Shares `current_cancel` with turns: compaction spends a
+                // provider request, so Esc has to be able to stop it.
+                let cancel = CancellationToken::new();
+                current_cancel = Some(cancel.clone());
+                let state = state.clone();
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let mut guard = state.lock().await;
+                    match guard.agent.compact(&event_tx, &cancel).await {
+                        Ok(_) => {
+                            // Compaction rewrites history rather than
+                            // appending to it, so the messages already in the
+                            // database stay as they are — the session store
+                            // keeps the full transcript even though the model
+                            // no longer sees it, which is what makes the
+                            // operation non-destructive. What does need saving
+                            // is the summarising request's cost.
+                            //
+                            // Success is reported by the `ContextUsage` event
+                            // `compact` emits, not by a message: the only
+                            // notice channel here is `Error`, and headless
+                            // treats an `Error` mid-turn as a failed run.
+                            persist_turn(&mut guard);
+                        }
+                        Err(err) => {
+                            let _ = event_tx
+                                .send(AgentEvent::Error(format!("compaction failed: {err}")));
+                        }
+                    }
                 });
             }
             Action::StartLoop {
@@ -964,5 +1040,133 @@ mod tests {
         let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last["type"], "result");
         assert_eq!(last["data"]["exit_code"], 0);
+    }
+
+    /// The wiring half of acceptance criterion #4: a turn run through the real
+    /// orchestrator writes a `turns` row carrying the cost computed while it
+    /// ran, and a second `run_orchestrator` over the same database — which is
+    /// exactly what `--resume` is — starts from that stored figure.
+    #[tokio::test]
+    async fn a_turn_persists_its_cost_and_a_resumed_run_starts_from_it() {
+        use smith_core::testkit::text_reply_with_usage;
+        use smith_core::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = SessionStore::open(dir.path())
+            .unwrap()
+            .create_session("anthropic", "claude-sonnet-5", "/proj")
+            .unwrap();
+
+        // A million tokens each way of sonnet: $3 in + $15 out.
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Usage::default()
+        };
+        let provider = Arc::new(
+            ScriptedProvider::streams([text_reply_with_usage("done", usage)]).with_id("anthropic"),
+        );
+
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        let mut opts = OrchestratorOptions::new(
+            ProviderKind::Anthropic,
+            "claude-sonnet-5".to_string(),
+            Config::default(),
+        );
+        opts.provider = Some(provider);
+        opts.permission_policy = smith_core::PermissionPolicy::Skip;
+        opts.persistence = Some(Persistence {
+            store: SessionStore::open(dir.path()).unwrap(),
+            session_id: Some(session_id.clone()),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/proj".into(),
+            persisted: 0,
+        });
+
+        let orchestrator = tokio::spawn(run_orchestrator(
+            opts,
+            OrchestratorChannels {
+                action_rx,
+                event_tx,
+                permission_tx,
+                question_tx,
+            },
+        ));
+        action_tx
+            .send(Action::SubmitMessage("hello".into()))
+            .unwrap();
+
+        while let Some(event) = event_rx.recv().await {
+            if matches!(
+                event,
+                AgentEvent::AssistantTurnComplete {
+                    stop_reason: smith_core::StopReason::EndTurn,
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+
+        // Persistence happens in the turn's own task, just after the event.
+        let reader = SessionStore::open(dir.path()).unwrap();
+        let totals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let totals = reader.turn_totals(&session_id).unwrap();
+                if totals.turns > 0 {
+                    return totals;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the turn should have been recorded");
+        orchestrator.abort();
+
+        assert_eq!(totals.turns, 1);
+        assert_eq!(totals.usage.output_tokens, 1_000_000);
+        assert_eq!(totals.unpriced_turns, 0);
+        assert!((totals.cost_usd - 18.0).abs() < 1e-9, "{totals:?}");
+
+        // Now the resume: a fresh orchestrator over the same database has to
+        // pick the total up before it does anything at all.
+        let (_action_tx2, action_rx2) = mpsc::unbounded_channel();
+        let (event_tx2, _event_rx2) = mpsc::unbounded_channel();
+        let (permission_tx2, _p2) = mpsc::unbounded_channel();
+        let (question_tx2, _q2) = mpsc::unbounded_channel();
+        let mut opts = OrchestratorOptions::new(
+            ProviderKind::Anthropic,
+            "claude-sonnet-5".to_string(),
+            Config::default(),
+        );
+        // No scripted responses: this run must not need the provider to know
+        // what the session already cost.
+        opts.provider = Some(Arc::new(ScriptedProvider::streams([])));
+        opts.persistence = Some(Persistence {
+            store: SessionStore::open(dir.path()).unwrap(),
+            session_id: Some(session_id.clone()),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            cwd: "/proj".into(),
+            persisted: 0,
+        });
+        let resumed = tokio::spawn(run_orchestrator(
+            opts,
+            OrchestratorChannels {
+                action_rx: action_rx2,
+                event_tx: event_tx2,
+                permission_tx: permission_tx2,
+                question_tx: question_tx2,
+            },
+        ));
+        // Reading the totals back is the same call the orchestrator makes to
+        // seed the agent, and it is identical — not merely close.
+        assert_eq!(reader.turn_totals(&session_id).unwrap(), totals);
+        resumed.abort();
     }
 }

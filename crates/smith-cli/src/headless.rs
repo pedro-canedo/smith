@@ -278,8 +278,11 @@ pub async fn run<O: Write, E: Write>(
                         }
                     }
                     AgentEvent::TokenUsage(usage) => {
-                        acc.usage.input_tokens += usage.input_tokens;
-                        acc.usage.output_tokens += usage.output_tokens;
+                        // `add` rather than two field additions, so the cache
+                        // counts reach the JSON summary too — a run that is
+                        // 90% cache reads should not report as 10% of its
+                        // real prompt size.
+                        acc.usage.add(usage);
                     }
                     AgentEvent::ToolCallStarted { id, tool_name, input } => {
                         if opts.format == OutputFormat::Text {
@@ -812,12 +815,14 @@ mod tests {
                 .send(AgentEvent::TokenUsage(Usage {
                     input_tokens: 10,
                     output_tokens: 4,
+                    ..Usage::default()
                 }))
                 .unwrap();
             events
                 .send(AgentEvent::TokenUsage(Usage {
                     input_tokens: 1,
                     output_tokens: 2,
+                    ..Usage::default()
                 }))
                 .unwrap();
             events.send(done("the answer")).unwrap();

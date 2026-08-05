@@ -8,11 +8,17 @@ use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::context::{
+    carry_over, compaction_split, estimate_messages_tokens, estimate_tokens, render_transcript,
+    ContextUsage, COMPACT_THRESHOLD,
+};
 use crate::event::{
     AgentEvent, AgentPhase, PermissionDecision, PermissionRequest, ProgressReporter, Task,
     TaskStatus, TurnLimitKind, UserQuestion,
 };
-use crate::message::{CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent};
+use crate::message::{
+    CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent, Usage,
+};
 use crate::permission_detail::format_permission_detail;
 use crate::provider::{LlmProvider, ProviderError};
 use crate::redact::Redactor;
@@ -129,6 +135,87 @@ fn limit_note(kind: TurnLimitKind, limits: &TurnLimits) -> String {
 /// waits them out stops being run.
 type Sleeper = Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// When and how aggressively history gets compacted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactionConfig {
+    /// Off entirely. Only tests and `--headless` single-shot runs, where the
+    /// turn is short by construction, have a reason to disable it.
+    pub enabled: bool,
+    /// Fraction of the context window at which auto-compaction fires.
+    pub threshold: f32,
+    /// How many trailing messages survive untouched. Counted in *messages*,
+    /// not exchanges: a tool-heavy round is one assistant message plus one
+    /// results message, so eight is roughly the last three or four rounds.
+    ///
+    /// The real cut point is snapped to a clean user boundary (see
+    /// `context::compaction_split`), so this is a target, not a guarantee.
+    pub keep_recent: usize,
+    /// Cap on the summary the model is asked to write. It has to be small —
+    /// a summary that fills the space it just freed is not a compaction.
+    pub summary_max_tokens: u32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: COMPACT_THRESHOLD,
+            keep_recent: 8,
+            summary_max_tokens: 1024,
+        }
+    }
+}
+
+/// What one call to `run_turn` consumed, and what it cost.
+///
+/// `cost_usd` is computed **here, when the turn runs**, from the price table
+/// in force at that moment — and it is what gets persisted. Storing only the
+/// tokens and recomputing later gives a different answer the day a model is
+/// repriced or retired, which is exactly the drift `--resume` must not have.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnAccounting {
+    pub provider: String,
+    pub model: String,
+    pub usage: Usage,
+    /// `None` when this build has no price for the provider/model — an honest
+    /// gap, never a zero pretending to be free.
+    pub cost_usd: Option<f64>,
+}
+
+/// The result of a successful compaction, for whoever wants to report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionOutcome {
+    pub messages_before: usize,
+    pub messages_after: usize,
+    /// Estimated context tokens before and after, so a caller can say how much
+    /// room it actually bought.
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+    /// Whether the model wrote a prose summary, or the compaction is carrying
+    /// structure only.
+    pub summarised: bool,
+}
+
+/// What the assistant "says" in the synthetic acknowledgement that follows the
+/// compaction message.
+///
+/// It exists purely to keep roles alternating: the compaction message is a
+/// user message, and the kept tail also begins with a user message (that is
+/// what a clean split boundary *is*). Two user messages in a row is a shape
+/// some providers reject outright and others silently merge, and there is
+/// nothing to gain by finding out which.
+const COMPACTION_ACK: &str =
+    "Understood. I have the summary and carried-over state above, and I will continue from the \
+     messages that follow.";
+
+const SUMMARY_SYSTEM_PROMPT: &str =
+    "You are compacting the transcript of a coding session so that work can continue in a smaller \
+     context window. Write a dense factual summary in under 400 words. Cover, in this order: what \
+     the user asked for; decisions that were made and the reasoning behind them; what was actually \
+     changed and where; anything that was tried and failed, and why; and what remains unresolved. \
+     Prefer concrete names — files, functions, commands, error messages — over description. Do not \
+     speculate, do not offer next steps, and do not address the user. Output only the summary.";
+
 /// Implemented by smith-tools::ToolRegistry. Kept as a trait here so smith-core
 /// never depends on the concrete tool crate.
 #[async_trait]
@@ -224,6 +311,23 @@ pub struct Agent {
     limits: TurnLimits,
     retry_policy: RetryPolicy,
     sleeper: Sleeper,
+    compaction: CompactionConfig,
+    /// Usage from the most recent provider response, and how many messages
+    /// were in history when it arrived.
+    ///
+    /// These two together are what make context tracking cheap *and* accurate:
+    /// `input_tokens` is the provider's own exact count of everything it was
+    /// sent — system prompt, tool definitions, the lot — so the only thing
+    /// left to estimate is whatever has been appended since. `None` before the
+    /// first response of a session, when there is nothing but estimate.
+    last_usage: Option<Usage>,
+    counted_messages: usize,
+    /// Cumulative usage and cost for the whole session, including anything
+    /// restored from a resumed one via `seed_session_totals`.
+    session_usage: Usage,
+    session_cost_usd: f64,
+    /// Accounting for the turn currently running (or the last one that did).
+    last_turn: Option<TurnAccounting>,
 }
 
 impl Agent {
@@ -251,6 +355,12 @@ impl Agent {
             limits: TurnLimits::default(),
             retry_policy: RetryPolicy::default(),
             sleeper: Arc::new(|d| Box::pin(tokio::time::sleep(d))),
+            compaction: CompactionConfig::default(),
+            last_usage: None,
+            counted_messages: 0,
+            session_usage: Usage::default(),
+            session_cost_usd: 0.0,
+            last_turn: None,
         }
     }
 
@@ -310,6 +420,167 @@ impl Agent {
 
     pub fn retry_policy(&self) -> RetryPolicy {
         self.retry_policy
+    }
+
+    pub fn with_compaction(mut self, compaction: CompactionConfig) -> Self {
+        self.compaction = compaction;
+        self
+    }
+
+    pub fn compaction(&self) -> CompactionConfig {
+        self.compaction
+    }
+
+    /// Usage and cost for the most recent `run_turn` — what the caller
+    /// persists as one `turns` row.
+    pub fn last_turn(&self) -> Option<&TurnAccounting> {
+        self.last_turn.as_ref()
+    }
+
+    pub fn session_usage(&self) -> Usage {
+        self.session_usage
+    }
+
+    /// Accumulated cost for the session, in USD. Only ever the sum of costs
+    /// computed at the time of each turn — never a recomputation from a price
+    /// table that may have moved since.
+    pub fn session_cost_usd(&self) -> f64 {
+        self.session_cost_usd
+    }
+
+    /// Restores the running totals for a resumed session, from the numbers the
+    /// session store recorded when those turns actually ran. Also used by a
+    /// `/model` switch, which rebuilds the whole `Agent`.
+    pub fn seed_session_totals(&mut self, usage: Usage, cost_usd: f64) {
+        self.session_usage = usage;
+        self.session_cost_usd = cost_usd;
+    }
+
+    /// How full the context window is for the *next* request.
+    ///
+    /// Exact where it can be and estimated only where it must be: the last
+    /// response's `prompt_tokens` (input + cache read + cache write — Anthropic
+    /// reports those separately, and adding only `input_tokens` would miss the
+    /// entire cached prefix) plus its `output_tokens`, which is the assistant
+    /// message now sitting in history, plus a `chars/4` estimate of everything
+    /// appended since. Before the first response there is nothing but estimate,
+    /// and the system prompt and tool schemas have to be estimated too — they
+    /// are a fixed several-thousand-token floor that a naive count of
+    /// `messages` alone would miss entirely.
+    pub fn context_usage(&self) -> ContextUsage {
+        let window = self.provider.capabilities(&self.model).context_window;
+
+        let (counted, exact) = match self.last_usage {
+            Some(usage) => (
+                usage.prompt_tokens().saturating_add(usage.output_tokens),
+                true,
+            ),
+            None => (self.estimate_request_overhead(), false),
+        };
+
+        let pending = self
+            .messages
+            .get(self.counted_messages..)
+            .map(estimate_messages_tokens)
+            .unwrap_or(0);
+
+        ContextUsage {
+            used: counted.saturating_add(pending),
+            window,
+            // Exact only at the instant a response lands with nothing appended
+            // after it; one tool result and it is an estimate again.
+            estimated: !exact || pending > 0,
+        }
+    }
+
+    /// The part of a request that is not conversation: system prompt and tool
+    /// definitions. Only used before the first response, since after that the
+    /// provider's `input_tokens` already includes it.
+    fn estimate_request_overhead(&self) -> u32 {
+        let system = self
+            .effective_system()
+            .map(|s| estimate_tokens(&s))
+            .unwrap_or(0);
+        let tools = self
+            .tools
+            .tool_defs()
+            .iter()
+            .map(|d| {
+                estimate_tokens(&d.name)
+                    .saturating_add(estimate_tokens(&d.description))
+                    .saturating_add(estimate_tokens(&d.input_schema.to_string()))
+            })
+            .fold(0u32, u32::saturating_add);
+        system.saturating_add(tools)
+    }
+
+    /// Whether history is due for compaction.
+    pub fn should_compact(&self) -> bool {
+        self.compaction.enabled && self.context_usage().ratio() >= self.compaction.threshold
+    }
+
+    fn emit_context(&self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        let context = self.context_usage();
+        let _ = events.send(AgentEvent::ContextUsage {
+            used: context.used,
+            window: context.window,
+            estimated: context.estimated,
+        });
+    }
+
+    /// Folds one provider response's usage into the turn, session, and context
+    /// bookkeeping. Called once per round, after the assistant message has
+    /// been pushed, so `counted_messages` lines up with what the provider was
+    /// actually charging for.
+    fn note_usage(&mut self, usage: Usage) {
+        self.last_usage = Some(usage);
+        self.counted_messages = self.messages.len();
+        self.session_usage.add(&usage);
+
+        let provider = self.provider.id().to_string();
+        let cost = crate::pricing::cost_usd(&provider, &self.model, &usage);
+        if let Some(cost) = cost {
+            self.session_cost_usd += cost;
+        }
+
+        // One `TurnAccounting` spans every round of a turn: the model cannot
+        // change mid-turn, so summing rounds loses nothing, and it keeps the
+        // persisted `turns` table one row per user-visible turn rather than
+        // one per HTTP request.
+        let turn = self.last_turn.get_or_insert_with(|| TurnAccounting {
+            provider: provider.clone(),
+            model: self.model.clone(),
+            usage: Usage::default(),
+            cost_usd: None,
+        });
+        turn.usage.add(&usage);
+        if let Some(cost) = cost {
+            turn.cost_usd = Some(turn.cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
+
+    /// Bills a request the agent made on its own behalf (today: the compaction
+    /// summary) to the session and the current turn — but *not* to the context
+    /// tracker. It was a different prompt entirely, so letting it overwrite
+    /// `last_usage` would make the gauge describe a conversation that isn't
+    /// the one in `self.messages`.
+    fn note_side_request_usage(&mut self, usage: Usage) {
+        self.session_usage.add(&usage);
+        let provider = self.provider.id().to_string();
+        let cost = crate::pricing::cost_usd(&provider, &self.model, &usage);
+        if let Some(cost) = cost {
+            self.session_cost_usd += cost;
+        }
+        let turn = self.last_turn.get_or_insert_with(|| TurnAccounting {
+            provider,
+            model: self.model.clone(),
+            usage: Usage::default(),
+            cost_usd: None,
+        });
+        turn.usage.add(&usage);
+        if let Some(cost) = cost {
+            turn.cost_usd = Some(turn.cost_usd.unwrap_or(0.0) + cost);
+        }
     }
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -443,6 +714,12 @@ impl Agent {
     /// session) before the first `run_turn` call.
     pub fn seed_history(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        // Nothing here was measured by *this* agent's provider, so the whole
+        // history is unsent delta until the first response comes back. Leaving
+        // these stale would make a resumed session report the previous
+        // agent's context occupancy.
+        self.last_usage = None;
+        self.counted_messages = 0;
     }
 
     /// Runs one full user turn to completion: sends the user's message, streams
@@ -463,6 +740,10 @@ impl Agent {
     ) -> bool {
         self.messages.push(Message::user_text(user_text));
         let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Thinking));
+        // Fresh accounting per turn — the caller persists exactly one `turns`
+        // row from this, and a leftover from the previous turn would be
+        // recorded twice.
+        self.last_turn = None;
 
         // Some providers (Ollama cloud models especially) occasionally end a
         // turn with no text and no tool call right after a tool round — the
@@ -479,12 +760,36 @@ impl Agent {
         let started_at = Instant::now();
         let mut rounds: u32 = 0;
         let mut tool_calls: u32 = 0;
+        // Context size immediately after the last compaction this turn, if
+        // there was one — see the guard at the top of the loop.
+        let mut compacted_at: Option<u32> = None;
 
         loop {
             if cancel.is_cancelled() {
                 let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
                 let _ = events.send(AgentEvent::Error("cancelled".into()));
                 return false;
+            }
+
+            // Checked here, at a round boundary, because that is the only
+            // place history is guaranteed well-formed: every `tool_use` from
+            // the previous round already has its matching `tool_result`
+            // pushed. A failed compaction leaves history exactly as it was and
+            // the turn proceeds normally — see `compact`.
+            //
+            // The `compacted_at` guard stops a turn compacting the compaction:
+            // if a window is small enough that even the carried-over state sits
+            // above the threshold, an unguarded check would fire again on the
+            // very next round and this time throw the carry-over away. Growth
+            // past the post-compaction level is the right condition rather than
+            // "once per turn", because a tool-heavy turn genuinely can refill
+            // the window and legitimately needs compacting twice.
+            if self.should_compact()
+                && compacted_at.is_none_or(|after| self.context_usage().used > after)
+            {
+                if let Ok(outcome) = self.compact(&events, &cancel).await {
+                    compacted_at = Some(outcome.tokens_after);
+                }
             }
 
             let request = CompletionRequest {
@@ -505,7 +810,7 @@ impl Agent {
                 }
             };
 
-            let (mut assistant_message, mut stop_reason) =
+            let (mut assistant_message, mut stop_reason, usage) =
                 match consume_stream(stream, &events, cancel.clone()).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -562,6 +867,10 @@ impl Agent {
             if !assistant_message.content.is_empty() {
                 self.messages.push(assistant_message.clone());
             }
+            // After the push, so `counted_messages` marks the exact point up
+            // to which the provider's own token count is authoritative.
+            self.note_usage(usage);
+            self.emit_context(&events);
             let _ = events.send(AgentEvent::AssistantTurnComplete {
                 message: assistant_message.clone(),
                 stop_reason,
@@ -659,6 +968,9 @@ impl Agent {
                 role: Role::User,
                 content: results,
             });
+            // Tool results are the single biggest thing that lands in history
+            // between responses, so this is where the gauge actually moves.
+            self.emit_context(&events);
 
             if cancelled {
                 let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
@@ -705,6 +1017,153 @@ impl Agent {
         } else {
             None
         }
+    }
+
+    /// Replaces the older part of history with a summary plus a structural
+    /// carry-over, freeing context without losing what the session established.
+    ///
+    /// **Atomic.** The new history is assembled in a local vector and only
+    /// assigned to `self.messages` on the last line. Every failure path —
+    /// nothing safe to cut, provider error, cancellation — returns before that
+    /// point with history byte-for-byte unchanged. The alternative, falling
+    /// back to a mechanical drop when the summariser fails, would quietly
+    /// destroy the reasoning behind everything already done at exactly the
+    /// moment the provider is flaky; the turn continuing at full context and
+    /// the trigger firing again next round is strictly better, because the
+    /// retry layer will very likely have succeeded by then.
+    ///
+    /// **It spends one provider request, on the session's own model.** The
+    /// structural half (todos, goal, files) is mechanical and free, but
+    /// "decisions taken and why" exists only as prose in the transcript and no
+    /// amount of scanning recovers it. Using a cheaper model was considered
+    /// and rejected: `capabilities()` reports windows and features, not price,
+    /// so it cannot actually identify the cheap one — that would take a second
+    /// hardcoded model table, drifting exactly the way the pricing table
+    /// drifts. And a cheaper model is not necessarily *available*: an Ollama
+    /// user has one model pulled, and an API key does not imply access to
+    /// every model behind it. The session's own model is the one we know
+    /// works. The cost is bounded instead: the transcript is excerpted before
+    /// it is sent (see `context::render_transcript`) and the reply is capped
+    /// at `summary_max_tokens`.
+    pub async fn compact(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<CompactionOutcome, String> {
+        let split = compaction_split(&self.messages, self.compaction.keep_recent)
+            .ok_or("nothing safe to compact — history has no clean split point")?;
+
+        let messages_before = self.messages.len();
+        let tokens_before = self.context_usage().used;
+        let dropped = &self.messages[..split];
+
+        // Pure, and computed before anything can fail: whatever the provider
+        // does next, these facts are already in hand.
+        let carried = carry_over(dropped, self.goal.as_deref(), &self.tasks);
+        // Todos recovered from history become the live list, if there wasn't
+        // one. Without this, a *second* compaction would look for a
+        // `write_tasks` call that is no longer anywhere in history — the first
+        // compaction replaced it with prose — and the todos this one just
+        // rescued would quietly not survive the next round.
+        let recovered_tasks = (self.tasks.is_empty() && !carried.pending_tasks.is_empty())
+            .then(|| carried.pending_tasks.clone());
+
+        let (summary, summary_usage) = self.summarise(dropped, events, cancel).await?;
+        // The user paid for that request whether or not the compaction is a
+        // success, so it lands in the session totals either way.
+        self.note_side_request_usage(summary_usage);
+
+        let mut compacted = Vec::with_capacity(self.messages.len() - split + 2);
+        compacted.push(Message::user_text(carried.render(Some(&summary))));
+        compacted.push(Message::assistant(vec![ContentBlock::Text {
+            text: COMPACTION_ACK.to_string(),
+        }]));
+        compacted.extend_from_slice(&self.messages[split..]);
+
+        // The only mutations in this function, and they are unreachable from
+        // every failure path above.
+        self.messages = compacted;
+        if let Some(tasks) = recovered_tasks {
+            self.tasks = tasks.clone();
+            let _ = events.send(AgentEvent::TasksUpdated(tasks));
+        }
+        // The provider's last token count described a prompt that no longer
+        // exists, so the gauge falls back to a full estimate until the next
+        // response corrects it.
+        self.last_usage = None;
+        self.counted_messages = 0;
+
+        let outcome = CompactionOutcome {
+            messages_before,
+            messages_after: self.messages.len(),
+            tokens_before,
+            tokens_after: self.context_usage().used,
+            summarised: true,
+        };
+        self.emit_context(events);
+        Ok(outcome)
+    }
+
+    /// Asks the model to summarise `dropped`, as a single plain-text request.
+    ///
+    /// The transcript goes in as the *content of one user message* rather than
+    /// as replayed conversation history. That makes the `tool_use` /
+    /// `tool_result` pairing rules irrelevant — text cannot be malformed the
+    /// way a message array can — and lets each tool result be excerpted, which
+    /// is where nearly all the savings are.
+    async fn summarise(
+        &self,
+        dropped: &[Message],
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Usage), String> {
+        let window = self.provider.capabilities(&self.model).context_window;
+        // Half the window, in characters, at the un-margined 4:1 ratio. The
+        // summarisation request must comfortably fit alongside its own reply.
+        let budget_chars = (window as usize / 2).saturating_mul(4);
+        let transcript = render_transcript(dropped, budget_chars);
+
+        let request = CompletionRequest {
+            model: self.model.clone(),
+            system: Some(SUMMARY_SYSTEM_PROMPT.to_string()),
+            messages: vec![Message::user_text(format!(
+                "Summarise this session transcript.\n\n<transcript>\n{transcript}\n</transcript>"
+            ))],
+            // No tools: this request has one job and must not start doing work
+            // of its own halfway through a compaction.
+            tools: Vec::new(),
+            max_tokens: self.compaction.summary_max_tokens,
+            temperature: None,
+        };
+
+        let stream = self
+            .stream_with_retry(request, events, cancel)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // A private channel, because `consume_stream` streams text deltas to
+        // whoever it is handed — and the summary must never appear in the
+        // chat pane as something the assistant said to the user. Token usage
+        // is the one thing forwarded on: the user is paying for this request,
+        // so it belongs in their totals.
+        let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel();
+        let result = consume_stream(stream, &quiet_tx, cancel.clone()).await;
+        drop(quiet_tx);
+        while let Ok(event) = quiet_rx.try_recv() {
+            if let AgentEvent::TokenUsage(usage) = event {
+                let _ = events.send(AgentEvent::TokenUsage(usage));
+            }
+        }
+
+        let (message, stop_reason, usage) = result?;
+        if stop_reason == StopReason::Cancelled {
+            return Err("compaction cancelled".to_string());
+        }
+        let text = message.text();
+        if text.trim().is_empty() {
+            return Err("the summarising request returned no text".to_string());
+        }
+        Ok((text, usage))
     }
 
     /// Opens the completion stream, re-sending on failures worth re-sending.
@@ -1100,6 +1559,10 @@ fn parse_tool_call_envelope(
 
 /// Drains a provider's StreamEvent stream, forwarding text deltas as AgentEvents
 /// as they arrive and accumulating everything into a final assistant Message.
+///
+/// The `Usage` is returned as well as forwarded on the event channel: the
+/// caller needs it for context and cost accounting, and reading it back off a
+/// channel it also owns would be a race.
 async fn consume_stream(
     mut stream: futures::stream::BoxStream<
         'static,
@@ -1107,13 +1570,14 @@ async fn consume_stream(
     >,
     events: &mpsc::UnboundedSender<AgentEvent>,
     cancel: CancellationToken,
-) -> Result<(Message, StopReason), String> {
+) -> Result<(Message, StopReason, Usage), String> {
     use futures::StreamExt;
 
     let mut text = String::new();
     let mut tool_uses: Vec<(String, String, String)> = Vec::new(); // id, name, accumulated json
     let mut current_tool: Option<usize> = None;
     let mut stop_reason = StopReason::EndTurn;
+    let mut total_usage = Usage::default();
 
     loop {
         let item = tokio::select! {
@@ -1149,6 +1613,7 @@ async fn consume_stream(
                 usage,
             } => {
                 stop_reason = sr;
+                total_usage.add(&usage);
                 let _ = events.send(AgentEvent::TokenUsage(usage));
             }
             StreamEvent::Error(e) => return Err(e),
@@ -1168,7 +1633,7 @@ async fn consume_stream(
         content.push(ContentBlock::ToolUse { id, name, input });
     }
 
-    Ok((Message::assistant(content), stop_reason))
+    Ok((Message::assistant(content), stop_reason, total_usage))
 }
 
 #[cfg(test)]
@@ -2508,5 +2973,593 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{id} was never answered"))
+    }
+
+    // ---- context accounting ------------------------------------------------
+
+    use crate::provider::ProviderCapabilities;
+    use crate::testkit::text_reply_with_usage;
+
+    fn window_of(context_window: u32) -> ProviderCapabilities {
+        ProviderCapabilities {
+            context_window,
+            ..ProviderCapabilities::default()
+        }
+    }
+
+    fn prompt_usage(input_tokens: u32) -> Usage {
+        Usage {
+            input_tokens,
+            ..Usage::default()
+        }
+    }
+
+    fn context_events(events: &[AgentEvent]) -> Vec<(u32, u32, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ContextUsage {
+                    used,
+                    window,
+                    estimated,
+                } => Some((*used, *window, *estimated)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The provider hands back an exact prompt count with every response, so
+    /// the gauge should be that number verbatim — not an estimate of it —
+    /// right up until something else is appended to history.
+    #[tokio::test]
+    async fn the_context_gauge_uses_the_providers_own_prompt_count() {
+        let provider = Arc::new(
+            ScriptedProvider::streams([text_reply_with_usage(
+                "ok",
+                Usage {
+                    input_tokens: 5_000,
+                    output_tokens: 120,
+                    ..Usage::default()
+                },
+            )])
+            .with_capabilities(window_of(20_000)),
+        );
+        let mut agent = agent_for(provider, Arc::new(NoTools));
+        let (_, events) = run_collect(&mut agent, "hello", CancellationToken::new()).await;
+
+        let context = agent.context_usage();
+        assert_eq!(context.used, 5_120);
+        assert_eq!(context.window, 20_000);
+        assert!(
+            !context.estimated,
+            "nothing was appended after the response"
+        );
+        assert!(
+            (context.ratio() - 0.256).abs() < 1e-6,
+            "{}",
+            context.ratio()
+        );
+
+        // And the frontend was told, with the same numbers.
+        assert!(
+            context_events(&events).contains(&(5_120, 20_000, false)),
+            "{:?}",
+            context_events(&events)
+        );
+    }
+
+    /// Anthropic reports `input_tokens` *excluding* cached tokens, so a gauge
+    /// that reads only that field shows an all-but-empty context on the exact
+    /// sessions that are closest to full.
+    #[tokio::test]
+    async fn cached_prompt_tokens_count_toward_the_context() {
+        let provider = Arc::new(
+            ScriptedProvider::streams([text_reply_with_usage(
+                "ok",
+                Usage {
+                    input_tokens: 100,
+                    output_tokens: 0,
+                    cache_read: 9_000,
+                    cache_write: 500,
+                },
+            )])
+            .with_capabilities(window_of(20_000)),
+        );
+        let mut agent = agent_for(provider, Arc::new(NoTools));
+        run_collect(&mut agent, "hello", CancellationToken::new()).await;
+
+        assert_eq!(agent.context_usage().used, 9_600);
+    }
+
+    /// A model with no entry in any capability table must be assumed small.
+    /// `ScriptedProvider` reports `ProviderCapabilities::default()` for exactly
+    /// this reason.
+    #[tokio::test]
+    async fn an_unknown_model_is_measured_against_the_conservative_window() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply_with_usage(
+            "ok",
+            prompt_usage(4_096),
+        )]));
+        let mut agent = agent_for(provider, Arc::new(NoTools));
+        run_collect(&mut agent, "hello", CancellationToken::new()).await;
+
+        let context = agent.context_usage();
+        assert_eq!(context.window, 8_192);
+        assert!((context.ratio() - 0.5).abs() < 1e-6, "{}", context.ratio());
+        // The same 4096 tokens against a 200k model would be 2% — being wrong
+        // in this direction is what keeps a turn from blowing the window.
+        assert!(context.ratio() > 0.4);
+    }
+
+    /// Before the first response there is nothing but estimate, and the system
+    /// prompt and tool schemas are a real, sizeable part of it.
+    #[tokio::test]
+    async fn the_first_request_is_estimated_and_includes_the_prompt_overhead() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply("ok")]));
+        let agent = agent_for(provider, Arc::new(NoTools)).with_system("x".repeat(4_000));
+
+        let context = agent.context_usage();
+        assert!(context.estimated);
+        // 4000 chars of system prompt is ~1000 tokens before the margin.
+        assert!(context.used >= 1_000, "{}", context.used);
+    }
+
+    #[tokio::test]
+    async fn the_compaction_trigger_fires_at_the_threshold_and_not_before() {
+        // 0.80 of a 1000-token window is 800 exactly. Both sides of that line
+        // are checked, because "fires eventually" is not the requirement.
+        for (input_tokens, expected) in [(799u32, false), (800u32, true)] {
+            let provider = Arc::new(
+                ScriptedProvider::streams([text_reply_with_usage(
+                    "ok",
+                    prompt_usage(input_tokens),
+                )])
+                .with_capabilities(window_of(1_000)),
+            );
+            let mut agent = agent_for(provider, Arc::new(NoTools));
+            run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+            assert_eq!(agent.context_usage().used, input_tokens);
+            assert_eq!(
+                agent.should_compact(),
+                expected,
+                "{input_tokens} tokens of a 1000-token window"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_can_be_switched_off_entirely() {
+        let provider = Arc::new(
+            ScriptedProvider::streams([text_reply_with_usage("ok", prompt_usage(999))])
+                .with_capabilities(window_of(1_000)),
+        );
+        let mut agent = agent_for(provider, Arc::new(NoTools)).with_compaction(CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        });
+        run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        assert!(agent.context_usage().ratio() > 0.9);
+        assert!(!agent.should_compact());
+    }
+
+    // ---- compaction --------------------------------------------------------
+
+    const OPEN_TODOS: &[&str] = &[
+        "wire up the migration path",
+        "persist the computed cost",
+        "emit the context gauge",
+        "write the compaction tests",
+    ];
+    const DONE_TODO: &str = "read the existing session store";
+
+    fn write_tasks_call() -> Message {
+        let mut tasks = vec![serde_json::json!({
+            "content": DONE_TODO,
+            "status": "completed",
+        })];
+        for (i, todo) in OPEN_TODOS.iter().enumerate() {
+            tasks.push(serde_json::json!({
+                "content": todo,
+                "status": if i == 0 { "in_progress" } else { "pending" },
+            }));
+        }
+        Message::assistant(vec![ContentBlock::ToolUse {
+            id: "tasks_1".into(),
+            name: "write_tasks".into(),
+            input: serde_json::json!({ "tasks": tasks }),
+        }])
+    }
+
+    /// A long, realistic session: the checklist is established in the third
+    /// message — deep inside the part compaction throws away — and the rest is
+    /// alternating work with tool calls in it.
+    fn long_history(total: usize) -> Vec<Message> {
+        let mut messages = vec![
+            Message::user_text("build the context accounting chain"),
+            write_tasks_call(),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tasks_1".into(),
+                    content: "tasks updated".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let mut round = 0;
+        while messages.len() < total {
+            round += 1;
+            messages.push(Message::user_text(format!("step {round}, please continue")));
+            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: format!("call_{round}"),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": format!("src/file_{round}.rs") }),
+            }]));
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("call_{round}"),
+                    content: format!("contents of file {round}"),
+                    is_error: false,
+                }],
+            });
+            messages.push(Message::assistant(vec![ContentBlock::Text {
+                text: format!("read file {round}"),
+            }]));
+        }
+        messages.truncate(total);
+        messages
+    }
+
+    fn history_text(history: &[Message]) -> String {
+        history
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fingerprint(history: &[Message]) -> String {
+        serde_json::to_string(history).unwrap()
+    }
+
+    /// The acceptance criterion, end to end: 200 messages, todos established
+    /// in the part that gets thrown away, and every open one still present
+    /// afterwards — because they are re-injected structurally, not because the
+    /// summary happened to mention them (the scripted summary deliberately
+    /// mentions none of them).
+    #[tokio::test]
+    async fn two_hundred_messages_compact_with_every_pending_todo_intact() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply(
+            "The session refactored the session store and added a migration path.",
+        )]));
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools));
+        agent.set_goal(Some("ship context accounting".into()));
+        agent.seed_history(long_history(200));
+        assert_eq!(agent.history().len(), 200);
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let outcome = agent
+            .compact(&events_tx, &CancellationToken::new())
+            .await
+            .expect("compaction should succeed");
+
+        assert_eq!(outcome.messages_before, 200);
+        assert!(outcome.messages_after <= 12, "{outcome:?}");
+        assert!(outcome.tokens_after < outcome.tokens_before, "{outcome:?}");
+        // Exactly one provider request: the summary. Compaction is not an
+        // excuse to start a conversation.
+        assert_eq!(provider.request_count(), 1);
+        // ...and it was asked with no tools, so it cannot go do work of its own.
+        assert!(provider.last_request().unwrap().tools.is_empty());
+
+        let text = history_text(agent.history());
+        for todo in OPEN_TODOS {
+            assert!(text.contains(todo), "compaction lost the todo {todo:?}");
+        }
+        assert!(
+            !text.contains(DONE_TODO),
+            "a completed todo was re-injected as open"
+        );
+        assert!(text.contains("ship context accounting"), "{text}");
+        assert!(text.contains("refactored the session store"), "{text}");
+        assert!(text.contains("src/file_1.rs"), "files touched were lost");
+
+        // The invariant that makes the *next* request legal at all.
+        assert_eq!(
+            collect_ids(agent.history(), true),
+            collect_ids(agent.history(), false)
+        );
+        // Roles still alternate across the seam.
+        assert_eq!(agent.history()[0].role, Role::User);
+        assert_eq!(agent.history()[1].role, Role::Assistant);
+        assert_eq!(agent.history()[2].role, Role::User);
+    }
+
+    /// The criterion end to end through `run_turn`, not through `compact`
+    /// directly: a 200-message session crosses the threshold, compacts itself
+    /// mid-turn, and answers — with every open todo still in the history the
+    /// model was actually sent.
+    #[tokio::test]
+    async fn a_long_turn_auto_compacts_and_still_answers() {
+        let provider = Arc::new(
+            ScriptedProvider::streams([
+                text_reply("Earlier work established the store and its migrations."),
+                text_reply_with_usage("here is the answer", prompt_usage(300)),
+            ])
+            .with_capabilities(window_of(1_000)),
+        );
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools));
+        agent.seed_history(long_history(200));
+        assert!(
+            agent.should_compact(),
+            "200 messages must not fit a 1000-token window"
+        );
+
+        let (completed, events) =
+            run_collect(&mut agent, "so what now?", CancellationToken::new()).await;
+
+        assert!(completed);
+        // Two requests: the summary, then the turn itself.
+        assert_eq!(provider.request_count(), 2);
+        assert!(agent.history().len() < 20, "{}", agent.history().len());
+
+        // What the model was *sent* on the real request is what matters.
+        let sent = provider.requests()[1]
+            .messages
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for todo in OPEN_TODOS {
+            assert!(
+                sent.contains(todo),
+                "auto-compaction lost the todo {todo:?}"
+            );
+        }
+        assert!(sent.contains("so what now?"), "the user's message was lost");
+
+        // The gauge came back down, and the frontend was told.
+        assert!(!agent.should_compact());
+        assert!(!context_events(&events).is_empty());
+    }
+
+    /// The second compaction is the dangerous one. By then the original
+    /// `write_tasks` call is gone — the first compaction replaced it with
+    /// prose — so anything reconstructing todos from history finds nothing.
+    /// The todos survive because the first compaction promoted them to the
+    /// agent's live checklist.
+    #[tokio::test]
+    async fn a_second_compaction_still_carries_the_todos() {
+        let provider = Arc::new(ScriptedProvider::streams([
+            text_reply("first summary"),
+            text_reply("second summary"),
+        ]));
+        let mut agent = agent_for(provider, Arc::new(NoTools));
+        agent.seed_history(long_history(200));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        agent.compact(&events_tx, &cancel).await.unwrap();
+
+        // There is no `write_tasks` call left anywhere to reconstruct from.
+        assert!(
+            !agent
+                .history()
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "write_tasks")),
+            "the fixture no longer tests what it claims to"
+        );
+        assert_eq!(agent.tasks().len(), OPEN_TODOS.len());
+
+        agent.compact(&events_tx, &cancel).await.unwrap();
+
+        let text = history_text(agent.history());
+        for todo in OPEN_TODOS {
+            assert!(text.contains(todo), "the second compaction lost {todo:?}");
+        }
+    }
+
+    /// The failure path. A summarising request that dies must leave the
+    /// conversation byte-for-byte as it was — the alternative is destroying
+    /// history at precisely the moment the provider is unreliable.
+    #[tokio::test]
+    async fn a_failed_summarisation_leaves_history_intact() {
+        // 401 rather than a 5xx: non-retryable, so the failure is the test's
+        // subject rather than the backoff schedule.
+        let provider = Arc::new(ScriptedProvider::new([ScriptedResponse::Fail(api_error(
+            401, None,
+        ))]));
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools));
+        let before = long_history(200);
+        agent.seed_history(before.clone());
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let error = agent
+            .compact(&events_tx, &CancellationToken::new())
+            .await
+            .expect_err("the summarising request failed, so compaction must fail");
+
+        assert!(error.contains("401"), "{error}");
+        assert_eq!(agent.history().len(), before.len());
+        assert_eq!(fingerprint(agent.history()), fingerprint(&before));
+        assert_eq!(provider.request_count(), 1);
+    }
+
+    /// A summary that comes back empty is a failure too — replacing 200
+    /// messages with nothing is worse than not compacting.
+    #[tokio::test]
+    async fn an_empty_summary_is_treated_as_a_failure() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply("   ")]));
+        let mut agent = agent_for(provider, Arc::new(NoTools));
+        let before = long_history(60);
+        agent.seed_history(before.clone());
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        assert!(agent
+            .compact(&events_tx, &CancellationToken::new())
+            .await
+            .is_err());
+        assert_eq!(fingerprint(agent.history()), fingerprint(&before));
+    }
+
+    /// A conversation too short to have a safe split point must fail cleanly
+    /// without spending a request on a summary of nothing.
+    #[tokio::test]
+    async fn a_short_history_is_not_compacted_and_costs_no_request() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply("unused")]));
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools));
+        agent.seed_history(vec![Message::user_text("hi")]);
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        assert!(agent
+            .compact(&events_tx, &CancellationToken::new())
+            .await
+            .is_err());
+        assert_eq!(provider.request_count(), 0);
+    }
+
+    /// The summary must never surface as something the assistant said — it is
+    /// housekeeping, not conversation. Its token cost, however, is the user's
+    /// and does surface.
+    #[tokio::test]
+    async fn the_summary_text_never_reaches_the_frontend_but_its_cost_does() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply_with_usage(
+            "a summary nobody should see in the chat pane",
+            Usage {
+                input_tokens: 900,
+                output_tokens: 100,
+                ..Usage::default()
+            },
+        )]));
+        let mut agent = agent_for(provider, Arc::new(NoTools));
+        agent.seed_history(long_history(60));
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        agent
+            .compact(&events_tx, &CancellationToken::new())
+            .await
+            .unwrap();
+        let events: Vec<AgentEvent> = std::iter::from_fn(|| events_rx.try_recv().ok()).collect();
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AssistantTextDelta(_))),
+            "the summary leaked into the transcript"
+        );
+        let reported: u32 = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TokenUsage(u) => Some(u.total_tokens()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(reported, 1_000);
+        assert_eq!(agent.session_usage().output_tokens, 100);
+    }
+
+    // ---- cost --------------------------------------------------------------
+
+    fn priced_agent(provider: Arc<ScriptedProvider>, model: &str) -> Agent {
+        Agent::new(
+            provider,
+            Arc::new(NoTools),
+            model.to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_permission_policy(PermissionPolicy::Skip)
+    }
+
+    /// Cost is computed once, here, while the turn is running — which is the
+    /// number the session store then persists.
+    #[tokio::test]
+    async fn a_turn_carries_the_cost_computed_when_it_ran() {
+        let provider = Arc::new(
+            ScriptedProvider::streams([text_reply_with_usage(
+                "ok",
+                Usage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    ..Usage::default()
+                },
+            )])
+            .with_id("anthropic"),
+        );
+        let mut agent = priced_agent(provider, "claude-sonnet-5");
+        run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        let turn = agent.last_turn().expect("a turn ran");
+        assert_eq!(turn.provider, "anthropic");
+        assert_eq!(turn.model, "claude-sonnet-5");
+        assert_eq!(turn.usage.output_tokens, 1_000_000);
+        assert!((turn.cost_usd.unwrap() - 18.0).abs() < 1e-9, "{turn:?}");
+        assert!((agent.session_cost_usd() - 18.0).abs() < 1e-9);
+    }
+
+    /// An unpriced model still gets its tokens recorded; the cost is `None`,
+    /// never a zero pretending the turn was free.
+    #[tokio::test]
+    async fn an_unpriced_model_records_tokens_without_inventing_a_cost() {
+        let provider = Arc::new(
+            ScriptedProvider::streams([text_reply_with_usage("ok", prompt_usage(1_000))])
+                .with_id("ollama"),
+        );
+        let mut agent = priced_agent(provider, "qwen2.5");
+        run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        let turn = agent.last_turn().unwrap();
+        assert_eq!(turn.usage.input_tokens, 1_000);
+        assert_eq!(turn.cost_usd, None);
+        assert_eq!(agent.session_cost_usd(), 0.0);
+    }
+
+    /// Each turn's accounting stands alone, so a caller persisting one row per
+    /// turn never double-counts the previous one.
+    #[tokio::test]
+    async fn turn_accounting_resets_between_turns_while_the_session_total_grows() {
+        let provider = Arc::new(
+            ScriptedProvider::streams([
+                text_reply_with_usage("one", prompt_usage(1_000_000)),
+                text_reply_with_usage("two", prompt_usage(1_000_000)),
+            ])
+            .with_id("anthropic"),
+        );
+        let mut agent = priced_agent(provider, "claude-sonnet-5");
+
+        run_collect(&mut agent, "first", CancellationToken::new()).await;
+        assert!((agent.last_turn().unwrap().cost_usd.unwrap() - 3.0).abs() < 1e-9);
+
+        run_collect(&mut agent, "second", CancellationToken::new()).await;
+        assert!((agent.last_turn().unwrap().cost_usd.unwrap() - 3.0).abs() < 1e-9);
+        assert!((agent.session_cost_usd() - 6.0).abs() < 1e-9);
+        assert_eq!(agent.session_usage().input_tokens, 2_000_000);
+    }
+
+    /// What `--resume` does: the restored total is whatever the store recorded,
+    /// and this turn's freshly computed cost accumulates on top of it.
+    #[tokio::test]
+    async fn a_resumed_session_keeps_accumulating_from_its_restored_total() {
+        let provider = Arc::new(
+            ScriptedProvider::streams([text_reply_with_usage("ok", prompt_usage(1_000_000))])
+                .with_id("anthropic"),
+        );
+        let mut agent = priced_agent(provider, "claude-sonnet-5");
+        agent.seed_session_totals(
+            Usage {
+                input_tokens: 500,
+                output_tokens: 250,
+                ..Usage::default()
+            },
+            41.5,
+        );
+
+        run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        assert!((agent.session_cost_usd() - 44.5).abs() < 1e-9);
+        assert_eq!(agent.session_usage().input_tokens, 1_000_500);
     }
 }

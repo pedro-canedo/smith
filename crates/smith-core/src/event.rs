@@ -43,7 +43,7 @@ pub enum TaskStatus {
 /// One step of a checklist the agent keeps visible via the `write_tasks`
 /// tool — mirrors how coding-agent CLIs surface a persistent todo list
 /// instead of just a transient "thinking…" status.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub content: String,
     pub status: TaskStatus,
@@ -133,6 +133,9 @@ pub enum Action {
     SetGoal(Option<String>),
     /// Answer to an `ask_user` prompt (chosen suggestion or free text).
     QuestionResponse(String),
+    /// `/compact`: summarise the older part of the conversation now, instead
+    /// of waiting for the context to cross the auto-compaction threshold.
+    Compact,
     /// `/loop [<N>] <task>`: runs `task` repeatedly — each iteration after the
     /// first is a "continue" turn — until the model's reply contains the
     /// completion sentinel, `max_iterations` is reached (defaults to a safety
@@ -191,6 +194,21 @@ pub enum AgentEvent {
     /// Coarse status for the activity line / chrome.
     PhaseChanged(AgentPhase),
     TokenUsage(Usage),
+    /// How full the model's context window is, recomputed after every provider
+    /// round and after a compaction.
+    ///
+    /// Three flat fields rather than a ratio, because a ratio throws away the
+    /// two numbers a frontend actually wants to print ("128k / 200k") and
+    /// cannot be recovered from. `estimated` exists because the honest answer
+    /// changes shape mid-turn: right after a response `used` is the provider's
+    /// own prompt count and is exact, but once tool results have been appended
+    /// part of it is a `chars/4` estimate — and a gauge that renders "162,000"
+    /// when it means "roughly 162,000" is lying about which one it has.
+    ContextUsage {
+        used: u32,
+        window: u32,
+        estimated: bool,
+    },
     /// Confirms a successful `Action::SwitchModel`, so the frontend can
     /// update its own display labels and let the user know it took effect.
     ModelChanged {
@@ -327,6 +345,8 @@ mod tests {
             AgentEvent::TokenUsage(Usage {
                 input_tokens: 10,
                 output_tokens: 20,
+                cache_read: 30,
+                cache_write: 40,
             }),
             AgentEvent::TasksUpdated(vec![Task {
                 content: "ship it".into(),

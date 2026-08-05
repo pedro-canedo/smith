@@ -400,6 +400,10 @@ pub struct App {
     pub git_branch: Option<String>,
     pub idle_hint: IdleHint,
     pub usage: Usage,
+    /// Latest context-window occupancy reported by the agent: tokens used,
+    /// the model's window, and whether the figure includes an estimate.
+    /// `None` until the first `ContextUsage` event of the session.
+    pub context: Option<(u32, u32, bool)>,
     /// Latest local-machine resource snapshot (Ollama only; `None` for
     /// token-billed providers, which show a cost estimate instead).
     pub resources: Option<ResourceStats>,
@@ -466,6 +470,7 @@ impl App {
             git_branch: config.git_branch,
             idle_hint: config.idle_hint,
             usage: Usage::default(),
+            context: None,
             resources: None,
             permission_policy: config.permission_policy,
             request_count: 0,
@@ -1486,6 +1491,17 @@ impl App {
                     }
                 }
             }
+            AgentEvent::ContextUsage {
+                used,
+                window,
+                estimated,
+            } => {
+                // Kept as the agent reported it, not folded into `usage`:
+                // `usage` is the session's cumulative token spend, while this
+                // is the occupancy of a single window that compaction resets.
+                // Adding one to the other would be meaningless.
+                self.context = Some((used, window, estimated));
+            }
             AgentEvent::ResourceUsage(stats) => {
                 self.resources = Some(stats);
             }
@@ -1794,6 +1810,7 @@ mod tests {
         app.on_agent_event(AgentEvent::TokenUsage(Usage {
             input_tokens: 10,
             output_tokens: 100,
+            ..Usage::default()
         }));
         let rate = app.tokens_per_sec.expect("measured rate");
         assert!(rate > 0.0);

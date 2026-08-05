@@ -158,6 +158,22 @@ fn parse_sse_payload(payload: &serde_json::Value, state: &mut SseState) -> Vec<S
             {
                 state.usage.input_tokens = tokens as u32;
             }
+            // Reported *alongside* `input_tokens`, not inside it. Dropping
+            // these on the floor makes a heavily-cached session — which is
+            // every long one, since the system prompt and tool schemas cache —
+            // look like it is barely using its context window at all.
+            if let Some(tokens) = payload
+                .pointer("/message/usage/cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                state.usage.cache_read = tokens as u32;
+            }
+            if let Some(tokens) = payload
+                .pointer("/message/usage/cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                state.usage.cache_write = tokens as u32;
+            }
         }
         "content_block_start" => {
             let index = payload.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -351,6 +367,50 @@ mod tests {
         assert!(
             matches!(&complete[0], StreamEvent::MessageComplete { stop_reason: StopReason::EndTurn, usage } if usage.output_tokens == 3)
         );
+    }
+
+    /// Anthropic reports cache traffic *alongside* `input_tokens`, not inside
+    /// it, so all three have to be captured and kept disjoint — that is what
+    /// makes `Usage::prompt_tokens` the real context occupancy.
+    #[test]
+    fn cache_tokens_are_captured_alongside_input_tokens() {
+        let mut state = SseState::default();
+        let start = serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": 120,
+                "cache_read_input_tokens": 18_000,
+                "cache_creation_input_tokens": 2_400,
+            }},
+        });
+        let stop = serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 40}});
+        let msg_stop = serde_json::json!({"type": "message_stop"});
+
+        parse_sse_payload(&start, &mut state);
+        parse_sse_payload(&stop, &mut state);
+        let complete = parse_sse_payload(&msg_stop, &mut state);
+
+        let StreamEvent::MessageComplete { usage, .. } = &complete[0] else {
+            panic!("expected MessageComplete, got {:?}", complete[0]);
+        };
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.cache_read, 18_000);
+        assert_eq!(usage.cache_write, 2_400);
+        assert_eq!(usage.prompt_tokens(), 20_520);
+    }
+
+    /// A response with no cache fields at all (uncached request, or a model
+    /// that does not support it) must not invent any.
+    #[test]
+    fn absent_cache_fields_stay_zero() {
+        let mut state = SseState::default();
+        parse_sse_payload(
+            &serde_json::json!({"type": "message_start", "message": {"usage": {"input_tokens": 7}}}),
+            &mut state,
+        );
+        assert_eq!(state.usage.cache_read, 0);
+        assert_eq!(state.usage.cache_write, 0);
+        assert_eq!(state.usage.prompt_tokens(), 7);
     }
 
     #[test]

@@ -48,6 +48,7 @@ mod tests {
         let usage = Usage {
             input_tokens: 1_000_000,
             output_tokens: 1_000_000,
+            ..Usage::default()
         };
         let cost = estimate_cost_usd("anthropic", "claude-sonnet-5", &usage).unwrap();
         assert!((cost - 18.0).abs() < 0.001);
@@ -58,6 +59,7 @@ mod tests {
         let usage = Usage {
             input_tokens: 100,
             output_tokens: 100,
+            ..Usage::default()
         };
         assert!(estimate_cost_usd("anthropic", "claude-does-not-exist", &usage).is_none());
         assert!(estimate_cost_usd("ollama", "qwen3.5", &usage).is_none());

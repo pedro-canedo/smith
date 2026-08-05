@@ -14,7 +14,7 @@ use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::message::{CompletionRequest, StopReason, StreamEvent, Usage};
-use crate::provider::{LlmProvider, ProviderError};
+use crate::provider::{LlmProvider, ProviderCapabilities, ProviderError};
 
 /// What a [`ScriptedProvider`] does for one request.
 pub enum ScriptedResponse {
@@ -40,6 +40,8 @@ pub enum ScriptedResponse {
 pub struct ScriptedProvider {
     responses: Mutex<VecDeque<ScriptedResponse>>,
     requests: Mutex<Vec<CompletionRequest>>,
+    capabilities: ProviderCapabilities,
+    id: &'static str,
 }
 
 impl ScriptedProvider {
@@ -47,7 +49,24 @@ impl ScriptedProvider {
         Self {
             responses: Mutex::new(responses.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
+            capabilities: ProviderCapabilities::default(),
+            id: "scripted",
         }
+    }
+
+    /// Overrides what `capabilities()` reports. Anything keyed off the context
+    /// window — the gauge, the compaction trigger — needs a window it can
+    /// cross deliberately rather than the conservative 8192 default.
+    pub fn with_capabilities(mut self, capabilities: ProviderCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Sets the id `LlmProvider::id()` reports. Cost lookups key off it, so a
+    /// test about pricing has to be able to claim to be a real provider.
+    pub fn with_id(mut self, id: &'static str) -> Self {
+        self.id = id;
+        self
     }
 
     /// One successful stream per request — the common case.
@@ -97,7 +116,11 @@ impl ScriptedProvider {
 #[async_trait]
 impl LlmProvider for ScriptedProvider {
     fn id(&self) -> &'static str {
-        "scripted"
+        self.id
+    }
+
+    fn capabilities(&self, _model: &str) -> ProviderCapabilities {
+        self.capabilities
     }
 
     async fn stream_completion(
@@ -124,11 +147,17 @@ impl LlmProvider for ScriptedProvider {
 
 /// One request's worth of events: a text reply that ends the turn.
 pub fn text_reply(text: &str) -> Vec<StreamEvent> {
+    text_reply_with_usage(text, Usage::default())
+}
+
+/// The same, but with the provider reporting real token counts — which is what
+/// context tracking and cost accounting are entirely built on.
+pub fn text_reply_with_usage(text: &str, usage: Usage) -> Vec<StreamEvent> {
     vec![
         StreamEvent::TextDelta(text.to_string()),
         StreamEvent::MessageComplete {
             stop_reason: StopReason::EndTurn,
-            usage: Usage::default(),
+            usage,
         },
     ]
 }

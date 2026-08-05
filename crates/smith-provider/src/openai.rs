@@ -208,6 +208,23 @@ fn parse_chunk(payload: &serde_json::Value, state: &mut SseState) -> Vec<StreamE
         if let Some(v) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
             state.usage.output_tokens = v as u32;
         }
+        // OpenAI reports cached tokens as a *breakdown of* `prompt_tokens`,
+        // the opposite of Anthropic, which reports them alongside it. So the
+        // cached share is subtracted back out of `input_tokens` here: `Usage`'s
+        // four fields are disjoint by contract, and `prompt_tokens()` adds
+        // them — double-counting the cached prefix would over-report the
+        // context and over-bill the turn.
+        //
+        // `cache_write` stays zero because OpenAI does not charge for, or
+        // report, cache creation.
+        if let Some(cached) = usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(|v| v.as_u64())
+        {
+            let cached = cached as u32;
+            state.usage.cache_read = cached;
+            state.usage.input_tokens = state.usage.input_tokens.saturating_sub(cached);
+        }
     }
 
     let Some(choice) = payload.get("choices").and_then(|c| c.get(0)) else {
@@ -404,6 +421,48 @@ mod tests {
         assert_eq!(wire[0]["role"], "tool");
         assert_eq!(wire[0]["tool_call_id"], "call_1");
         assert_eq!(wire[0]["content"], "42");
+    }
+
+    /// OpenAI reports cached tokens as a breakdown *of* `prompt_tokens`, the
+    /// opposite of Anthropic. `Usage`'s fields are disjoint, so the cached
+    /// share has to come back out of `input_tokens` or the same tokens get
+    /// counted — and billed — twice.
+    #[test]
+    fn cached_prompt_tokens_are_split_out_of_the_input_count() {
+        let mut state = SseState::default();
+        parse_chunk(
+            &serde_json::json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 10_000,
+                    "completion_tokens": 250,
+                    "prompt_tokens_details": {"cached_tokens": 8_000},
+                },
+            }),
+            &mut state,
+        );
+
+        assert_eq!(state.usage.input_tokens, 2_000);
+        assert_eq!(state.usage.cache_read, 8_000);
+        // OpenAI does not bill or report cache creation.
+        assert_eq!(state.usage.cache_write, 0);
+        // The total is unchanged — only its attribution moved.
+        assert_eq!(state.usage.prompt_tokens(), 10_000);
+    }
+
+    #[test]
+    fn usage_without_a_cache_breakdown_is_all_input() {
+        let mut state = SseState::default();
+        parse_chunk(
+            &serde_json::json!({
+                "choices": [],
+                "usage": {"prompt_tokens": 500, "completion_tokens": 20},
+            }),
+            &mut state,
+        );
+        assert_eq!(state.usage.input_tokens, 500);
+        assert_eq!(state.usage.cache_read, 0);
+        assert_eq!(state.usage.prompt_tokens(), 500);
     }
 
     #[test]
