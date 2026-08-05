@@ -462,6 +462,8 @@ fn tool_target(line: &ChatLine) -> String {
     let target = match name {
         "read_file" | "write_file" | "edit_file" | "list_dir" => tool_field(line, "path"),
         "glob" => tool_field(line, "pattern"),
+        "grep" => tool_field(line, "pattern"),
+        "multi_edit" => tool_field(line, "path"),
         "run_bash" => tool_field(line, "command"),
         "web_search" => tool_field(line, "query"),
         _ => None,

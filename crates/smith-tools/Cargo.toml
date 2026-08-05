@@ -16,7 +16,11 @@ sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-glob = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+grep-matcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-searcher = { workspace = true }
 similar = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }

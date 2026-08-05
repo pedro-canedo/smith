@@ -76,8 +76,10 @@ impl ToolRegistry {
         registry.register(Arc::new(crate::fs_tools::ReadFileTool));
         registry.register(Arc::new(crate::fs_tools::ListDirTool));
         registry.register(Arc::new(crate::fs_tools::GlobTool));
+        registry.register(Arc::new(crate::grep::GrepTool));
         registry.register(Arc::new(crate::fs_tools::WriteFileTool));
         registry.register(Arc::new(crate::fs_tools::EditFileTool));
+        registry.register(Arc::new(crate::fs_tools::MultiEditTool));
         registry.register(Arc::new(crate::shell_tool::RunBashTool));
         registry.register(Arc::new(crate::ask_user::AskUserTool));
         registry.register(Arc::new(crate::write_tasks::WriteTasksTool));
@@ -252,9 +254,40 @@ mod tests {
 
     #[test]
     fn builtin_tools_have_no_colliding_names() {
-        // `register` panics on collision, so this just has to not panic.
+        // `register` panics on collision, so building it is most of the test.
         let registry = ToolRegistry::with_builtin_tools();
-        assert_eq!(registry.tool_defs().len(), 9);
+        let names: Vec<String> = registry.tool_defs().into_iter().map(|d| d.name).collect();
+
+        // Asserted by name rather than by count: a count says "10 tools" when
+        // one is missing and another was added, and it makes every new tool a
+        // merge conflict for no benefit.
+        for expected in [
+            "read_file",
+            "list_dir",
+            "glob",
+            "grep",
+            "write_file",
+            "edit_file",
+            "multi_edit",
+            "run_bash",
+            "ask_user",
+            "write_tasks",
+            "web_search",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} is not registered: {names:?}"
+            );
+        }
+
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "duplicate tool name in {names:?}"
+        );
     }
 
     /// The real wiring behind checkpointing, checked against the real
@@ -269,7 +302,7 @@ mod tests {
         let registry = ToolRegistry::with_builtin_tools();
         let ctx = ToolContext::new(dir.path(), "test");
 
-        for tool in ["write_file", "edit_file"] {
+        for tool in ["write_file", "edit_file", "multi_edit"] {
             let paths = registry.snapshot_paths(
                 tool,
                 &serde_json::json!({"path": "src/main.rs", "content": "x"}),

@@ -4,6 +4,7 @@ pub mod ask_user;
 pub mod checkpoint;
 pub mod chromium;
 pub mod fs_tools;
+pub mod grep;
 pub mod registry;
 pub mod shell_tool;
 pub mod staging;
