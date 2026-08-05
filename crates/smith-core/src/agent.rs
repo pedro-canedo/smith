@@ -13,6 +13,11 @@ use crate::permission_detail::format_permission_detail;
 use crate::provider::LlmProvider;
 use crate::tool::{PermissionClass, PermissionPolicy, ToolContext, ToolResult};
 
+/// Stand-in result recorded for a tool call the turn never got to run. The
+/// model reads it, so it says plainly that nothing happened — an empty or
+/// vague result would invite it to assume the call succeeded.
+const NOT_EXECUTED_CANCELLED: &str = "not executed — the turn was cancelled by the user";
+
 /// Implemented by smith-tools::ToolRegistry. Kept as a trait here so smith-core
 /// never depends on the concrete tool crate.
 #[async_trait]
@@ -334,6 +339,19 @@ impl Agent {
                 continue;
             }
 
+            // A cancelled stream leaves a half-built message: any `ToolUse`
+            // block in it was never dispatched, and its input JSON may have
+            // stopped mid-token. Drop those blocks before the message reaches
+            // history — a `tool_use` with no matching `tool_result` makes the
+            // *next* request fail outright, so an interrupted turn would
+            // otherwise poison the whole session. The text is kept: it's what
+            // the model managed to say, and it's still useful context.
+            if stop_reason == StopReason::Cancelled {
+                assistant_message
+                    .content
+                    .retain(|b| !matches!(b, ContentBlock::ToolUse { .. }));
+            }
+
             // A provider can legitimately return a completely empty turn
             // (no text, no tool use) — pushing that into history would
             // serialize as `content: null` on the next request, which
@@ -349,7 +367,9 @@ impl Agent {
 
             if stop_reason != StopReason::ToolUse {
                 let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
-                return true;
+                // Cancellation is not a normal completion — callers use the
+                // return value to decide whether to keep driving the loop.
+                return stop_reason != StopReason::Cancelled;
             }
 
             empty_retries = 0;
@@ -365,12 +385,25 @@ impl Agent {
                 })
                 .collect();
 
-            let mut results = Vec::with_capacity(tool_uses.len());
-            for (id, name, input) in tool_uses {
+            // Every `tool_use` must come back with a matching `tool_result`
+            // or the provider rejects the next request. Seeding the answers
+            // up front and *filling them in* — rather than appending as we
+            // go — makes that invariant hold on every exit path, cancellation
+            // included, instead of depending on the loop running to the end.
+            let mut results: Vec<ContentBlock> = tool_uses
+                .iter()
+                .map(|(id, _, _)| ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: NOT_EXECUTED_CANCELLED.to_string(),
+                    is_error: true,
+                })
+                .collect();
+
+            let mut cancelled = false;
+            for (slot, (id, name, input)) in tool_uses.into_iter().enumerate() {
                 if cancel.is_cancelled() {
-                    let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
-                    let _ = events.send(AgentEvent::Error("cancelled".into()));
-                    return false;
+                    cancelled = true;
+                    break;
                 }
 
                 let result = self
@@ -384,17 +417,24 @@ impl Agent {
                         cancel.clone(),
                     )
                     .await;
-                results.push(ContentBlock::ToolResult {
+                results[slot] = ContentBlock::ToolResult {
                     tool_use_id: id,
                     content: result.content,
                     is_error: result.is_error,
-                });
+                };
             }
 
             self.messages.push(Message {
                 role: Role::User,
                 content: results,
             });
+
+            if cancelled {
+                let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
+                let _ = events.send(AgentEvent::Error("cancelled".into()));
+                return false;
+            }
+
             let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Thinking));
         }
     }
@@ -1470,5 +1510,252 @@ mod tests {
             agent.effective_system().as_deref(),
             Some("Current date: 2026-08-05")
         );
+    }
+
+    /// Asks for two tool calls in one turn, then ends the turn.
+    struct TwoToolCallProvider {
+        called: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl LlmProvider for TwoToolCallProvider {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn stream_completion(
+            &self,
+            _request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<StreamEvent, crate::provider::ProviderError>,
+            >,
+            crate::provider::ProviderError,
+        > {
+            let events = if self.called.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".to_string())),
+                    Ok(StreamEvent::MessageComplete {
+                        stop_reason: StopReason::EndTurn,
+                        usage: crate::message::Usage::default(),
+                    }),
+                ]
+            } else {
+                let mut events = Vec::new();
+                for id in ["call_1", "call_2"] {
+                    events.push(Ok(StreamEvent::ToolUseStart {
+                        id: id.to_string(),
+                        name: "slow_tool".to_string(),
+                    }));
+                    events.push(Ok(StreamEvent::ToolUseInputDelta {
+                        id: id.to_string(),
+                        partial_json: "{}".to_string(),
+                    }));
+                    events.push(Ok(StreamEvent::ToolUseComplete { id: id.to_string() }));
+                }
+                events.push(Ok(StreamEvent::MessageComplete {
+                    stop_reason: StopReason::ToolUse,
+                    usage: crate::message::Usage::default(),
+                }));
+                events
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// Cancels the turn from inside the first tool call — the exact shape of
+    /// a user hitting Esc while a tool is running.
+    struct CancelOnFirstCallTools {
+        cancel: CancellationToken,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CancelOnFirstCallTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            vec![crate::message::ToolDefinition {
+                name: "slow_tool".into(),
+                description: "test tool".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cancel.cancel();
+            ToolResult::ok("first tool finished")
+        }
+    }
+
+    /// Every `tool_use` block must be answered by a `tool_result`, even when
+    /// the turn is cancelled halfway through the round. Without this the next
+    /// request is rejected outright ("tool_use ids were found without
+    /// tool_result blocks") and the session is unusable — acceptance
+    /// criterion #1.
+    #[tokio::test]
+    async fn cancelling_mid_tool_round_still_answers_every_tool_use() {
+        let cancel = CancellationToken::new();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = Arc::new(CancelOnFirstCallTools {
+            cancel: cancel.clone(),
+            calls: calls.clone(),
+        });
+        let provider = Arc::new(TwoToolCallProvider {
+            called: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tool_ctx = ToolContext {
+            cwd: std::path::PathBuf::from("."),
+            session_id: "test-session".into(),
+        };
+        let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
+            .with_permission_policy(PermissionPolicy::Skip);
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (perm_tx, _perm_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        let completed = agent
+            .run_turn("go".into(), events_tx, perm_tx, question_tx, cancel.clone())
+            .await;
+
+        assert!(!completed, "a cancelled turn is not a normal completion");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second tool must not run after cancellation"
+        );
+
+        let tool_use_ids = collect_ids(agent.history(), true);
+        let tool_result_ids = collect_ids(agent.history(), false);
+        assert_eq!(
+            tool_use_ids, tool_result_ids,
+            "every tool_use must have a matching tool_result"
+        );
+        assert_eq!(tool_use_ids.len(), 2);
+
+        // The call that never ran must say so rather than look successful.
+        let unanswered = agent
+            .history()
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == "call_2" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("call_2 must be answered");
+        assert!(unanswered.1, "an unrun tool call is an error result");
+        assert!(unanswered.0.contains("cancelled"), "got: {}", unanswered.0);
+    }
+
+    /// Collects `tool_use` ids (`want_use`) or `tool_result` ids from history.
+    fn collect_ids(history: &[Message], want_use: bool) -> Vec<String> {
+        history
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } if want_use => Some(id.clone()),
+                ContentBlock::ToolResult { tool_use_id, .. } if !want_use => {
+                    Some(tool_use_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Emits a partial tool call and then reports the stream as cancelled —
+    /// what a mid-stream Esc looks like.
+    struct CancelledMidStreamProvider;
+
+    #[async_trait]
+    impl LlmProvider for CancelledMidStreamProvider {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn stream_completion(
+            &self,
+            _request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<StreamEvent, crate::provider::ProviderError>,
+            >,
+            crate::provider::ProviderError,
+        > {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("let me check ".to_string())),
+                Ok(StreamEvent::ToolUseStart {
+                    id: "half_call".to_string(),
+                    name: "slow_tool".to_string(),
+                }),
+                Ok(StreamEvent::ToolUseInputDelta {
+                    id: "half_call".to_string(),
+                    partial_json: "{\"pa".to_string(),
+                }),
+                Ok(StreamEvent::MessageComplete {
+                    stop_reason: StopReason::Cancelled,
+                    usage: crate::message::Usage::default(),
+                }),
+            ])))
+        }
+    }
+
+    /// A tool call cut off mid-stream was never dispatched and its arguments
+    /// may be truncated JSON — it must not reach history, or it becomes a
+    /// dangling `tool_use` that breaks every later request.
+    #[tokio::test]
+    async fn cancelling_mid_stream_drops_the_half_built_tool_call() {
+        let tool_ctx = ToolContext {
+            cwd: std::path::PathBuf::from("."),
+            session_id: "test-session".into(),
+        };
+        let mut agent = Agent::new(
+            Arc::new(CancelledMidStreamProvider),
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            tool_ctx,
+        );
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (perm_tx, _perm_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        let completed = agent
+            .run_turn(
+                "go".into(),
+                events_tx,
+                perm_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!completed, "cancelled is not a normal completion");
+        assert!(
+            collect_ids(agent.history(), true).is_empty(),
+            "no dangling tool_use may survive a cancelled stream"
+        );
+        // The text the model did manage to produce is still worth keeping.
+        assert!(agent
+            .history()
+            .iter()
+            .any(|m| m.text().contains("let me check")));
     }
 }

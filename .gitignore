@@ -1,3 +1,4 @@
 /target
 .smith/
+.claude/worktrees/
 graphify-out/graph.html
