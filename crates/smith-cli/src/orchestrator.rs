@@ -152,9 +152,12 @@ impl Persistence {
 }
 
 /// Connects to every configured MCP server and registers its tools into
-/// `tools`. A server that fails to connect or list tools is skipped (with an
-/// error surfaced in the UI) rather than aborting startup — one bad server
-/// shouldn't take down the whole session.
+/// `tools`, each under the namespaced `mcp__{server}__{tool}` name so a remote
+/// server can't shadow a built-in or another server. A server that fails to
+/// connect or list tools is skipped (with an error surfaced in the UI) rather
+/// than aborting startup — one bad server shouldn't take down the whole
+/// session; an individual tool whose name is somehow still taken is skipped
+/// the same way.
 async fn connect_mcp_servers(
     config: &Config,
     tools: &mut ToolRegistry,
@@ -181,10 +184,14 @@ async fn connect_mcp_servers(
         match client.list_tools().await {
             Ok(defs) => {
                 for def in defs {
-                    tools.register(Arc::new(smith_mcp::McpToolAdapter::new(
-                        client.clone(),
-                        def,
-                    )));
+                    let remote_name = def.name.clone();
+                    let adapter = Arc::new(smith_mcp::McpToolAdapter::new(client.clone(), def));
+                    if let Err(e) = tools.try_register(adapter) {
+                        let _ = event_tx.send(AgentEvent::Error(format!(
+                            "mcp server '{}': skipping tool '{remote_name}': {e}",
+                            server.name
+                        )));
+                    }
                 }
             }
             Err(e) => {
@@ -348,7 +355,7 @@ pub async fn run_orchestrator(
 
     let mut tools = ToolRegistry::with_builtin_tools();
     if let Some(key) = config.exa.api_key.clone() {
-        tools.register(Arc::new(smith_tools::web_search::WebSearchTool::new(Some(
+        tools.replace(Arc::new(smith_tools::web_search::WebSearchTool::new(Some(
             key,
         ))));
     }

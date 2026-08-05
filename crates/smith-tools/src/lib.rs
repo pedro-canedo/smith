@@ -8,4 +8,4 @@ pub mod staging;
 pub mod web_search;
 pub mod write_tasks;
 
-pub use registry::ToolRegistry;
+pub use registry::{DuplicateToolName, ToolRegistry};

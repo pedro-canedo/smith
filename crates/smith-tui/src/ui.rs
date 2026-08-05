@@ -23,6 +23,10 @@ const MAX_CONTENT_WIDTH: u16 = 100;
 const ERROR_TAIL_LINES: usize = 3;
 /// Cap for tool output in verbose (expanded) mode.
 const VERBOSE_OUTPUT_CAP: usize = 12;
+/// Shown in the status bar between the two `Ctrl+C` presses that quit.
+const QUIT_HINT: &str = "press Ctrl+C again to quit";
+/// Floor for the permission popup: header, detail, key row and both borders.
+const PERMISSION_MODAL_MIN_HEIGHT: u16 = 8;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let suggestions = app.slash_suggestions();
@@ -102,7 +106,7 @@ fn draw_idle(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter send   Alt+Enter newline   Esc cancel   Ctrl+O tool detail   Ctrl+C quit",
+        "Enter send   Alt+Enter newline   Esc cancel   Ctrl+O tool detail   Ctrl+C ×2 quit",
         theme.disabled(),
     )));
     lines.push(Line::from(""));
@@ -881,7 +885,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let busy = !matches!(app.phase, smith_core::AgentPhase::Idle)
         || app.waiting_on_assistant
         || app.modal.is_some();
-    let center = if busy {
+    // The armed-quit hint outranks the phase readout: it is the only thing
+    // on screen telling the user what their next keystroke will do.
+    let center = if app.quit_pending() {
+        Some(QUIT_HINT.to_string())
+    } else if busy {
         let spinner = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
         let mut s = format!("{spinner} {}", app.phase_label());
         if let Some((iteration, max_iterations)) = app.loop_progress {
@@ -909,8 +917,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             let remaining = w.saturating_sub(left_w + center_w + right_w);
             let gap1 = remaining / 2;
             let gap2 = remaining.saturating_sub(gap1);
+            let center_style = if app.quit_pending() {
+                theme.warning()
+            } else {
+                theme.ember()
+            };
             spans.push(Span::styled(" ".repeat(gap1), bg));
-            spans.push(Span::styled(c, theme.ember()));
+            spans.push(Span::styled(c, center_style));
             spans.push(Span::styled(" ".repeat(gap2), bg));
             spans.push(Span::styled(right, theme.disabled()));
         }
@@ -929,12 +942,13 @@ fn draw_permission_modal(
 ) {
     let request = &modal.request;
     let width = area.width.saturating_sub(8).clamp(36, 72);
+    let max_height = (area.height.saturating_mul(4) / 5).max(PERMISSION_MODAL_MIN_HEIGHT);
 
     let mut key_row = chips::confirm_hint("y", "allow once", theme);
     key_row.extend(chips::confirm_hint("a", "allow session", theme));
     key_row.extend(chips::cancel_hint("n", "deny", theme));
 
-    let body_lines = vec![
+    let mut body_lines = vec![
         Line::from(vec![
             Span::styled("tool: ", theme.disabled()),
             Span::styled(
@@ -943,12 +957,49 @@ fn draw_permission_modal(
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled(request.detail.clone(), theme.text())),
-        Line::from(""),
-        Line::from(key_row),
     ];
+    // A `run_bash` detail is routinely multi-line; as one `Line` its newlines
+    // are not row breaks at all, so the command the user is approving came
+    // out mangled on a single row.
+    body_lines.extend(
+        request
+            .detail
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_string(), theme.text()))),
+    );
+    body_lines.push(Line::from(""));
+    body_lines.push(Line::from(key_row));
 
-    let height = 8;
+    let inner_width = width.saturating_sub(2);
+    let block = |scrollable: bool| {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " permission requested ",
+                theme.warning().add_modifier(Modifier::BOLD),
+            ))
+            .border_style(theme.warning());
+        if scrollable {
+            block.title_bottom(Span::styled(" ↑↓ / PgUp/PgDn scroll ", theme.disabled()))
+        } else {
+            block
+        }
+    };
+    let paragraph = Paragraph::new(Text::from(body_lines))
+        .style(theme.raised_bg())
+        .block(block(false))
+        .wrap(Wrap { trim: false });
+
+    // `line_count` already includes the block's two border rows, so it is the
+    // full popup height the content wants — clamp that, don't grow it again.
+    let content_height = paragraph.line_count(inner_width) as u16;
+    let height = content_height
+        .min(max_height)
+        .max(PERMISSION_MODAL_MIN_HEIGHT)
+        .min(area.height.max(1));
+    let max_scroll = content_height.saturating_sub(height);
+    modal.scroll = modal.scroll.min(max_scroll);
+
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -956,24 +1007,13 @@ fn draw_permission_modal(
         height,
     };
 
-    let paragraph = Paragraph::new(Text::from(body_lines))
-        .style(theme.raised_bg())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " permission requested ",
-                    theme.warning().add_modifier(Modifier::BOLD),
-                ))
-                .border_style(theme.warning()),
-        )
-        .wrap(Wrap { trim: false });
-
-    // Compact summary — keep scroll at 0 even if keys were pressed earlier.
-    modal.scroll = 0;
-
     frame.render_widget(Clear, popup);
-    frame.render_widget(paragraph, popup);
+    frame.render_widget(
+        paragraph
+            .block(block(max_scroll > 0))
+            .scroll((modal.scroll, 0)),
+        popup,
+    );
 }
 
 fn draw_plan_modal(
@@ -1488,6 +1528,122 @@ mod tests {
         assert!(
             text.contains("palavra"),
             "input text never made it to screen"
+        );
+    }
+
+    fn screen_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn app_with_long_permission_request() -> App {
+        let mut app = app_for_input_tests();
+        let detail = (0..40)
+            .map(|i| format!("echo line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.modal = Modal::Permission(crate::app::PermissionModal {
+            request: smith_core::PermissionRequest {
+                tool_call_id: "call_1".into(),
+                tool_name: "run_bash".into(),
+                detail,
+            },
+            scroll: 0,
+        });
+        app
+    }
+
+    #[test]
+    fn permission_modal_scrolls_through_a_long_detail_and_keeps_its_offset() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_long_permission_request();
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let first = screen_text(&terminal);
+        assert!(first.contains("line-00"), "top of the command is missing");
+        assert!(
+            first.contains("PgUp/PgDn"),
+            "a clipped detail must say it scrolls"
+        );
+
+        for _ in 0..20 {
+            app.on_key(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            );
+        }
+        assert_eq!(app.modal.permission().unwrap().scroll, 20);
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        // The redraw used to reset `scroll` to 0, which made every scroll key
+        // a no-op and left the tail of the command unreadable.
+        assert_eq!(
+            app.modal.permission().unwrap().scroll,
+            20,
+            "the redraw clobbered the scroll offset"
+        );
+        let scrolled = screen_text(&terminal);
+        assert!(
+            !scrolled.contains("line-00"),
+            "the popup never actually moved"
+        );
+        assert!(scrolled.contains("line-20"), "scrolled past the content");
+    }
+
+    #[test]
+    fn permission_modal_grows_with_its_content_but_stays_inside_the_frame() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_long_permission_request();
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        // The popup was hardcoded to 8 rows — 6 of body — regardless of how
+        // much detail there was to read. Count the rows its left border owns;
+        // the input box's own border sits in column 0, not here.
+        let popup_x = (60 - 60u16.saturating_sub(8).clamp(36, 72)) / 2;
+        let popup_rows = (0..20)
+            .filter(|y| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell(ratatui::layout::Position::new(popup_x, *y))
+                    .unwrap()
+                    .symbol()
+                    == "│"
+            })
+            .count();
+        assert!(popup_rows > 6, "popup body was only {popup_rows} rows tall");
+        assert!(popup_rows < 20, "popup grew past the frame");
+    }
+
+    #[test]
+    fn a_pending_quit_announces_itself_in_the_status_bar() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_for_input_tests();
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!screen_text(&terminal).contains(QUIT_HINT));
+
+        app.on_key(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            screen_text(&terminal).contains(QUIT_HINT),
+            "the second press has to be discoverable"
         );
     }
 }

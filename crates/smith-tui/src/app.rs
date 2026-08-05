@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use smith_core::{
     Action, AgentEvent, AgentPhase, PermissionDecision, PermissionPolicy, PermissionRequest,
@@ -13,6 +13,10 @@ const MAX_LABEL_CHARS: usize = 64;
 /// Minimum gap (seconds) between events before we emit a `Thought` row —
 /// anything shorter is just provider latency, not a real thinking pause.
 const THOUGHT_THRESHOLD_SECS: f32 = 0.5;
+/// How long a first `Ctrl+C` stays armed. Long enough to read the hint and
+/// press again on purpose, short enough that a stray `Ctrl+C` from minutes
+/// ago can't combine with a fresh one to throw the session away.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
@@ -314,6 +318,9 @@ pub struct App {
     live_tokens_per_sec: Option<f32>,
     /// Last measured rate from provider `output_tokens / elapsed`.
     tokens_per_sec: Option<f32>,
+    /// When the first of the two `Ctrl+C` presses landed, if the quit is
+    /// currently armed — see `quit_pending`.
+    quit_armed_at: Option<Instant>,
 }
 
 impl App {
@@ -356,6 +363,7 @@ impl App {
             stream_output_chars: 0,
             live_tokens_per_sec: None,
             tokens_per_sec: None,
+            quit_armed_at: None,
         }
     }
 
@@ -447,6 +455,24 @@ impl App {
         }
     }
 
+    /// True while a first `Ctrl+C` is waiting for its confirmation — the
+    /// status bar shows the hint for exactly this long.
+    pub fn quit_pending(&self) -> bool {
+        self.quit_armed_at
+            .is_some_and(|at| at.elapsed() < QUIT_CONFIRM_WINDOW)
+    }
+
+    /// Drops an armed quit whose window has lapsed, reporting whether it
+    /// actually cleared one. The event loop uses the return value to force
+    /// one more redraw so the hint disappears on its own, without a keypress.
+    pub fn expire_pending_quit(&mut self) -> bool {
+        if self.quit_armed_at.is_some() && !self.quit_pending() {
+            self.quit_armed_at = None;
+            return true;
+        }
+        false
+    }
+
     /// Handles a raw key event, returning an Action to forward to the
     /// orchestrator if this keystroke produced one.
     pub fn on_key(
@@ -455,6 +481,22 @@ impl App {
         modifiers: crossterm::event::KeyModifiers,
     ) -> Option<Action> {
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Before the modal branches, which each consume every key they see:
+        // with a modal up, `Ctrl+C` used to either type a literal "c" into
+        // the question box or do nothing at all, leaving no way out.
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+            if self.quit_pending() {
+                self.quit_armed_at = None;
+                self.should_quit = true;
+                return Some(Action::Quit);
+            }
+            self.quit_armed_at = Some(Instant::now());
+            return None;
+        }
+        // Anything else means the user moved on — quitting has to be two
+        // deliberate presses in a row, not any two presses.
+        self.quit_armed_at = None;
 
         if self.modal.is_question() {
             return match code {
@@ -613,11 +655,6 @@ impl App {
                 }
                 _ => None,
             };
-        }
-
-        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return Some(Action::Quit);
         }
 
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('o') {
@@ -2469,5 +2506,100 @@ mod tests {
         app.phase = AgentPhase::Building;
         app.on_agent_event(AgentEvent::PhaseChanged(AgentPhase::Thinking));
         assert_eq!(app.phase, AgentPhase::Building);
+    }
+
+    fn ctrl_c(app: &mut App) -> Option<Action> {
+        app.on_key(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )
+    }
+
+    fn question_modal() -> Modal {
+        Modal::Question(QuestionModal {
+            question: UserQuestion {
+                id: "q1".into(),
+                prompt: "Which approach?".into(),
+                options: ["Alpha".into(), "Beta".into(), "Gamma".into()],
+            },
+            selected: 0,
+            custom: String::new(),
+        })
+    }
+
+    fn permission_modal() -> Modal {
+        Modal::Permission(PermissionModal {
+            request: PermissionRequest {
+                tool_call_id: "call_1".into(),
+                tool_name: "run_bash".into(),
+                detail: "rm -rf build".into(),
+            },
+            scroll: 0,
+        })
+    }
+
+    #[test]
+    fn ctrl_c_with_a_question_modal_open_arms_the_quit_instead_of_typing_c() {
+        // The modal branch used to swallow it via `Char(c) if !c.is_control()`.
+        let mut app = test_app();
+        app.modal = question_modal();
+        assert!(ctrl_c(&mut app).is_none());
+        assert_eq!(app.modal.question().unwrap().custom, "");
+        assert_eq!(app.modal.question().unwrap().selected, 0);
+        assert!(app.quit_pending());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_with_plan_or_permission_modal_open_arms_the_quit() {
+        // Both branches used to fall through to `_ => None`: no way out at all.
+        for modal in [
+            Modal::Plan(PlanModal {
+                text: "step 1".into(),
+                scroll: 0,
+            }),
+            permission_modal(),
+        ] {
+            let mut app = test_app();
+            app.modal = modal;
+            assert!(ctrl_c(&mut app).is_none());
+            assert!(app.quit_pending());
+            assert!(app.modal.is_some(), "the modal must stay up until we quit");
+            assert!(matches!(ctrl_c(&mut app), Some(Action::Quit)));
+            assert!(app.should_quit);
+        }
+    }
+
+    #[test]
+    fn quitting_takes_two_ctrl_c_presses() {
+        let mut app = test_app();
+        assert!(ctrl_c(&mut app).is_none());
+        assert!(!app.should_quit, "one press must never discard the session");
+        assert!(matches!(ctrl_c(&mut app), Some(Action::Quit)));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn any_other_key_disarms_a_pending_quit() {
+        let mut app = test_app();
+        ctrl_c(&mut app);
+        app.on_key(
+            crossterm::event::KeyCode::Char('h'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(!app.quit_pending());
+        assert!(ctrl_c(&mut app).is_none(), "this is a fresh first press");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn a_stale_arm_expires_instead_of_pairing_with_a_later_press() {
+        let mut app = test_app();
+        app.quit_armed_at = Some(Instant::now() - QUIT_CONFIRM_WINDOW - Duration::from_secs(1));
+        assert!(!app.quit_pending());
+        assert!(app.expire_pending_quit(), "the lapsed hint needs a repaint");
+        assert!(!app.expire_pending_quit(), "only once");
+        assert!(ctrl_c(&mut app).is_none());
+        assert!(!app.should_quit);
     }
 }

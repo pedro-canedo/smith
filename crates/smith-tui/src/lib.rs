@@ -44,7 +44,11 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = spinner.tick() => {
-                if !app.is_animating() {
+                // An expiring `Ctrl+C` hint has to be repainted away even
+                // when nothing else is moving — otherwise it sits on an idle
+                // screen claiming a second press will still quit.
+                let quit_hint_expired = app.expire_pending_quit();
+                if !app.is_animating() && !quit_hint_expired {
                     continue;
                 }
                 app.tick();

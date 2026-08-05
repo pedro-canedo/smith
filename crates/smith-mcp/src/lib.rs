@@ -4,5 +4,5 @@ pub mod bridge;
 pub mod client;
 mod transport;
 
-pub use bridge::McpToolAdapter;
+pub use bridge::{namespaced_tool_name, McpToolAdapter};
 pub use client::{McpClient, McpError, McpToolDef};
