@@ -1,7 +1,9 @@
+mod doctor;
 mod headless;
 mod orchestrator;
 mod prompts;
 mod resources;
+mod runtime;
 mod setup;
 
 use std::collections::BTreeSet;
@@ -106,6 +108,10 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Check config, credentials, connectivity, runtimes, directory
+    /// permissions and MCP servers. Exits non-zero if anything FAILs, so it
+    /// can gate a CI job.
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -181,6 +187,13 @@ async fn main() -> ExitCode {
 
     if let Some(Commands::Sessions { action }) = &command {
         return run_sessions(action);
+    }
+
+    // After `--cwd`, because the project config layer, `.smith/` and the
+    // session store it inspects all hang off the working directory — doctor
+    // has to be looking at the same project a real run would.
+    if let Some(Commands::Doctor) = &command {
+        return ExitCode::from(doctor::run().await);
     }
 
     if cli.is_headless(std::io::stdout().is_terminal()) {
@@ -343,6 +356,52 @@ fn run_remember(note: &str, global: bool) -> ExitCode {
     }
 }
 
+/// Hands the browser `smith setup` provisioned to `smith-tools`.
+///
+/// `smith_tools::chromium` resolves a browser from `SMITH_CHROMIUM_PATH`,
+/// then `CHROME_PATH`, then `PATH` — it knows nothing about `smith-config`,
+/// and `smith-cli` cannot reach into it to teach it. Exporting the variable is
+/// the seam that already exists, so no change to that crate is needed for a
+/// provisioned browser to be found. (Having `chromium.rs` probe
+/// `~/.smith/runtime` itself would be tidier; see the note filed with this
+/// change.)
+///
+/// A variable the user set themselves is never overwritten: an explicit
+/// override has to keep winning, which is the whole contract of those two
+/// variables.
+fn export_provisioned_browser(config: &Config) {
+    let Some(path) = browser_path_to_export(config, |v| std::env::var(v).ok()) else {
+        return;
+    };
+    // Safe here in the way `set_var` needs to be: this runs during startup
+    // resolution, before any tool, provider or TUI task exists, so nothing
+    // else is reading the environment concurrently.
+    std::env::set_var(runtime::BROWSER_PATH_ENV, path);
+}
+
+/// The decision `export_provisioned_browser` makes, without the side effect —
+/// so the precedence is testable without mutating the process environment out
+/// from under every other test in the binary.
+fn browser_path_to_export(config: &Config, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let path = config
+        .runtime
+        .chromium_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())?;
+    // A variable the user set themselves is never overwritten: an explicit
+    // override has to keep winning, which is the whole contract of these two.
+    for var in [
+        runtime::BROWSER_PATH_ENV,
+        runtime::BROWSER_PATH_ENV_FALLBACK,
+    ] {
+        if env(var).is_some_and(|v| !v.trim().is_empty()) {
+            return None;
+        }
+    }
+    Some(path.to_string())
+}
+
 /// State both frontends need, resolved identically for each so a headless run
 /// and an interactive one disagree about nothing except the frontend.
 struct Startup {
@@ -362,6 +421,7 @@ impl Startup {
     fn resolve(cli: &Cli) -> Result<Self, String> {
         let cwd = std::env::current_dir().unwrap_or_default();
         let config = Config::load_layered(&cwd).unwrap_or_default();
+        export_provisioned_browser(&config);
         let provider_kind = cli
             .provider
             .or_else(|| {
@@ -798,6 +858,61 @@ mod tests {
     #[test]
     fn the_flag_surface_is_wired_up_the_way_clap_expects() {
         Cli::command().debug_assert();
+    }
+
+    fn config_with_browser(path: Option<&str>) -> Config {
+        let mut config = Config::default();
+        config.runtime.chromium_path = path.map(str::to_string);
+        config
+    }
+
+    /// The seam that makes provisioning work at all: `smith_tools::chromium`
+    /// only ever looks at these environment variables, so a browser recorded
+    /// in config reaches it or it reaches nothing.
+    #[test]
+    fn a_provisioned_browser_is_handed_to_smith_tools_through_the_env_var() {
+        let config = config_with_browser(Some("/home/u/.smith/runtime/chrome-headless-shell"));
+        assert_eq!(
+            browser_path_to_export(&config, |_| None).as_deref(),
+            Some("/home/u/.smith/runtime/chrome-headless-shell")
+        );
+    }
+
+    /// An explicit override is the user saying which browser to use. Silently
+    /// replacing it with smith's own would break the one guarantee those
+    /// variables carry.
+    #[test]
+    fn an_override_the_user_set_is_never_replaced() {
+        let config = config_with_browser(Some("/home/u/.smith/runtime/chrome-headless-shell"));
+        for var in [
+            runtime::BROWSER_PATH_ENV,
+            runtime::BROWSER_PATH_ENV_FALLBACK,
+        ] {
+            let exported =
+                browser_path_to_export(&config, |v| (v == var).then(|| "/opt/theirs".to_string()));
+            assert_eq!(exported, None, "{var} was overwritten");
+        }
+    }
+
+    #[test]
+    fn nothing_is_exported_when_no_browser_was_provisioned() {
+        assert_eq!(
+            browser_path_to_export(&config_with_browser(None), |_| None),
+            None
+        );
+        assert_eq!(
+            browser_path_to_export(&config_with_browser(Some("   ")), |_| None),
+            None
+        );
+    }
+
+    /// An empty variable is "unset", not "the user chose nothing" — otherwise
+    /// a stray `export SMITH_CHROMIUM_PATH=` disables provisioning entirely.
+    #[test]
+    fn a_blank_override_does_not_suppress_the_provisioned_browser() {
+        let config = config_with_browser(Some("/home/u/.smith/runtime/chrome-headless-shell"));
+        let exported = browser_path_to_export(&config, |_| Some("  ".to_string()));
+        assert!(exported.is_some());
     }
 
     #[test]

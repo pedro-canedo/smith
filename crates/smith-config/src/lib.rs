@@ -35,6 +35,12 @@ pub struct Config {
     /// keyless endpoint first and falls back to DuckDuckGo lite.
     #[serde(default)]
     pub exa: ProviderSecrets,
+    /// Third-party binaries `smith setup` provisioned into `~/.smith/runtime`.
+    /// Must stay ahead of `mcp_servers`: TOML forbids a plain table after an
+    /// array of tables, so a field serialized after it would produce a file
+    /// this same struct could not read back.
+    #[serde(default)]
+    pub runtime: RuntimeSettings,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
 }
@@ -56,6 +62,21 @@ pub struct ProviderSecrets {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OllamaSettings {
     pub base_url: Option<String>,
+}
+
+/// Where `smith setup` put the runtimes it provisioned.
+///
+/// Only ever *written* by the provisioning step, never hand-edited in the
+/// normal case — a user who wants their own browser sets `SMITH_CHROMIUM_PATH`
+/// instead, which still wins over anything recorded here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeSettings {
+    /// Absolute path to the provisioned headless browser binary.
+    pub chromium_path: Option<String>,
+    /// The Chrome for Testing build `chromium_path` came from, so an upgrade
+    /// can tell "already current" from "a newer build exists" without
+    /// launching the binary.
+    pub chromium_version: Option<String>,
 }
 
 /// One entry in `[[mcp_servers]]`: a stdio-transport MCP server smith should
@@ -87,6 +108,16 @@ pub fn project_config_path(project_dir: &std::path::Path) -> PathBuf {
     project_dir.join(".smith").join("config.toml")
 }
 
+/// `~/.smith/runtime` — third-party binaries smith downloaded for itself.
+///
+/// Deliberately under `~/.smith` rather than an OS cache directory: a cache is
+/// something the system may delete at will, and silently losing a 100 MB
+/// browser the user explicitly asked `smith setup` to fetch would look like a
+/// regression rather than housekeeping.
+pub fn runtime_dir() -> Result<PathBuf, ConfigError> {
+    Ok(config_dir()?.join("runtime"))
+}
+
 impl Config {
     /// Global config only. Prefer `load_layered` — this exists for `save`,
     /// which must never write a project's values back into the global file.
@@ -101,6 +132,22 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&text)?)
+    }
+
+    /// Whether one layer on disk parses, without merging it into anything.
+    ///
+    /// Exists for `smith doctor`. `load_layered` swallows a parse error into
+    /// `Config::default()`, which is right for a normal run — smith should
+    /// start — but means a typo'd file is silently *ignored* rather than
+    /// reported. This is how the diagnostic tells those two apart, and it
+    /// lives here so nothing outside this crate has to know the file is TOML.
+    ///
+    /// `Ok(false)` means the file does not exist, which is not an error.
+    pub fn check_path(path: &std::path::Path) -> Result<bool, ConfigError> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        Self::load_path(path).map(|_| true)
     }
 
     /// Global config with the project's `.smith/config.toml` layered on top.
@@ -143,6 +190,13 @@ impl Config {
             target.api_key = incoming.api_key.or(target.api_key.take());
         }
         self.ollama.base_url = other.ollama.base_url.or(self.ollama.base_url.take());
+
+        let RuntimeSettings {
+            chromium_path,
+            chromium_version,
+        } = other.runtime;
+        self.runtime.chromium_path = chromium_path.or(self.runtime.chromium_path.take());
+        self.runtime.chromium_version = chromium_version.or(self.runtime.chromium_version.take());
 
         // MCP servers are a list, not a scalar: a project declaring servers
         // means "these too", not "forget the global ones". Same name in both
@@ -317,6 +371,67 @@ mod tests {
             .unwrap();
         assert_eq!(shared.command, "project-override");
         assert!(config.mcp_servers.iter().any(|s| s.name == "project-only"));
+    }
+
+    #[test]
+    fn a_project_may_point_at_its_own_provisioned_browser() {
+        let mut config = global();
+        config.runtime.chromium_path = Some("/home/u/.smith/runtime/global".into());
+        config.merge_over(
+            toml::from_str(
+                r#"
+                [runtime]
+                chromium_path = "/opt/project-chrome"
+                "#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            config.runtime.chromium_path.as_deref(),
+            Some("/opt/project-chrome")
+        );
+    }
+
+    #[test]
+    fn an_unstated_runtime_section_keeps_the_provisioned_browser() {
+        let mut config = global();
+        config.runtime.chromium_path = Some("/home/u/.smith/runtime/chrome".into());
+        config.runtime.chromium_version = Some("151.0.7922.76".into());
+        config.merge_over(Config::default());
+        assert_eq!(
+            config.runtime.chromium_path.as_deref(),
+            Some("/home/u/.smith/runtime/chrome")
+        );
+        assert_eq!(
+            config.runtime.chromium_version.as_deref(),
+            Some("151.0.7922.76")
+        );
+    }
+
+    /// TOML cannot express a plain table after an array of tables. If
+    /// `runtime` ever moves below `mcp_servers` in the struct, `save` starts
+    /// writing files that `load` rejects — and only a round-trip with both
+    /// present catches it.
+    #[test]
+    fn a_config_with_both_a_runtime_and_mcp_servers_round_trips() {
+        let mut config = global();
+        config.runtime.chromium_path = Some("/home/u/.smith/runtime/chrome".into());
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).expect("must parse back: {text}");
+        assert_eq!(
+            parsed.runtime.chromium_path.as_deref(),
+            Some("/home/u/.smith/runtime/chrome")
+        );
+        assert_eq!(parsed.mcp_servers.len(), 1);
+    }
+
+    #[test]
+    fn the_runtime_dir_sits_under_the_config_dir() {
+        // Both derive from the home directory, which the test environment may
+        // not have; when it does, they must agree.
+        if let (Ok(config), Ok(runtime)) = (config_dir(), runtime_dir()) {
+            assert_eq!(runtime.parent(), Some(config.as_path()));
+        }
     }
 
     #[test]

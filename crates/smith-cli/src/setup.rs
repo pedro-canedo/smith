@@ -2,8 +2,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Input, Password, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use smith_config::{Config, DEFAULT_OLLAMA_BASE_URL, OLLAMA_HOST};
+
+use crate::runtime::{self, BrowserSource, HttpAssetSource};
 
 const ANTHROPIC_MODELS: &[&str] = &["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
 const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3"];
@@ -45,9 +47,77 @@ pub async fn run(jump_to_model: bool) -> color_eyre::Result<()> {
         other => color_eyre::eyre::bail!("unknown provider: {other}"),
     }
 
+    // Deliberately after the provider is settled and deliberately in `setup`
+    // at all: this is the one place a ~100 MB download can be offered, sized
+    // and consented to, instead of ambushing a turn that happened to call
+    // `web_search`. Never fatal — a browser is an upgrade to one search
+    // backend, not a prerequisite for using smith.
+    if let Err(e) = setup_browser(&theme, &mut config).await {
+        eprintln!("\nCould not provision a browser: {e}");
+        eprintln!("web_search will still work over plain HTTP, with weaker results.");
+        eprintln!("Re-run `smith setup` to try again, or run `smith doctor` for details.");
+    }
+
     config.save()?;
     println!("\nSaved to {}", smith_config::config_path()?.display());
     println!("Run `smith` to start chatting.");
+    Ok(())
+}
+
+/// The explicit provisioning step: offers to download a headless browser for
+/// `web_search`'s Chromium tier, and records where it landed.
+async fn setup_browser(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Result<()> {
+    println!("\n--- web_search browser ---");
+
+    let existing = runtime::find_browser(&config.runtime);
+    let prompt = match &existing {
+        Some(found) => {
+            let origin = match found.source {
+                BrowserSource::Env(var) => format!("from {var}"),
+                BrowserSource::Provisioned => "already provisioned by smith".to_string(),
+                BrowserSource::System => "already installed on this machine".to_string(),
+            };
+            println!("Found a browser {origin}: {}", found.path.display());
+            // Default to leaving a working setup alone; downloading over a
+            // browser someone already has is rude and slow.
+            "Download smith's own headless browser anyway?"
+        }
+        None => {
+            println!("No Chromium-family browser found.");
+            println!(
+                "web_search can use one to read search results the way a real visitor would; \
+                 without it, it falls back to plain HTTP and weaker results."
+            );
+            "Download a headless browser now (~100 MB, one time)?"
+        }
+    };
+
+    if !Confirm::with_theme(theme)
+        .with_prompt(prompt)
+        .default(existing.is_none())
+        .interact()?
+    {
+        println!("Skipped. Run `smith setup` again whenever you want it.");
+        return Ok(());
+    }
+
+    let root = smith_config::runtime_dir()?;
+    let source = HttpAssetSource::new().map_err(color_eyre::eyre::Report::msg)?;
+    let installed = runtime::provision_chromium(&source, &root, &mut std::io::stdout())
+        .await
+        .map_err(color_eyre::eyre::Report::msg)?;
+
+    if installed.reused {
+        println!("Nothing to download — that install is current.");
+    }
+    if let Some(integrity) = installed.integrity {
+        println!("Integrity: {}", integrity.describe());
+    }
+    println!("Ready: {}", installed.reported_version);
+    println!("  {}", installed.binary.display());
+
+    config.runtime.chromium_path = Some(installed.binary.to_string_lossy().into_owned());
+    config.runtime.chromium_version = Some(installed.version);
     Ok(())
 }
 

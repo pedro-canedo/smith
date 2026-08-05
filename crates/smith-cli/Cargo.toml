@@ -33,6 +33,16 @@ sysinfo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+# Chrome for Testing ships every platform as a zip; `deflate` is the only
+# compression method those archives actually use, so the rest stays out.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+# Chrome for Testing publishes no checksums of its own, but Google Cloud
+# Storage serves an MD5 of the stored object. See `runtime.rs` for what that
+# is and isn't worth.
+md-5 = "0.11"
+base64 = "0.23"
 
 [dev-dependencies]
 # `testkit` brings in `ScriptedProvider`, so the orchestrator/headless tests
@@ -40,3 +50,7 @@ chrono = { workspace = true }
 # normal build of the dependency above.
 smith-core = { workspace = true, features = ["testkit"] }
 tempfile = "3"
+# Doctor's tests build `Config` values from literal TOML, which is how a user's
+# file actually reaches it. Test-only: nothing in the binary parses TOML —
+# `smith-config` owns the format.
+toml = { workspace = true }

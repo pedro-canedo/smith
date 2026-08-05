@@ -24,6 +24,7 @@ grep-searcher = { workspace = true }
 similar = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
+directories = { workspace = true }
 url = "2"
 
 # `killpg` for cancelling a whole shell process group; already in the tree via

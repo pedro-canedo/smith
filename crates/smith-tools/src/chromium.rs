@@ -110,15 +110,57 @@ pub(crate) async fn search(
     Ok(parse_results(&dom, limit))
 }
 
+/// Where `smith setup` installs the browser it provisions. Probed directly
+/// rather than being handed over in an environment variable: exporting one
+/// from `main` meant the browser was only findable when the process happened
+/// to have gone through that code path, so a differently-wired frontend — or
+/// a test — would silently see no browser at all.
+///
+/// Versioned, so the newest install wins and an upgrade is never an
+/// overwrite. `chrome-headless-shell` rather than full Chrome, deliberately:
+/// full Chrome never terminates under the `--dump-dom` invocation below.
+const RUNTIME_SUBDIR: &str = "runtime/chrome-headless-shell";
+const RUNTIME_BINARY: &str = if cfg!(windows) {
+    "chrome-headless-shell.exe"
+} else {
+    "chrome-headless-shell"
+};
+
+/// The newest provisioned browser under `~/.smith`, if any.
+fn provisioned_browser() -> Option<PathBuf> {
+    let root = directories::BaseDirs::new()?
+        .home_dir()
+        .join(".smith")
+        .join(RUNTIME_SUBDIR);
+
+    let mut installs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join(RUNTIME_BINARY).is_file())
+        .collect();
+
+    // Lexicographic on the versioned directory name is not true semver
+    // ordering, but installs are pruned to a handful and any of them works —
+    // picking the wrong one costs nothing.
+    installs.sort();
+    installs.pop().map(|dir| dir.join(RUNTIME_BINARY))
+}
+
 /// The resolved browser, probed once per process. `PATH` doesn't change under
 /// a running program, so re-walking it on every search would buy nothing.
 fn browser_path() -> Option<&'static Path> {
     static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
     PATH.get_or_init(|| {
+        // An explicit override always wins — someone pointing at a specific
+        // binary means it, even when smith has provisioned one of its own.
         let explicit = std::env::var(BROWSER_PATH_ENV)
             .or_else(|_| std::env::var(BROWSER_PATH_ENV_FALLBACK))
             .ok();
-        pick_browser(explicit, BROWSER_CANDIDATES, resolve_in_path)
+        if let Some(found) = pick_browser(explicit, BROWSER_CANDIDATES, resolve_in_path) {
+            return Some(found);
+        }
+        provisioned_browser()
     })
     .as_deref()
 }
