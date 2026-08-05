@@ -6,6 +6,7 @@ pub mod chromium;
 pub mod fs_tools;
 pub mod grep;
 pub mod registry;
+pub mod schema_validate;
 pub mod shell_tool;
 pub mod staging;
 pub mod web_fetch;

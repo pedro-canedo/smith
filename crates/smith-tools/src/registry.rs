@@ -126,6 +126,15 @@ impl ToolExecutor for ToolRegistry {
             .unwrap_or_default()
     }
 
+    /// The one place a tool call is checked against the schema the model was
+    /// shown.
+    ///
+    /// It goes here rather than in each tool for the same reason the plan gate
+    /// and the permission prompt live in `Agent::run_one_tool`: it is the
+    /// choke point every call passes through, so a tool added tomorrow is
+    /// covered by the schema it already has to publish, and no tool can forget.
+    /// Tools keep their own checks behind this — validation proves the
+    /// *shape*, never that a path exists or that `old_str` is unique.
     async fn execute(
         &self,
         name: &str,
@@ -133,10 +142,19 @@ impl ToolExecutor for ToolRegistry {
         ctx: &ToolContext,
         cancel: CancellationToken,
     ) -> ToolResult {
-        match self.tools.get(name) {
-            Some(tool) => tool.execute(input, ctx, cancel).await,
-            None => ToolResult::error(format!("unknown tool: {name}")),
+        let Some(tool) = self.tools.get(name) else {
+            return ToolResult::error(format!("unknown tool: {name}"));
+        };
+        // A rejection is an ordinary `ToolResult::error`, deliberately: the
+        // model already sees these, and a wrong argument is the most
+        // correctable thing it can be told. Anything harsher (aborting the
+        // turn) would spend a whole turn on a fixable typo.
+        if let Err(message) =
+            crate::schema_validate::validate_input(name, &tool.input_schema(), &input)
+        {
+            return ToolResult::error(message);
         }
+        tool.execute(input, ctx, cancel).await
     }
 }
 
@@ -171,6 +189,37 @@ mod tests {
             _cancel: CancellationToken,
         ) -> ToolResult {
             ToolResult::ok("impostor ran")
+        }
+    }
+
+    /// Answers with the arguments it was handed, verbatim — the only way to
+    /// prove the validator is a *gate* and not a filter.
+    struct EchoTool {
+        name: &'static str,
+        schema: serde_json::Value,
+    }
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "echo"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            self.schema.clone()
+        }
+        fn permission_class(&self) -> PermissionClass {
+            PermissionClass::ReadOnly
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            ToolResult::ok(input.to_string())
         }
     }
 
@@ -345,6 +394,200 @@ mod tests {
                 &ctx
             )
             .is_empty());
+    }
+
+    /// The dispatch point rejects a call the schema forbids *before* the tool
+    /// runs, so `read_file` never gets to quietly default a bad `offset` to 1.
+    #[tokio::test]
+    async fn a_call_that_contradicts_the_schema_never_reaches_the_tool() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let result = registry
+            .execute(
+                "read_file",
+                serde_json::json!({"path": "a.rs", "offset": "abc"}),
+                &ctx(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            "read_file: argument \"offset\" must be an integer, but got the string \"abc\"."
+        );
+    }
+
+    /// A valid call is a pass-through: the tool must receive exactly the
+    /// arguments the model sent, unknown keys and all.
+    #[tokio::test]
+    async fn a_valid_call_reaches_the_tool_byte_identical() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool {
+            name: "echo",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "num_results": {"type": "integer", "minimum": 1}
+                },
+                "required": ["query"]
+            }),
+        }));
+
+        let input = serde_json::json!({"query": "rust", "num_results": 3});
+        let result = registry
+            .execute("echo", input.clone(), &ctx(), CancellationToken::new())
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, input.to_string());
+    }
+
+    /// `smith_core`'s `align_arguments` passes through argument names it
+    /// cannot map onto the schema, on purpose, so the tool can decide. This
+    /// layer has to agree — a weak model that sent `region` to `web_search`
+    /// must still get its search, not a validation refusal.
+    #[tokio::test]
+    async fn an_unknown_argument_is_forwarded_rather_than_refused() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool {
+            name: "echo",
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+        }));
+
+        let input = serde_json::json!({"query": "rust", "region": "us-east-1"});
+        let result = registry
+            .execute("echo", input.clone(), &ctx(), CancellationToken::new())
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, input.to_string());
+    }
+
+    /// A remote server's broken schema costs it its own validation and nothing
+    /// else. Two things it must not be able to do: make its tool permanently
+    /// uncallable (a server that accepts the call anyway would be bricked by
+    /// smith), and reach past its own entry to weaken a built-in.
+    #[tokio::test]
+    async fn a_malformed_remote_schema_cannot_disable_validation_for_a_builtin() {
+        let mut registry = ToolRegistry::with_builtin_tools();
+        registry
+            .try_register(Arc::new(EchoTool {
+                name: "mcp__hostile__read_file",
+                schema: serde_json::json!("not a schema at all"),
+            }))
+            .unwrap();
+
+        // The nonsense schema validates nothing, so the call goes through.
+        let result = registry
+            .execute(
+                "mcp__hostile__read_file",
+                serde_json::json!({"whatever": 1}),
+                &ctx(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        // The built-in is untouched — schemas are read per tool, from the tool.
+        let result = registry
+            .execute(
+                "read_file",
+                serde_json::json!({"offset": 0}),
+                &ctx(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .content
+                .contains("missing required argument \"path\""),
+            "{}",
+            result.content
+        );
+    }
+
+    /// Guards against a schema that declares something no valid call can
+    /// satisfy — a typo in `required`, a `minimum` above every sensible value.
+    /// The representative call is written by hand rather than generated,
+    /// because the point is that the *documented* way to use each tool passes.
+    #[test]
+    fn every_builtin_schema_accepts_a_representative_good_call() {
+        let good: &[(&str, serde_json::Value)] = &[
+            (
+                "read_file",
+                serde_json::json!({"path": "src/main.rs", "offset": 1, "limit": 50, "line_numbers": true}),
+            ),
+            ("list_dir", serde_json::json!({"path": "src"})),
+            (
+                "glob",
+                serde_json::json!({"pattern": "**/*.rs", "include_hidden": false}),
+            ),
+            (
+                "grep",
+                serde_json::json!({
+                    "pattern": "fn main", "path": "src", "glob": "*.rs", "type": "rust",
+                    "mode": "content", "literal": false, "case_insensitive": true,
+                    "include_hidden": false, "before_context": 0, "after_context": 2, "context": 0
+                }),
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "hi"}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "a.rs", "old_str": "a", "new_str": "b", "replace_all": false}),
+            ),
+            (
+                "multi_edit",
+                serde_json::json!({
+                    "path": "a.rs",
+                    "edits": [{"old_str": "a", "new_str": "b"}, {"old_str": "c", "new_str": "d", "replace_all": true}]
+                }),
+            ),
+            (
+                "run_bash",
+                serde_json::json!({"command": "ls -la", "timeout_secs": 30}),
+            ),
+            (
+                "ask_user",
+                serde_json::json!({
+                    "question": "Which?", "option_a": "a", "option_b": "b", "option_c": "c"
+                }),
+            ),
+            (
+                "write_tasks",
+                serde_json::json!({
+                    "tasks": [{"content": "do it", "status": "in_progress"}]
+                }),
+            ),
+            (
+                "web_search",
+                serde_json::json!({"query": "ratatui", "num_results": 5}),
+            ),
+            (
+                "web_fetch",
+                serde_json::json!({"url": "https://example.com", "max_chars": 30000}),
+            ),
+        ];
+
+        let defs = ToolRegistry::with_builtin_tools().tool_defs();
+        for def in &defs {
+            let (_, input) = good
+                .iter()
+                .find(|(name, _)| *name == def.name)
+                .unwrap_or_else(|| panic!("{} has no representative call in this test", def.name));
+            crate::schema_validate::validate_input(&def.name, &def.input_schema, input)
+                .unwrap_or_else(|e| panic!("{}'s own schema rejects a good call: {e}", def.name));
+        }
+        assert_eq!(
+            defs.len(),
+            good.len(),
+            "a tool was removed but not this list"
+        );
     }
 
     /// Prompt caching keys on a stable prefix, and the tool array is in it.
