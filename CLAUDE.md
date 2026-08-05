@@ -35,7 +35,7 @@ way: `smith-core` defines traits and knows nothing about HTTP, SQLite, or
   the `LlmProvider`/`Tool` traits, and the `Agent` orchestration loop
   (`agent.rs`). Read this crate first; `agent.rs::run_turn` is the center of
   the whole system.
-- **`smith-providers`** — `LlmProvider` adapters: Anthropic, OpenAI, and
+- **`smith-provider`** — `LlmProvider` adapters: Anthropic, OpenAI, and
   Ollama (via the OpenAI-compatible adapter), including SSE stream parsing.
 - **`smith-tools`** — built-in tools (`read_file`, `write_file`, `edit_file`,
   `list_dir`, `glob`, `run_bash`, `ask_user`) and the `ToolRegistry` that
@@ -43,11 +43,11 @@ way: `smith-core` defines traits and knows nothing about HTTP, SQLite, or
 - **`smith-mcp`** — hand-rolled JSON-RPC-over-stdio MCP client; bridges
   remote MCP server tools into the same `Tool` trait as built-ins (default
   `PermissionClass::Dangerous`, same as `run_bash`).
-- **`smith-persist`** — global config (`~/.smith/config.toml`) and
+- **`smith-store`** — global config (`~/.smith/config.toml`) and
   per-project session history (`.smith/sessions.db`, SQLite).
 - **`smith-tui`** — the `ratatui`/`crossterm` terminal UI (chat pane, input
   box, permission/plan/question modals, sidebar). Never talks to
-  `smith-providers` or `smith-tools` directly — only through the
+  `smith-provider` or `smith-tools` directly — only through the
   `Action`/`AgentEvent` channels.
 - **`smith-cli`** — binary entry point: CLI flags (`clap`), the system
   prompt, and the orchestrator loop in `main.rs` that matches on `Action` and
@@ -100,7 +100,7 @@ plan. Both checks happen in `Agent::run_one_tool`
 ### Session/goal persistence
 
 Conversations persist per-project to `.smith/sessions.db` (SQLite, via
-`smith-persist::SessionStore`). `/goal` writes to `.smith/goal.md` and is
+`smith-store::SessionStore`). `/goal` writes to `.smith/goal.md` and is
 folded into every request's system prompt via `Agent::effective_system`.
 Both live under the project's `.smith/` directory (gitignored), separate from
 the global `~/.smith/config.toml`.

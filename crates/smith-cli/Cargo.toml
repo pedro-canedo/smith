@@ -10,10 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 smith-core = { workspace = true }
-smith-providers = { workspace = true }
+smith-provider = { workspace = true }
 smith-tools = { workspace = true }
 smith-mcp = { workspace = true }
-smith-persist = { workspace = true }
+smith-store = { workspace = true }
 smith-tui = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

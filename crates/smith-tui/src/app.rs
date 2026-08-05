@@ -818,7 +818,7 @@ impl App {
 
         let (provider, model) = match spec.split_once('/') {
             Some((p, m)) => {
-                if !smith_persist::is_known_provider(p) {
+                if !smith_store::is_known_provider(p) {
                     self.lines.push(ChatLine::new(
                         ChatRole::System,
                         format!("unknown provider: {p} (expected anthropic, openai, or ollama)"),
@@ -850,7 +850,7 @@ impl App {
             ChatRole::System,
             format!("current: {}/{}", self.provider_label, self.model_label),
         ));
-        let known = smith_persist::known_models(&self.provider_label);
+        let known = smith_store::known_models(&self.provider_label);
         if !known.is_empty() {
             self.lines.push(ChatLine::new(
                 ChatRole::System,

@@ -10,7 +10,7 @@ provider returned an error: 400 Bad Request: {"error":{"message":"invalid messag
 It looks like the model “dies” on complex tasks; the real failure is on the *follow-up*
 request that re-sends history containing a bad assistant message.
 ## Root cause
-In `crates/smith-providers/src/openai.rs`, `messages_to_wire` serializes
+In `crates/smith-provider/src/openai.rs`, `messages_to_wire` serializes
 tool-only assistant messages as:
 ```json
 { "role": "assistant", "content": null, "tool_calls": [...] }
@@ -35,5 +35,5 @@ stream_options.include_usage: confirm older Ollama versions don’t reject the b
 Anthropic path: leave alone unless the same null-content pattern exists there; this bug is specifically in the OpenAI-compatible serializer used by Ollama.
 Acceptance
 Reproduce: Ollama + tools → ask to create a file → approve tool → send a follow-up message → no 400; conversation continues.
-cargo test -p smith-providers covers the empty-content serialization case.
+cargo test -p smith-provider covers the empty-content serialization case.
 cargo fmt, clippy -D warnings, cargo test --workspace pass.

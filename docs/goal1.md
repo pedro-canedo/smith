@@ -22,7 +22,7 @@ capabilities via slash commands, in the spirit of Claude Code / OpenCode.
   `cargo test --workspace`, update `/help`, and be usable in the TUI without
   depending on the next package.
 - Prefer extending the existing slash dispatcher in `smith-tui`
-  (`run_slash_command`) and persisting state in `smith-persist`
+  (`run_slash_command`) and persisting state in `smith-store`
   (`~/.smith/config.toml` and/or `.smith/`) when needed.
 - Do not refactor architecture beyond what the current package requires.
 

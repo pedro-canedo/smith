@@ -2491,8 +2491,8 @@ dependencies = [
  "serde_json",
  "smith-core",
  "smith-mcp",
- "smith-persist",
- "smith-providers",
+ "smith-provider",
+ "smith-store",
  "smith-tools",
  "smith-tui",
  "sysinfo",
@@ -2528,22 +2528,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "smith-persist"
-version = "0.1.0"
-dependencies = [
- "directories",
- "rusqlite",
- "serde",
- "serde_json",
- "smith-core",
- "tempfile",
- "thiserror 2.0.19",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "smith-providers"
+name = "smith-provider"
 version = "0.1.0"
 dependencies = [
  "async-stream",
@@ -2556,6 +2541,21 @@ dependencies = [
  "smith-core",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "smith-store"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "smith-core",
+ "tempfile",
+ "thiserror 2.0.19",
+ "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -2586,7 +2586,7 @@ dependencies = [
  "serde_json",
  "similar",
  "smith-core",
- "smith-persist",
+ "smith-store",
  "tokio",
  "tokio-stream",
  "tui-markdown",

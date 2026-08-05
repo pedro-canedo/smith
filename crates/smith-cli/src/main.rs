@@ -5,7 +5,7 @@ mod setup;
 
 use clap::{Parser, Subcommand};
 use smith_core::{Action, AgentEvent, ContentBlock, Message, PermissionAsk, QuestionAsk};
-use smith_persist::{Config, SessionStore};
+use smith_store::{Config, SessionStore};
 use smith_tui::{ChatLine, ChatRole, IdleHint, TuiConfig};
 use tokio::sync::mpsc;
 

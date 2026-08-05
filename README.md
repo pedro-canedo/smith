@@ -232,10 +232,10 @@ SQLite, or `ratatui`.
 | Crate | Responsibility |
 | --- | --- |
 | `smith-core` | Domain types, the `LlmProvider`/`Tool` traits, and the agent loop (`agent.rs`) |
-| `smith-providers` | Provider adapters (Anthropic, OpenAI, Ollama) including SSE stream parsing |
+| `smith-provider` | Provider adapters (Anthropic, OpenAI, Ollama) including SSE stream parsing |
 | `smith-tools` | Built-in tools and the `ToolRegistry` |
 | `smith-mcp` | Hand-rolled JSON-RPC-over-stdio MCP client |
-| `smith-persist` | Global config and per-project SQLite session history |
+| `smith-store` | Global config and per-project SQLite session history |
 | `smith-tui` | The `ratatui`/`crossterm` UI — chat pane, input box, modals, sidebar |
 | `smith-cli` | Binary entry point: CLI flags, system prompt, orchestrator loop |
 

@@ -30,7 +30,7 @@ cargo test --workspace
 
 7-crate workspace; dependencies flow one way toward `smith-core`, which is
 pure traits/types (no HTTP, SQLite, or ratatui). `smith-tui` never talks to
-`smith-providers`/`smith-tools` directly — only via `Action`/`AgentEvent`
+`smith-provider`/`smith-tools` directly — only via `Action`/`AgentEvent`
 channels.
 
 The loop to understand before touching orchestration or TUI code:

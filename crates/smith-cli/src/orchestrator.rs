@@ -12,8 +12,8 @@ use smith_core::{
     Action, Agent, AgentEvent, AgentPhase, LlmProvider, Message, PermissionAsk, QuestionAsk,
     ToolContext,
 };
-use smith_persist::{Config, SessionStore};
-use smith_providers::{AnthropicProvider, OpenAiProvider};
+use smith_provider::{AnthropicProvider, OpenAiProvider};
+use smith_store::{Config, SessionStore};
 use smith_tools::ToolRegistry;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -94,7 +94,7 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
                 .ollama
                 .base_url
                 .clone()
-                .unwrap_or_else(|| smith_persist::DEFAULT_OLLAMA_BASE_URL.to_string());
+                .unwrap_or_else(|| smith_store::DEFAULT_OLLAMA_BASE_URL.to_string());
             Ok(Arc::new(OpenAiProvider::ollama(base_url)))
         }
     }

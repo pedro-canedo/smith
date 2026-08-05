@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 smith-core = { workspace = true }
-smith-persist = { workspace = true }
+smith-store = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
