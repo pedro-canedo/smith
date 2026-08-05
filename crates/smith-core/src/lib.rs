@@ -6,14 +6,17 @@ pub mod message;
 pub mod permission_detail;
 pub mod provider;
 pub mod redact;
+pub mod retry;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod tool;
 
-pub use agent::{parse_tasks, Agent, NoTools, PermissionAsk, QuestionAsk, ToolExecutor};
+pub use agent::{
+    parse_tasks, Agent, NoTools, PermissionAsk, QuestionAsk, ToolExecutor, TurnLimits,
+};
 pub use event::{
     Action, AgentEvent, AgentPhase, LoopStopReason, PermissionDecision, PermissionRequest,
-    ProgressReporter, ResourceStats, Task, TaskStatus, UserQuestion,
+    ProgressReporter, ResourceStats, Task, TaskStatus, TurnLimitKind, UserQuestion,
 };
 pub use message::{
     CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition, Usage,
@@ -21,4 +24,5 @@ pub use message::{
 pub use permission_detail::format_permission_detail;
 pub use provider::{LlmProvider, ProviderCapabilities, ProviderError};
 pub use redact::Redactor;
+pub use retry::RetryPolicy;
 pub use tool::{PermissionClass, PermissionPolicy, Tool, ToolContext, ToolResult};

@@ -1473,6 +1473,36 @@ impl App {
                     format!("permission mode: {}{suffix}", policy.as_str()),
                 ));
             }
+            AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason,
+            } => {
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!(
+                        "{reason} — retrying in {:.1}s (attempt {attempt}/{max_attempts})",
+                        delay_ms as f64 / 1000.0
+                    ),
+                ));
+            }
+            AgentEvent::TurnLimitReached { detail, .. } => {
+                // Same state reset as the Error arm below: the turn is over,
+                // so anything still marked in-flight would spin forever.
+                self.waiting_on_assistant = false;
+                self.in_flight_text = None;
+                self.turn_started_at = None;
+                self.stream_started_at = None;
+                self.stream_output_chars = 0;
+                self.live_tokens_per_sec = None;
+                self.plan_turn_active = false;
+                self.phase = AgentPhase::Idle;
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("turn stopped: it {detail} — send \"continue\" to keep going"),
+                ));
+            }
             AgentEvent::Error(err) => {
                 self.waiting_on_assistant = false;
                 self.in_flight_text = None;

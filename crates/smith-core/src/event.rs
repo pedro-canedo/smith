@@ -79,6 +79,18 @@ pub enum LoopStopReason {
     Failed,
 }
 
+/// Which cap stopped a turn — see `AgentEvent::TurnLimitReached`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnLimitKind {
+    /// Tool-call rounds within one turn.
+    Rounds,
+    /// Individual tool calls within one turn, summed across rounds.
+    ToolCalls,
+    /// Elapsed time since the turn started.
+    WallClock,
+}
+
 /// A snapshot of local machine resource usage, polled independently of the
 /// LLM turn loop — only meaningful for local providers (e.g. Ollama), where
 /// there's no per-token cost to show instead.
@@ -215,6 +227,32 @@ pub enum AgentEvent {
     /// The agent replaced its task checklist via `write_tasks` — the full
     /// list, not a diff; the frontend just swaps its copy wholesale.
     TasksUpdated(Vec<Task>),
+    /// A provider request failed with something worth re-sending, and the
+    /// agent is about to wait `delay_ms` before attempt `attempt + 1`.
+    ///
+    /// Emitted *before* the sleep, always. A backoff nobody can see is
+    /// indistinguishable from a hang, and a user who thinks the app has hung
+    /// kills it — losing the turn the retry was about to save.
+    ProviderRetry {
+        /// 1-based index of the attempt that just failed.
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        /// The failure being retried, rendered for display.
+        reason: String,
+    },
+    /// The turn stopped because it hit one of its own safety caps, not because
+    /// anything failed.
+    ///
+    /// Deliberately *not* an `Error`. The turn did exactly what it was
+    /// configured to do, everything it completed is intact, and the remedy is
+    /// "say continue" — rendering that as an error teaches users to ignore
+    /// errors and hides that the work survived.
+    TurnLimitReached {
+        kind: TurnLimitKind,
+        /// One line naming the cap and its value, ready to show as-is.
+        detail: String,
+    },
     Error(String),
 }
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use clap::ValueEnum;
 use smith_core::{
     Action, Agent, AgentEvent, AgentPhase, LlmProvider, Message, PermissionAsk, QuestionAsk,
-    Redactor, ToolContext,
+    Redactor, RetryPolicy, ToolContext, TurnLimits,
 };
 use smith_provider::{AnthropicProvider, OpenAiProvider};
 use smith_store::{Config, SessionStore};
@@ -263,10 +263,17 @@ impl OrchestratorState {
         // agent's made the two disagree).
         let allowed = self.agent.allowed_session_tools().clone();
         let tasks = self.agent.tasks().to_vec();
+        // Turn budget and retry schedule are session settings, not per-model
+        // ones: dropping them here would quietly restore the defaults on every
+        // `/model`, which is the least visible way to lose a configured cap.
+        let limits = self.agent.limits();
+        let retry_policy = self.agent.retry_policy();
 
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
             .with_system(SYSTEM_PROMPT)
             .with_context_provider(environment_now)
+            .with_limits(limits)
+            .with_retry_policy(retry_policy)
             // Rebuilt from config rather than carried over, so a key added
             // since startup is covered too. Forgetting it here would silently
             // disable redaction for the rest of the session.
@@ -404,6 +411,11 @@ pub async fn run_orchestrator(
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_system(SYSTEM_PROMPT)
         .with_context_provider(environment_now)
+        // The seam a user-facing config plugs into; the defaults are the
+        // policy for now, but they are set explicitly so `switch_model` has
+        // something to carry over and so the wiring exists in one place.
+        .with_limits(TurnLimits::default())
+        .with_retry_policy(RetryPolicy::default())
         .with_redactor(secret_redactor(&config))
         .with_permission_policy(permission_policy);
     agent.set_goal(initial_goal);

@@ -1,24 +1,133 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::event::{
     AgentEvent, AgentPhase, PermissionDecision, PermissionRequest, ProgressReporter, Task,
-    TaskStatus, UserQuestion,
+    TaskStatus, TurnLimitKind, UserQuestion,
 };
 use crate::message::{CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent};
 use crate::permission_detail::format_permission_detail;
-use crate::provider::LlmProvider;
+use crate::provider::{LlmProvider, ProviderError};
 use crate::redact::Redactor;
+use crate::retry::RetryPolicy;
 use crate::tool::{PermissionClass, PermissionPolicy, ToolContext, ToolResult};
 
 /// Stand-in result recorded for a tool call the turn never got to run. The
 /// model reads it, so it says plainly that nothing happened — an empty or
 /// vague result would invite it to assume the call succeeded.
 const NOT_EXECUTED_CANCELLED: &str = "not executed — the turn was cancelled by the user";
+
+/// The same idea for a call the turn had no budget left to run.
+const NOT_EXECUTED_TOOL_BUDGET: &str =
+    "not executed — this turn reached its tool-call budget before this call";
+
+/// How long one call to `run_turn` may keep going on its own.
+///
+/// Without these the loop is unbounded in every direction: a model that
+/// oscillates between two tool calls, or keeps "just checking one more file",
+/// spends the user's money until they notice and kill the process. Each cap
+/// covers a different runaway shape, so they are not redundant:
+/// `max_turns` bounds *requests*, `max_tool_calls_per_turn` bounds *side
+/// effects* (a single round can carry a dozen calls), and `max_wall_clock`
+/// bounds the one thing neither of those sees — tools that are individually
+/// slow rather than numerous.
+///
+/// All three are checked only at a round boundary, never mid-round. That is
+/// what keeps the `tool_use`/`tool_result` invariant intact and means a cap
+/// can never kill a command that is already running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnLimits {
+    /// Tool-call rounds — provider request plus its tool executions — in one
+    /// turn.
+    pub max_turns: u32,
+    /// Individual tool calls in one turn, summed across rounds.
+    pub max_tool_calls_per_turn: u32,
+    /// Elapsed time since the turn started.
+    pub max_wall_clock: Duration,
+}
+
+impl Default for TurnLimits {
+    /// - **`max_turns` 50**: real coding work routinely takes twenty or thirty
+    ///   rounds, so anything much lower would cut off legitimate turns; fifty
+    ///   still caps a two-call oscillation at fifty wasted requests instead of
+    ///   an unbounded number. This is the cap that actually catches a loop,
+    ///   because a loop is fast — it will never reach the wall clock.
+    /// - **`max_tool_calls_per_turn` 100**: rounds and calls diverge as soon
+    ///   as a model emits calls in parallel, so bounding rounds alone doesn't
+    ///   bound side effects. A hundred tool calls is already far more than any
+    ///   single user instruction plausibly needs, and being slightly too low
+    ///   costs one "continue" — the turn stops cleanly with everything intact.
+    /// - **`max_wall_clock` 10 minutes**: the legitimate consumer of wall
+    ///   clock is a long `run_bash` (a full workspace build and test suite is
+    ///   minutes), and since the check happens between rounds it never
+    ///   interrupts one. Ten minutes is roughly where a user is still watching
+    ///   an interactive turn; past it, the agent has quietly become a batch
+    ///   job nobody asked for.
+    fn default() -> Self {
+        Self {
+            max_turns: 50,
+            max_tool_calls_per_turn: 100,
+            max_wall_clock: Duration::from_secs(600),
+        }
+    }
+}
+
+impl TurnLimitKind {
+    /// One line naming the cap and the value it hit — shown to the user and
+    /// folded into what the model is told, so the two never disagree.
+    fn describe(self, limits: &TurnLimits) -> String {
+        match self {
+            TurnLimitKind::Rounds => format!(
+                "reached the limit of {} tool-call rounds in one turn",
+                limits.max_turns
+            ),
+            TurnLimitKind::ToolCalls => format!(
+                "reached the limit of {} tool calls in one turn",
+                limits.max_tool_calls_per_turn
+            ),
+            TurnLimitKind::WallClock => format!(
+                "reached the {}s time limit for one turn",
+                limits.max_wall_clock.as_secs()
+            ),
+        }
+    }
+}
+
+/// What the model is told about a capped turn.
+///
+/// It goes into history as a text block on the *same* user message that
+/// carries the round's tool results, rather than a message of its own: two
+/// consecutive user messages is a shape some providers reject and others
+/// silently merge, and there is nothing to gain by risking it. Not a system
+/// prompt addition either — the system prompt is a cached prefix and a
+/// standing instruction, while this is a one-off fact about one turn.
+///
+/// The model does not read it now (the turn ends without another request —
+/// spending a request to narrate the moment we decided it was overspending
+/// would be self-defeating). It reads it on the *next* turn, which is exactly
+/// when it matters: the user types "continue" and the model needs to know why
+/// it stopped rather than assuming the task was finished.
+fn limit_note(kind: TurnLimitKind, limits: &TurnLimits) -> String {
+    format!(
+        "[smith] This turn was stopped automatically: it {}. \
+         Everything already done is intact and nothing else was executed — \
+         the task is not necessarily finished. If the user asks you to \
+         continue, resume from here.",
+        kind.describe(limits)
+    )
+}
+
+/// Suspends the turn for a backoff. Injectable because the alternative is
+/// tests that really sleep: the delays are seconds by design, and a suite that
+/// waits them out stops being run.
+type Sleeper = Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Implemented by smith-tools::ToolRegistry. Kept as a trait here so smith-core
 /// never depends on the concrete tool crate.
@@ -107,6 +216,9 @@ pub struct Agent {
     /// opinion about which secrets exist — the frontend, which loaded them,
     /// supplies the list.
     redactor: Redactor,
+    limits: TurnLimits,
+    retry_policy: RetryPolicy,
+    sleeper: Sleeper,
 }
 
 impl Agent {
@@ -131,12 +243,68 @@ impl Agent {
             context_provider: None,
             tasks: Vec::new(),
             redactor: Redactor::default(),
+            limits: TurnLimits::default(),
+            retry_policy: RetryPolicy::default(),
+            sleeper: Arc::new(|d| Box::pin(tokio::time::sleep(d))),
         }
     }
 
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
         self.redactor = redactor;
         self
+    }
+
+    pub fn with_limits(mut self, limits: TurnLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn with_max_turns(mut self, max_turns: u32) -> Self {
+        self.limits.max_turns = max_turns;
+        self
+    }
+
+    pub fn with_max_tool_calls_per_turn(mut self, max_tool_calls: u32) -> Self {
+        self.limits.max_tool_calls_per_turn = max_tool_calls;
+        self
+    }
+
+    pub fn with_max_wall_clock(mut self, max_wall_clock: Duration) -> Self {
+        self.limits.max_wall_clock = max_wall_clock;
+        self
+    }
+
+    /// The per-request completion cap. Separate from [`TurnLimits`] because it
+    /// bounds one *response*, not the turn: it is a provider parameter that
+    /// travels on every request.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// Replaces the backoff sleep. Only tests should need this; production
+    /// wants the default, which is `tokio::time::sleep`.
+    pub fn with_sleeper(
+        mut self,
+        sleeper: impl Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        self.sleeper = Arc::new(sleeper);
+        self
+    }
+
+    /// Exposed so a `/model` switch — which rebuilds the whole `Agent` — can
+    /// carry these over instead of silently resetting them to the defaults.
+    pub fn limits(&self) -> TurnLimits {
+        self.limits
+    }
+
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry_policy
     }
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -299,6 +467,13 @@ impl Agent {
         const MAX_EMPTY_RETRIES: u32 = 2;
         let mut empty_retries: u32 = 0;
 
+        // Turn budget. Measured from here rather than from the first request
+        // so that time spent in permission prompts and backoff sleeps counts
+        // too — from the user's side that is all the same wait.
+        let started_at = Instant::now();
+        let mut rounds: u32 = 0;
+        let mut tool_calls: u32 = 0;
+
         loop {
             if cancel.is_cancelled() {
                 let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
@@ -315,11 +490,7 @@ impl Agent {
                 temperature: None,
             };
 
-            let stream = match self
-                .provider
-                .stream_completion(request, cancel.clone())
-                .await
-            {
+            let stream = match self.stream_with_retry(request, &events, &cancel).await {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
@@ -398,6 +569,7 @@ impl Agent {
             }
 
             empty_retries = 0;
+            rounds += 1;
 
             let tool_uses: Vec<(String, String, serde_json::Value)> = assistant_message
                 .content
@@ -431,6 +603,21 @@ impl Agent {
                     break;
                 }
 
+                // The one cap that has to bite mid-round: a single round can
+                // ask for more calls than the whole turn has left. The seeded
+                // slot is overwritten rather than left at the cancellation
+                // wording, so the model isn't told the user stopped it when
+                // the user did nothing of the sort.
+                if tool_calls >= self.limits.max_tool_calls_per_turn {
+                    results[slot] = ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content: NOT_EXECUTED_TOOL_BUDGET.to_string(),
+                        is_error: true,
+                    };
+                    continue;
+                }
+                tool_calls += 1;
+
                 let result = self
                     .run_one_tool(
                         &id,
@@ -449,6 +636,19 @@ impl Agent {
                 };
             }
 
+            // Checked here, with the round's results in hand and before they
+            // are pushed, so the explanation rides the same user message the
+            // tool results do — one message, one push, invariant preserved on
+            // this exit path exactly as on the cancellation one.
+            let limit = (!cancelled)
+                .then(|| self.limit_reached(rounds, tool_calls, started_at))
+                .flatten();
+            if let Some(kind) = limit {
+                results.push(ContentBlock::Text {
+                    text: limit_note(kind, &self.limits),
+                });
+            }
+
             self.messages.push(Message {
                 role: Role::User,
                 content: results,
@@ -460,7 +660,90 @@ impl Agent {
                 return false;
             }
 
+            if let Some(kind) = limit {
+                let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
+                let _ = events.send(AgentEvent::TurnLimitReached {
+                    kind,
+                    detail: kind.describe(&self.limits),
+                });
+                // Not a normal completion: `/loop` must not answer a runaway
+                // turn by starting another one.
+                return false;
+            }
+
             let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Thinking));
+        }
+    }
+
+    /// Which cap, if any, this turn has now reached. Called once per completed
+    /// round; the order fixes which one is reported when several are hit at
+    /// the same moment.
+    ///
+    /// Every comparison is `>=`, so exhausting a budget exactly stops the
+    /// turn. Letting one more round run would buy the model a request it has
+    /// no tool calls left to spend — and if it then asked for tools anyway,
+    /// every one of them would be refused and we would stop on the next check
+    /// regardless.
+    fn limit_reached(
+        &self,
+        rounds: u32,
+        tool_calls: u32,
+        started_at: Instant,
+    ) -> Option<TurnLimitKind> {
+        if rounds >= self.limits.max_turns {
+            Some(TurnLimitKind::Rounds)
+        } else if tool_calls >= self.limits.max_tool_calls_per_turn {
+            Some(TurnLimitKind::ToolCalls)
+        } else if started_at.elapsed() >= self.limits.max_wall_clock {
+            Some(TurnLimitKind::WallClock)
+        } else {
+            None
+        }
+    }
+
+    /// Opens the completion stream, re-sending on failures worth re-sending.
+    ///
+    /// Only the *request* is retried, never a stream that already started:
+    /// by then text deltas have reached the transcript, and replaying the
+    /// request would duplicate the model's output on screen and in history.
+    /// A mid-stream failure surfaces as an error, same as before.
+    async fn stream_with_retry(
+        &self,
+        request: CompletionRequest,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        let mut attempt: u32 = 1;
+        loop {
+            let error = match self
+                .provider
+                .stream_completion(request.clone(), cancel.clone())
+                .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(e) => e,
+            };
+
+            let Some(delay) = self.retry_policy.delay_for(&error, attempt) else {
+                return Err(error);
+            };
+
+            let _ = events.send(AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts: self.retry_policy.max_attempts,
+                delay_ms: delay.as_millis() as u64,
+                reason: error.to_string(),
+            });
+
+            // Esc during a backoff has to take effect now, not when the timer
+            // happens to expire: the whole point of showing the wait is that
+            // the user can decide not to sit through it.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                _ = (self.sleeper)(delay) => {}
+            }
+            attempt += 1;
         }
     }
 
@@ -842,7 +1125,10 @@ async fn consume_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{empty_reply, text_reply, tool_calls_reply, ScriptedProvider};
+    use crate::testkit::{
+        empty_reply, text_reply, tool_call_reply, tool_calls_reply, ScriptedProvider,
+        ScriptedResponse,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The agent retries an empty turn twice before giving up, so a provider
@@ -1685,5 +1971,381 @@ mod tests {
             .history()
             .iter()
             .any(|m| m.text().contains("let me check")));
+    }
+
+    // ---- turn limits and provider retry -------------------------------
+
+    fn api_error(status: u16, retry_after: Option<Duration>) -> ProviderError {
+        ProviderError::Api {
+            status,
+            message: "boom".into(),
+            retry_after,
+        }
+    }
+
+    /// A sleeper that records what it was asked to wait for and returns
+    /// immediately. The schedule is seconds by design, and a suite that lives
+    /// through it is a suite nobody runs.
+    fn recording_sleeper() -> (
+        Arc<std::sync::Mutex<Vec<Duration>>>,
+        impl Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = log.clone();
+        (log, move |d| {
+            sink.lock().unwrap().push(d);
+            Box::pin(std::future::ready(()))
+        })
+    }
+
+    fn agent_for(provider: Arc<ScriptedProvider>, tools: Arc<dyn ToolExecutor>) -> Agent {
+        Agent::new(
+            provider,
+            tools,
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_permission_policy(PermissionPolicy::Skip)
+    }
+
+    /// Runs one turn against throwaway channels and hands back everything the
+    /// turn emitted, so a test can assert on the event stream as a whole.
+    async fn run_collect(
+        agent: &mut Agent,
+        text: &str,
+        cancel: CancellationToken,
+    ) -> (bool, Vec<AgentEvent>) {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (perm_tx, _perm_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        let completed = agent
+            .run_turn(text.to_string(), events_tx, perm_tx, question_tx, cancel)
+            .await;
+        let events = std::iter::from_fn(|| events_rx.try_recv().ok()).collect();
+        (completed, events)
+    }
+
+    fn retries(events: &[AgentEvent]) -> Vec<(u32, u64)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ProviderRetry {
+                    attempt, delay_ms, ..
+                } => Some((*attempt, *delay_ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn errors(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Error(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn limits_hit(events: &[AgentEvent]) -> Vec<TurnLimitKind> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnLimitReached { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_request_is_retried_and_the_turn_then_succeeds() {
+        let provider = Arc::new(ScriptedProvider::error_then_text(
+            api_error(429, None),
+            "recovered",
+        ));
+        let (delays, sleeper) = recording_sleeper();
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools)).with_sleeper(sleeper);
+
+        let (completed, events) = run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        assert!(completed, "the retry should have rescued the turn");
+        assert_eq!(provider.request_count(), 2);
+        assert_eq!(agent.history()[1].text(), "recovered");
+        assert_eq!(delays.lock().unwrap().len(), 1, "one backoff, one sleep");
+        // The user has to be told *before* the wait, or a backoff is
+        // indistinguishable from a hang.
+        assert_eq!(retries(&events).len(), 1);
+        assert!(errors(&events).is_empty(), "a rescued turn is not an error");
+    }
+
+    /// Replaying a contract error can never succeed — it only spends quota and
+    /// delays the one useful thing, telling the user what is wrong.
+    #[tokio::test]
+    async fn a_bad_request_is_not_retried() {
+        let provider = Arc::new(ScriptedProvider::new([ScriptedResponse::Fail(api_error(
+            400, None,
+        ))]));
+        let (delays, sleeper) = recording_sleeper();
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools)).with_sleeper(sleeper);
+
+        let (completed, events) = run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        assert!(!completed);
+        assert_eq!(provider.request_count(), 1, "400 must be sent exactly once");
+        assert!(delays.lock().unwrap().is_empty());
+        assert!(retries(&events).is_empty());
+        assert!(errors(&events)[0].contains("400"));
+    }
+
+    #[tokio::test]
+    async fn retrying_stops_at_the_attempt_cap_and_surfaces_the_error() {
+        let policy = RetryPolicy::default();
+        // Exactly the budget: the fixture panics on an extra request, so
+        // over-retrying fails this test loudly rather than silently.
+        let provider = Arc::new(ScriptedProvider::new(
+            (0..policy.max_attempts).map(|_| ScriptedResponse::Fail(api_error(503, None))),
+        ));
+        let (delays, sleeper) = recording_sleeper();
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools))
+            .with_retry_policy(policy)
+            .with_sleeper(sleeper);
+
+        let (completed, events) = run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        assert!(!completed);
+        assert_eq!(provider.request_count(), policy.max_attempts as usize);
+        assert_eq!(
+            delays.lock().unwrap().len(),
+            policy.max_attempts as usize - 1
+        );
+        assert_eq!(retries(&events).len(), policy.max_attempts as usize - 1);
+        assert!(errors(&events)[0].contains("503"));
+    }
+
+    #[tokio::test]
+    async fn retry_after_from_the_server_replaces_the_computed_backoff() {
+        let server_delay = Duration::from_secs(7);
+        let provider = Arc::new(ScriptedProvider::error_then_text(
+            api_error(429, Some(server_delay)),
+            "recovered",
+        ));
+        let (delays, sleeper) = recording_sleeper();
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools)).with_sleeper(sleeper);
+
+        let (completed, events) = run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        assert!(completed);
+        // Not the ~0.5s the formula would have chosen: the server is the only
+        // party that knows when its window actually reopens.
+        assert_eq!(*delays.lock().unwrap(), vec![server_delay]);
+        assert_eq!(retries(&events), vec![(1, 7000)]);
+    }
+
+    /// A provider asking for five minutes is not describing a blip. Sleeping
+    /// on it would hold the agent lock and look exactly like a crash, so the
+    /// turn fails immediately with the number in the message and the user
+    /// decides what to do about it.
+    #[tokio::test]
+    async fn a_retry_after_beyond_the_cap_fails_fast_instead_of_waiting() {
+        let policy = RetryPolicy::default();
+        let too_long = policy.max_retry_after + Duration::from_secs(1);
+        let provider = Arc::new(ScriptedProvider::new([ScriptedResponse::Fail(api_error(
+            429,
+            Some(too_long),
+        ))]));
+        let (delays, sleeper) = recording_sleeper();
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools)).with_sleeper(sleeper);
+
+        let (completed, events) = run_collect(&mut agent, "hi", CancellationToken::new()).await;
+
+        assert!(!completed);
+        assert_eq!(provider.request_count(), 1);
+        assert!(delays.lock().unwrap().is_empty());
+        assert!(errors(&events)[0].contains("retry after 31s"));
+    }
+
+    /// Esc during a backoff must take effect now. This one uses the *real*
+    /// sleeper on purpose — an injected one could never catch a select! that
+    /// waits for the timer before noticing the token.
+    #[tokio::test]
+    async fn cancelling_during_a_backoff_does_not_wait_the_sleep_out() {
+        let provider = Arc::new(ScriptedProvider::new([ScriptedResponse::Fail(api_error(
+            429,
+            Some(Duration::from_secs(25)),
+        ))]));
+        let mut agent = agent_for(provider.clone(), Arc::new(NoTools));
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let started = Instant::now();
+        let (completed, _events) = run_collect(&mut agent, "hi", cancel).await;
+
+        assert!(!completed);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} — cancellation lost the race with a 25s sleep",
+            started.elapsed()
+        );
+        assert_eq!(provider.request_count(), 1);
+    }
+
+    /// Counts its calls, and optionally takes a while — enough to stand in for
+    /// both a runaway loop and a slow command.
+    struct CountingTools {
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl CountingTools {
+        fn new(delay: Duration) -> (Arc<Self>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    calls: calls.clone(),
+                    delay,
+                }),
+                calls,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CountingTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            vec![crate::message::ToolDefinition {
+                name: "slow_tool".into(),
+                description: "test tool".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            ToolResult::ok("ok")
+        }
+    }
+
+    /// The runaway case: a model that asks for a tool every single round. The
+    /// cap has to stop it *and* leave history usable, or the next request is
+    /// rejected for dangling `tool_use` blocks and the session is dead.
+    #[tokio::test]
+    async fn the_round_cap_stops_a_model_that_never_stops_calling_tools() {
+        const MAX_ROUNDS: u32 = 3;
+        let provider =
+            Arc::new(ScriptedProvider::streams((0..MAX_ROUNDS).map(|i| {
+                tool_call_reply(&format!("call_{i}"), "slow_tool", json_empty())
+            })));
+        let (tools, calls) = CountingTools::new(Duration::ZERO);
+        let mut agent = agent_for(provider.clone(), tools).with_max_turns(MAX_ROUNDS);
+
+        let (completed, events) = run_collect(&mut agent, "go", CancellationToken::new()).await;
+
+        assert!(!completed, "a capped turn is not a normal completion");
+        assert_eq!(provider.request_count(), MAX_ROUNDS as usize);
+        assert_eq!(provider.remaining(), 0, "no request beyond the cap");
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_ROUNDS as usize);
+        assert_eq!(limits_hit(&events), vec![TurnLimitKind::Rounds]);
+
+        // The invariant the whole exit path exists to protect.
+        assert_eq!(
+            collect_ids(agent.history(), true),
+            collect_ids(agent.history(), false),
+            "every tool_use must have a matching tool_result"
+        );
+        // And the model is told why it stopped, in the same message.
+        assert!(agent
+            .history()
+            .last()
+            .unwrap()
+            .text()
+            .contains("stopped automatically"));
+    }
+
+    /// Rounds and calls diverge the moment a model batches calls, so the call
+    /// budget is the only one that can bite mid-round — and the calls it
+    /// refuses still have to be answered.
+    #[tokio::test]
+    async fn the_tool_call_budget_refuses_the_rest_of_the_round_and_answers_them() {
+        let provider = Arc::new(ScriptedProvider::streams([tool_calls_reply(&[
+            ("call_1", "slow_tool", json_empty()),
+            ("call_2", "slow_tool", json_empty()),
+        ])]));
+        let (tools, calls) = CountingTools::new(Duration::ZERO);
+        let mut agent = agent_for(provider, tools).with_max_tool_calls_per_turn(1);
+
+        let (completed, events) = run_collect(&mut agent, "go", CancellationToken::new()).await;
+
+        assert!(!completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "budget was one call");
+        assert_eq!(limits_hit(&events), vec![TurnLimitKind::ToolCalls]);
+        assert_eq!(
+            collect_ids(agent.history(), true),
+            collect_ids(agent.history(), false)
+        );
+        // The refused call must say it was refused, not that the user cancelled.
+        let refused = tool_result_for(agent.history(), "call_2");
+        assert!(refused.contains("tool-call budget"), "got: {refused}");
+    }
+
+    #[tokio::test]
+    async fn the_wall_clock_cap_stops_a_turn_made_of_slow_tools() {
+        let provider = Arc::new(ScriptedProvider::streams([tool_call_reply(
+            "call_1",
+            "slow_tool",
+            json_empty(),
+        )]));
+        let (tools, calls) = CountingTools::new(Duration::from_millis(20));
+        let mut agent =
+            agent_for(provider.clone(), tools).with_max_wall_clock(Duration::from_millis(5));
+
+        let (completed, events) = run_collect(&mut agent, "go", CancellationToken::new()).await;
+
+        assert!(!completed);
+        assert_eq!(limits_hit(&events), vec![TurnLimitKind::WallClock]);
+        // The cap bounds further rounds; it never abandons a tool already
+        // running, and never prevents the turn from doing anything at all.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.request_count(), 1);
+        assert_eq!(
+            collect_ids(agent.history(), true),
+            collect_ids(agent.history(), false)
+        );
+    }
+
+    fn json_empty() -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    fn tool_result_for(history: &[Message], id: &str) -> String {
+        history
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == id => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{id} was never answered"))
     }
 }
