@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use clap::ValueEnum;
-use smith_config::Config;
+use smith_config::{Config, MemoryCache};
 use smith_core::{
     Action, Agent, AgentEvent, AgentPhase, LlmProvider, Message, PermissionAsk, QuestionAsk,
     Redactor, RetryPolicy, ToolContext, TurnLimits,
@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::prompts::{
-    build_approved_plan_prompt, build_loop_task_prompt, environment_now, last_assistant_plan_text,
+    build_approved_plan_prompt, build_loop_task_prompt, context_provider, last_assistant_plan_text,
     loop_turn_is_done, LOOP_CONTINUE_PROMPT, SYSTEM_PROMPT,
 };
 
@@ -232,6 +232,11 @@ struct OrchestratorState {
     persistence: Option<Persistence>,
     provider_kind: ProviderKind,
     tools: Arc<ToolRegistry>,
+    /// Shared with the agent's context provider. Kept here so `switch_model`
+    /// hands the *same* cache to the rebuilt agent — a fresh one would re-read
+    /// every SMITH.md on the next request for no reason, and would drop the
+    /// warm state a long session has built up.
+    memory: MemoryCache,
 }
 
 impl OrchestratorState {
@@ -272,7 +277,7 @@ impl OrchestratorState {
 
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
             .with_system(SYSTEM_PROMPT)
-            .with_context_provider(environment_now)
+            .with_context_provider(context_provider(self.memory.clone()))
             .with_limits(limits)
             .with_retry_policy(retry_policy)
             // Rebuilt from config rather than carried over, so a key added
@@ -467,9 +472,14 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     }
 
     let tool_ctx = ToolContext::new(std::env::current_dir().unwrap_or_default(), session_id);
+    // Project memory is scoped to the working directory the rest of this run
+    // already agreed on (`main` applies `--cwd` before anything reads it), so
+    // the memory chain, the tool sandbox and the session store all describe
+    // the same project.
+    let memory = MemoryCache::discover(&tool_ctx.cwd);
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_system(SYSTEM_PROMPT)
-        .with_context_provider(environment_now)
+        .with_context_provider(context_provider(memory.clone()))
         // Set explicitly (rather than left to `Agent`'s own default) so
         // `switch_model` has something to carry over and so `--max-turns` has
         // exactly one place to plug into.
@@ -490,6 +500,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         persistence,
         provider_kind,
         tools,
+        memory,
     }));
 
     let mut current_cancel: Option<CancellationToken> = None;

@@ -4,6 +4,7 @@
 //! can be tuned and tested without touching any async/channel plumbing.
 
 use chrono::{DateTime, FixedOffset, Local};
+use smith_config::MemoryCache;
 use smith_core::Message;
 
 /// Environment context appended to the system prompt on every request, via
@@ -33,6 +34,40 @@ pub fn environment_block(now: DateTime<FixedOffset>) -> String {
 /// `environment_block` for right now — the function handed to the `Agent`.
 pub fn environment_now() -> String {
     environment_block(Local::now().fixed_offset())
+}
+
+/// The whole volatile half of the system prompt: environment context followed
+/// by `SMITH.md` project memory. This is what goes into
+/// `Agent::with_context_provider`.
+///
+/// Order is the point of this function existing. `Agent::effective_system`
+/// emits the static `SYSTEM_PROMPT`, then whatever this returns, then the
+/// session goal — so the final prompt reads:
+///
+/// 1. `SYSTEM_PROMPT` — byte-identical forever, so a provider's prefix cache
+///    keeps hitting. Nothing volatile may go in front of it.
+/// 2. Environment — the date. Fixed for a session in all but the pathological
+///    case, and short.
+/// 3. Project memory — user-authored and editable *during* the session
+///    (`/remember`, or just opening SMITH.md). It sits behind the environment
+///    block precisely because it is the more mutable of the two: an edit then
+///    invalidates less of the cached prefix than it would the other way round.
+/// 4. The goal — last, and deliberately so. Memory is what is always true of
+///    this project; the goal is what the user asked for in this session. The
+///    more specific and more recent instruction belongs closest to the
+///    conversation, and if a `SMITH.md` and the goal disagree the goal must
+///    win — otherwise a file checked into the repo could countermand what the
+///    user typed thirty seconds ago.
+pub fn context_provider(memory: MemoryCache) -> impl Fn() -> String + Send + Sync + 'static {
+    move || {
+        let environment = environment_now();
+        let memory = memory.render();
+        if memory.trim().is_empty() {
+            environment
+        } else {
+            format!("{environment}\n\n{memory}")
+        }
+    }
 }
 
 pub const SYSTEM_PROMPT: &str = "\
@@ -206,6 +241,108 @@ mod loop_prompt_tests {
     }
 }
 
+/// The one place the whole system prompt is asserted end to end: a real
+/// `Agent` with a real context provider, driven through one turn, with the
+/// request the provider actually received inspected afterwards.
+///
+/// `Agent::effective_system` is private and lives in a crate this feature
+/// must not edit, so ordering can only be checked from the outside — which is
+/// the right place anyway, since it is the sent bytes that matter.
+#[cfg(test)]
+mod system_prompt_composition_tests {
+    use std::sync::Arc;
+
+    use smith_config::{MemoryCache, MemoryScope};
+    use smith_core::testkit::ScriptedProvider;
+    use smith_core::{Agent, ToolContext};
+    use smith_tools::ToolRegistry;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Runs one scripted turn and returns the system prompt that was sent.
+    async fn system_prompt_for(memory_body: Option<&str>, goal: Option<&str>) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        if let Some(body) = memory_body {
+            std::fs::write(tmp.path().join("SMITH.md"), body).unwrap();
+        }
+        // `global_dir: None` keeps the developer's own ~/.smith/SMITH.md out
+        // of the assertion.
+        let memory = MemoryCache::new(MemoryScope::new(None, tmp.path(), tmp.path()));
+
+        let provider = Arc::new(ScriptedProvider::text("ok"));
+        let mut agent = Agent::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::with_builtin_tools()),
+            "test-model".to_string(),
+            ToolContext::new(tmp.path(), "test-session"),
+        )
+        .with_system(super::SYSTEM_PROMPT)
+        .with_context_provider(super::context_provider(memory));
+        agent.set_goal(goal.map(str::to_string));
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "hello".to_string(),
+                event_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        provider
+            .last_request()
+            .expect("a request was sent")
+            .system
+            .expect("a system prompt was sent")
+    }
+
+    #[tokio::test]
+    async fn static_prompt_then_environment_then_memory_then_goal() {
+        let system = system_prompt_for(
+            Some("commit messages stay under 50 chars"),
+            Some("ship login"),
+        )
+        .await;
+
+        let base = system
+            .find("You are smith, a terminal-based coding agent")
+            .expect("static prompt");
+        let environment = system.find("## Environment").expect("environment block");
+        let memory = system.find("## Project memory").expect("memory block");
+        let goal = system.find("Current session goal").expect("goal");
+
+        // The static prompt first is load-bearing, not cosmetic: it is what a
+        // provider's prefix cache keys on, and anything volatile in front of
+        // it invalidates the cache on every request.
+        assert_eq!(base, 0, "static prompt is not the prefix:\n{system}");
+        assert!(
+            base < environment && environment < memory && memory < goal,
+            "wrong order in:\n{system}"
+        );
+        assert!(system.contains("commit messages stay under 50 chars"));
+    }
+
+    #[tokio::test]
+    async fn a_goal_still_lands_last_when_there_is_no_memory() {
+        let system = system_prompt_for(None, Some("ship login")).await;
+        assert!(!system.contains("## Project memory"));
+        let environment = system.find("## Environment").unwrap();
+        let goal = system.find("Current session goal").unwrap();
+        assert!(environment < goal, "wrong order in:\n{system}");
+    }
+
+    #[tokio::test]
+    async fn memory_alone_composes_with_no_goal_set() {
+        let system = system_prompt_for(Some("always run the tests"), None).await;
+        assert!(system.contains("always run the tests"));
+        assert!(!system.contains("Current session goal"));
+    }
+}
+
 #[cfg(test)]
 mod environment_tests {
     use super::{environment_block, environment_now};
@@ -231,6 +368,45 @@ mod environment_tests {
         );
         assert!(block.contains("LATER than your training data"));
         assert!(block.contains("web_search"));
+    }
+
+    #[test]
+    fn context_provider_without_memory_is_just_the_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scope = smith_config::MemoryScope::new(None, tmp.path(), tmp.path());
+        let context = super::context_provider(smith_config::MemoryCache::new(scope))();
+        assert!(context.contains("## Environment"));
+        assert!(!context.contains("## Project memory"));
+        // No trailing separator left behind by the absent memory block.
+        assert_eq!(context.trim_end(), context);
+    }
+
+    #[test]
+    fn context_provider_puts_memory_after_the_environment_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("SMITH.md"), "this project uses tabs").unwrap();
+        let scope = smith_config::MemoryScope::new(None, tmp.path(), tmp.path());
+        let context = super::context_provider(smith_config::MemoryCache::new(scope))();
+
+        let environment = context.find("## Environment").expect("environment block");
+        let memory = context.find("## Project memory").expect("memory block");
+        assert!(environment < memory, "wrong order in:\n{context}");
+        assert!(context.contains("this project uses tabs"));
+    }
+
+    #[test]
+    fn context_provider_picks_up_an_edit_made_mid_session() {
+        // The volatility decision, asserted: memory is re-read (behind a
+        // fingerprint check), not frozen at construction.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("SMITH.md");
+        std::fs::write(&path, "the first rule").unwrap();
+        let scope = smith_config::MemoryScope::new(None, tmp.path(), tmp.path());
+        let provider = super::context_provider(smith_config::MemoryCache::new(scope));
+
+        assert!(provider().contains("the first rule"));
+        std::fs::write(&path, "a second rule, of a different length").unwrap();
+        assert!(provider().contains("a second rule"));
     }
 
     #[test]

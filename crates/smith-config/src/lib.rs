@@ -2,6 +2,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod memory;
+
+pub use memory::{MemoryCache, MemoryScope, MEMORY_FILE_NAME};
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("could not determine the home directory")]
@@ -12,6 +16,8 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("failed to serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error("nothing to remember — the note was empty")]
+    EmptyNote,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

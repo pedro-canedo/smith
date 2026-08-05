@@ -83,6 +83,18 @@ enum Commands {
         #[command(subcommand)]
         resource: Option<SetupResource>,
     },
+    /// Append a standing instruction to this project's SMITH.md, which is
+    /// folded into the system prompt on every request from now on.
+    Remember {
+        /// The note. Multiple words need no quoting.
+        #[arg(required = true, num_args = 1.., value_name = "NOTE")]
+        note: Vec<String>,
+
+        /// Write to `~/.smith/SMITH.md` instead — every project, not just
+        /// this one.
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,9 +105,10 @@ enum SetupResource {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let command = cli.command.take();
 
-    if let Some(Commands::Setup { resource }) = cli.command {
+    if let Some(Commands::Setup { resource }) = &command {
         let jump_to_model = matches!(resource, Some(SetupResource::Model));
         return match setup::run(jump_to_model).await {
             Ok(()) => ExitCode::from(EXIT_OK),
@@ -116,10 +129,49 @@ async fn main() -> ExitCode {
         }
     }
 
+    // After `--cwd`, unlike `setup`: which SMITH.md this writes to is decided
+    // by the project directory, so it has to see the same one a session would.
+    if let Some(Commands::Remember { note, global }) = &command {
+        return run_remember(&note.join(" "), *global);
+    }
+
     if cli.is_headless(std::io::stdout().is_terminal()) {
         ExitCode::from(run_headless(cli).await)
     } else {
         run_tui(cli).await
+    }
+}
+
+/// `smith remember <note>` — appends a standing instruction to a `SMITH.md`.
+///
+/// The project target is the *root* of the memory chain, not the working
+/// directory: a note dropped into whatever subdirectory you happened to be in
+/// would only apply while you stayed there, which is not what "remember this"
+/// means. `--global` picks `~/.smith/SMITH.md` instead.
+fn run_remember(note: &str, global: bool) -> ExitCode {
+    let path = if global {
+        smith_config::memory::global_memory_path()
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        Ok(smith_config::memory::memory_path(
+            &smith_config::MemoryScope::discover(cwd).root,
+        ))
+    };
+
+    let result = path.and_then(|path| {
+        smith_config::memory::remember(&path, note)?;
+        Ok(path)
+    });
+
+    match result {
+        Ok(path) => {
+            println!("remembered in {}", path.display());
+            ExitCode::from(EXIT_OK)
+        }
+        Err(e) => {
+            eprintln!("smith: {e}");
+            ExitCode::from(EXIT_USAGE)
+        }
     }
 }
 
@@ -563,6 +615,22 @@ mod tests {
     #[test]
     fn the_flag_surface_is_wired_up_the_way_clap_expects() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn remember_takes_an_unquoted_multi_word_note() {
+        let parsed = cli(&["remember", "the", "build", "needs", "nightly"]);
+        let Some(Commands::Remember { note, global }) = parsed.command else {
+            panic!("expected the remember subcommand, got {:?}", parsed.command);
+        };
+        assert_eq!(note.join(" "), "the build needs nightly");
+        assert!(!global);
+    }
+
+    #[test]
+    fn remember_rejects_an_empty_note_at_the_parser() {
+        // Cheaper than finding out after the file has been opened.
+        assert!(Cli::try_parse_from(["smith", "remember"]).is_err());
     }
 
     #[test]
