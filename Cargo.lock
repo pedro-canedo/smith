@@ -2488,6 +2488,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "reqwest",
+ "serde",
  "serde_json",
  "smith-config",
  "smith-core",
@@ -2497,6 +2498,7 @@ dependencies = [
  "smith-tools",
  "smith-tui",
  "sysinfo",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

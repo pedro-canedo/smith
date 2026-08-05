@@ -25,5 +25,13 @@ dialoguer = { workspace = true }
 reqwest = { workspace = true }
 directories = { workspace = true }
 sysinfo = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+# `testkit` brings in `ScriptedProvider`, so the orchestrator/headless tests
+# drive real turns without a network. Resolver 2 keeps the feature out of the
+# normal build of the dependency above.
+smith-core = { workspace = true, features = ["testkit"] }
+tempfile = "3"

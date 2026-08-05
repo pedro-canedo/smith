@@ -360,31 +360,89 @@ async fn run_loop(
     let _ = event_tx.send(AgentEvent::LoopFinished { reason, iterations });
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_orchestrator(
-    provider_kind: ProviderKind,
-    model: String,
-    config: Config,
-    initial_messages: Vec<Message>,
-    mut persistence: Option<Persistence>,
-    permission_policy: smith_core::PermissionPolicy,
-    initial_goal: Option<String>,
-    mut action_rx: mpsc::UnboundedReceiver<Action>,
-    event_tx: mpsc::UnboundedSender<AgentEvent>,
-    permission_tx: mpsc::UnboundedSender<PermissionAsk>,
-    question_tx: mpsc::UnboundedSender<QuestionAsk>,
-) {
-    let provider = match build_provider(provider_kind, &config) {
-        Ok(p) => p,
-        Err(err) => {
-            let _ = event_tx.send(AgentEvent::Error(err));
-            while let Some(action) = action_rx.recv().await {
-                if matches!(action, Action::Quit) {
-                    break;
-                }
-            }
-            return;
+/// Everything `run_orchestrator` needs that isn't a channel.
+///
+/// A struct rather than a dozen positional parameters because there are now
+/// two callers (the TUI path in `main`, and `headless`) that agree on most
+/// fields and differ in two or three — with positional arguments that
+/// difference is invisible at the call site.
+pub struct OrchestratorOptions {
+    pub provider_kind: ProviderKind,
+    pub model: String,
+    pub config: Config,
+    pub initial_messages: Vec<Message>,
+    pub persistence: Option<Persistence>,
+    pub permission_policy: smith_core::PermissionPolicy,
+    pub initial_goal: Option<String>,
+    pub limits: TurnLimits,
+    /// Bypasses `build_provider` when set.
+    ///
+    /// Two reasons it exists: tests inject `ScriptedProvider` here (it has no
+    /// config representation, so without this seam every orchestrator-level
+    /// test would need the network), and `headless` builds the provider up
+    /// front so a missing API key is a clean exit-2 before any channel work
+    /// starts, rather than an `Error` event racing the first turn.
+    pub provider: Option<Arc<dyn LlmProvider>>,
+}
+
+impl OrchestratorOptions {
+    pub fn new(provider_kind: ProviderKind, model: String, config: Config) -> Self {
+        Self {
+            provider_kind,
+            model,
+            config,
+            initial_messages: Vec::new(),
+            persistence: None,
+            permission_policy: smith_core::PermissionPolicy::default(),
+            initial_goal: None,
+            limits: TurnLimits::default(),
+            provider: None,
         }
+    }
+}
+
+/// The four channels a frontend and the orchestrator share. `smith-tui` and
+/// `headless` are interchangeable consumers of the three outbound ones.
+pub struct OrchestratorChannels {
+    pub action_rx: mpsc::UnboundedReceiver<Action>,
+    pub event_tx: mpsc::UnboundedSender<AgentEvent>,
+    pub permission_tx: mpsc::UnboundedSender<PermissionAsk>,
+    pub question_tx: mpsc::UnboundedSender<QuestionAsk>,
+}
+
+pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChannels) {
+    let OrchestratorOptions {
+        provider_kind,
+        model,
+        config,
+        initial_messages,
+        mut persistence,
+        permission_policy,
+        initial_goal,
+        limits,
+        provider: provider_override,
+    } = opts;
+    let OrchestratorChannels {
+        mut action_rx,
+        event_tx,
+        permission_tx,
+        question_tx,
+    } = chans;
+
+    let provider = match provider_override {
+        Some(p) => p,
+        None => match build_provider(provider_kind, &config) {
+            Ok(p) => p,
+            Err(err) => {
+                let _ = event_tx.send(AgentEvent::Error(err));
+                while let Some(action) = action_rx.recv().await {
+                    if matches!(action, Action::Quit) {
+                        break;
+                    }
+                }
+                return;
+            }
+        },
     };
 
     let mut tools = ToolRegistry::with_builtin_tools();
@@ -412,10 +470,10 @@ pub async fn run_orchestrator(
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_system(SYSTEM_PROMPT)
         .with_context_provider(environment_now)
-        // The seam a user-facing config plugs into; the defaults are the
-        // policy for now, but they are set explicitly so `switch_model` has
-        // something to carry over and so the wiring exists in one place.
-        .with_limits(TurnLimits::default())
+        // Set explicitly (rather than left to `Agent`'s own default) so
+        // `switch_model` has something to carry over and so `--max-turns` has
+        // exactly one place to plug into.
+        .with_limits(limits)
         .with_retry_policy(RetryPolicy::default())
         .with_redactor(secret_redactor(&config))
         .with_permission_policy(permission_policy);
@@ -617,5 +675,283 @@ pub async fn run_orchestrator(
                 // Resolved directly by smith-tui via the oneshot channels.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::headless::{self, HeadlessOptions, OutputFormat, EXIT_LIMIT, EXIT_OK};
+    use smith_core::testkit::{text_reply, tool_call_reply, ScriptedProvider, ScriptedResponse};
+
+    /// The whole stack minus the network: a real `run_orchestrator` driving a
+    /// real `Agent` and `ToolRegistry` over the real channels, with only the
+    /// provider scripted, consumed by the real headless frontend.
+    async fn run_headless_against(
+        provider: Arc<ScriptedProvider>,
+        options: HeadlessOptions,
+        max_turns: Option<u32>,
+    ) -> (u8, String, String) {
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (permission_tx, permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, question_rx) = mpsc::unbounded_channel();
+
+        let mut opts = OrchestratorOptions::new(
+            ProviderKind::Anthropic,
+            "scripted-model".to_string(),
+            Config::default(),
+        );
+        opts.provider = Some(provider);
+        opts.permission_policy = smith_core::PermissionPolicy::Ask;
+        if let Some(max_turns) = max_turns {
+            opts.limits.max_turns = max_turns;
+        }
+
+        let orchestrator = tokio::spawn(run_orchestrator(
+            opts,
+            OrchestratorChannels {
+                action_rx,
+                event_tx,
+                permission_tx,
+                question_tx,
+            },
+        ));
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = headless::run(
+            &options,
+            action_tx,
+            event_rx,
+            permission_rx,
+            question_rx,
+            &mut out,
+            &mut err,
+        )
+        .await;
+        orchestrator.abort();
+
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    fn options(prompt: &str, format: OutputFormat, allowed: &[&str]) -> HeadlessOptions {
+        HeadlessOptions {
+            prompt: prompt.to_string(),
+            format,
+            allowed_tools: allowed.iter().map(|s| s.to_string()).collect(),
+            color: false,
+            provider: "scripted".into(),
+            model: "scripted-model".into(),
+        }
+    }
+
+    fn read_manifest() -> serde_json::Value {
+        serde_json::json!({ "path": "Cargo.toml" })
+    }
+
+    #[tokio::test]
+    async fn a_plain_turn_reaches_the_provider_and_comes_back_as_json() {
+        let provider = Arc::new(ScriptedProvider::text("the sky is blue"));
+        let (code, out, _) = run_headless_against(
+            provider.clone(),
+            options("why is the sky blue?", OutputFormat::Json, &[]),
+            None,
+        )
+        .await;
+
+        assert_eq!(code, EXIT_OK);
+        let value: serde_json::Value = serde_json::from_slice(out.as_bytes()).unwrap();
+        assert_eq!(value["result"], "the sky is blue");
+        assert_eq!(value["ok"], true);
+
+        // The prompt the frontend composed is what the model actually saw.
+        let request = provider.last_request().unwrap();
+        assert!(request
+            .messages
+            .iter()
+            .any(|m| m.text().contains("why is the sky blue?")));
+    }
+
+    /// Proves the composition, not just that `compose_prompt` returns a
+    /// string: the piped bytes have to survive all the way into the request.
+    #[tokio::test]
+    async fn a_prompt_composed_from_stdin_arrives_intact_at_the_provider() {
+        let prompt =
+            headless::compose_prompt(Some("diagnose this"), Some("thread 'main' panicked"))
+                .unwrap();
+        let provider = Arc::new(ScriptedProvider::text("it panicked"));
+        let (code, _, _) = run_headless_against(
+            provider.clone(),
+            options(&prompt, OutputFormat::Text, &[]),
+            None,
+        )
+        .await;
+
+        assert_eq!(code, EXIT_OK);
+        let sent = provider
+            .last_request()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.text())
+            .collect::<String>();
+        assert!(sent.contains("diagnose this"));
+        assert!(sent.contains("thread 'main' panicked"));
+    }
+
+    /// `--max-turns 1` has to stop the turn after one tool-call round, which
+    /// means the second scripted reply is never requested.
+    #[tokio::test]
+    async fn max_turns_stops_the_turn_and_reports_the_limit_exit_code() {
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_call_reply("call_1", "read_file", read_manifest()),
+            text_reply("never requested"),
+        ]));
+        let (code, _, err) = run_headless_against(
+            provider.clone(),
+            options("read the manifest", OutputFormat::Text, &["read_file"]),
+            Some(1),
+        )
+        .await;
+
+        assert_eq!(code, EXIT_LIMIT);
+        assert_eq!(provider.request_count(), 1);
+        assert_eq!(provider.remaining(), 1);
+        assert!(err.contains("1 tool-call rounds"), "{err}");
+    }
+
+    /// Without the cap the same script runs to completion — otherwise the
+    /// test above would pass for the wrong reason.
+    #[tokio::test]
+    async fn the_same_script_completes_when_the_cap_is_not_set() {
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_call_reply("call_1", "read_file", read_manifest()),
+            text_reply("it is a manifest"),
+        ]));
+        let (code, out, _) = run_headless_against(
+            provider.clone(),
+            options("read the manifest", OutputFormat::Text, &["read_file"]),
+            None,
+        )
+        .await;
+
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(out, "it is a manifest\n");
+        assert_eq!(provider.request_count(), 2);
+    }
+
+    /// A provider that fails outright must not be reported as a successful
+    /// run — the whole point of headless exit codes.
+    #[tokio::test]
+    async fn a_provider_failure_exits_non_zero() {
+        let provider = Arc::new(ScriptedProvider::new([ScriptedResponse::Fail(
+            // 401 rather than a 5xx on purpose: `RetryPolicy` would re-send a
+            // retryable failure, and this test is about the exit code, not
+            // the backoff schedule.
+            smith_core::ProviderError::Api {
+                status: 401,
+                message: "bad key".into(),
+                retry_after: None,
+            },
+        )]));
+        let (code, out, err) =
+            run_headless_against(provider, options("hello", OutputFormat::Text, &[]), None).await;
+
+        assert_ne!(code, EXIT_OK);
+        assert!(out.is_empty());
+        assert!(err.contains("bad key"), "{err}");
+    }
+
+    /// Deny-by-default all the way down: the tool is never executed, so the
+    /// file it would have written does not appear.
+    #[tokio::test]
+    async fn a_tool_missing_from_allowed_tools_never_runs() {
+        // Inside the crate directory on purpose: that is `ToolContext`'s
+        // sandbox root under `cargo test`, and a path outside it would be
+        // refused by the jail rather than by the flag under test.
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let target = dir.path().join("written.txt");
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_call_reply(
+                "call_1",
+                "write_file",
+                serde_json::json!({ "path": target.to_string_lossy(), "content": "hi" }),
+            ),
+            text_reply("I was not allowed to write that"),
+        ]));
+
+        let (code, out, err) = run_headless_against(
+            provider,
+            options("write a file", OutputFormat::Json, &["read_file"]),
+            None,
+        )
+        .await;
+
+        assert_eq!(code, EXIT_OK);
+        assert!(!target.exists(), "the denied tool ran anyway");
+        assert!(err.contains("denied write_file"), "{err}");
+        let value: serde_json::Value = serde_json::from_slice(out.as_bytes()).unwrap();
+        assert_eq!(value["denied_tools"][0], "write_file");
+    }
+
+    /// The same script with the tool allowed: the flag is what makes the
+    /// difference, not some other refusal along the way.
+    #[tokio::test]
+    async fn the_same_tool_runs_once_allowed_tools_names_it() {
+        // Inside the crate directory on purpose: that is `ToolContext`'s
+        // sandbox root under `cargo test`, and a path outside it would be
+        // refused by the jail rather than by the flag under test.
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let target = dir.path().join("written.txt");
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_call_reply(
+                "call_1",
+                "write_file",
+                serde_json::json!({ "path": target.to_string_lossy(), "content": "hi" }),
+            ),
+            text_reply("wrote it"),
+        ]));
+
+        let (code, _, err) = run_headless_against(
+            provider,
+            options("write a file", OutputFormat::Text, &["write_file"]),
+            None,
+        )
+        .await;
+
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(target.exists(), "{err}");
+    }
+
+    /// Every line of a real run's `stream-json` output — deltas, tool events,
+    /// the final summary — has to stand alone as JSON.
+    #[tokio::test]
+    async fn a_real_stream_json_run_is_line_delimited_throughout() {
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_call_reply("call_1", "read_file", read_manifest()),
+            text_reply("a manifest\nwith a newline in it"),
+        ]));
+        let (code, out, _) = run_headless_against(
+            provider,
+            options("read it", OutputFormat::StreamJson, &["read_file"]),
+            None,
+        )
+        .await;
+
+        assert_eq!(code, EXIT_OK);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.len() > 4, "{lines:?}");
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("not standalone JSON: {line:?}: {e}"));
+        }
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["type"], "result");
+        assert_eq!(last["data"]["exit_code"], 0);
     }
 }
