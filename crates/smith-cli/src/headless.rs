@@ -372,7 +372,7 @@ pub async fn run<O: Write, E: Write>(
             }
 
             Some(ask) = question_rx.recv() => {
-                let _ = ask.respond_to.send(NO_INTERACTIVE_USER.to_string());
+                let _ = ask.respond_to.send(Err(NO_INTERACTIVE_USER.to_string()));
                 if opts.format == OutputFormat::Text {
                     let _ = writeln!(
                         err,
@@ -399,9 +399,10 @@ pub async fn run<O: Write, E: Write>(
 /// overstep.
 ///
 /// It goes back through the normal answer channel, so the model sees it as
-/// `User answered: [smith] …`. Making it a *failed* tool call would read
-/// better still, but `QuestionAsk` carries a bare `oneshot::Sender<String>`
-/// with no way to express refusal, and that type lives in `smith-core`.
+/// Sent as `Err`, so the model sees a *failed* tool call rather than a fake
+/// answer attributed to a user who isn't there. Auto-picking a suggestion
+/// would put words in the user's mouth at exactly the moment the model
+/// admitted it had no basis to choose.
 const NO_INTERACTIVE_USER: &str = "[smith] This run is headless — there is no interactive user, and \
     no further questions can be answered. Do not ask again. Choose the option you judge best, state \
     which one you chose and why, and carry on.";
@@ -987,13 +988,17 @@ mod tests {
         })
         .await;
 
-        let answer = answered_rx.await.unwrap();
-        assert!(answer.contains("headless"));
-        // The whole point: it must not look like the user chose an option.
+        // A refusal, not an answer: headless has no user, and inventing one
+        // is worse than telling the model plainly that nobody is there.
+        let reason = answered_rx
+            .await
+            .unwrap()
+            .expect_err("headless must refuse the question, not answer it");
+        assert!(reason.contains("headless"));
         for option in ["postgres", "sqlite", "mysql"] {
             assert!(
-                !answer.contains(option),
-                "answer leaked a suggestion: {answer}"
+                !reason.contains(option),
+                "refusal leaked a suggestion: {reason}"
             );
         }
         assert_eq!(h.code, EXIT_OK);

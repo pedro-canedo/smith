@@ -75,7 +75,11 @@ pub struct CompletionRequest {
     pub temperature: Option<f32>,
 }
 
+/// `snake_case` on the wire like every other enum in the event stream — this
+/// one rides inside `assistant_turn_complete`, and PascalCase here would have
+/// been the single inconsistency a `jq` user tripped over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
     #[default]
     EndTurn,

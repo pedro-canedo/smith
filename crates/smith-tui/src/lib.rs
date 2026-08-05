@@ -37,7 +37,9 @@ pub async fn run(
     let mut app = App::new(config);
     let mut crossterm_events = EventStream::new();
     let mut pending_permission: Option<oneshot::Sender<smith_core::PermissionDecision>> = None;
-    let mut pending_question: Option<oneshot::Sender<String>> = None;
+    // `Result` because a frontend may be unable to ask at all; the TUI
+    // always can, so it only ever sends `Ok`.
+    let mut pending_question: Option<oneshot::Sender<Result<String, String>>> = None;
     let mut spinner = tokio::time::interval(SPINNER_INTERVAL);
 
     term.draw(|f| ui::draw(f, &mut app))?;
@@ -72,7 +74,7 @@ pub async fn run(
                             }
                             Action::QuestionResponse(answer) => {
                                 if let Some(tx) = pending_question.take() {
-                                    let _ = tx.send(answer);
+                                    let _ = tx.send(Ok(answer));
                                 }
                             }
                             Action::Quit => {

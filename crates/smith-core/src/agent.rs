@@ -175,11 +175,16 @@ pub struct PermissionAsk {
     pub respond_to: oneshot::Sender<PermissionDecision>,
 }
 
-/// Asks the TUI to resolve an `ask_user` question. The oneshot carries the
-/// final answer text (one of the three options, or custom input).
+/// Asks a frontend to resolve an `ask_user` question.
+///
+/// The oneshot carries `Ok(answer)` — one of the three suggestions or custom
+/// input — or `Err(reason)` when the frontend cannot ask at all. That second
+/// case is not hypothetical: headless runs have no user, and being able only
+/// to *answer* forced them to put words in the user's mouth. A refusal comes
+/// back to the model as a failed tool call, which is the honest shape.
 pub struct QuestionAsk {
     pub question: UserQuestion,
-    pub respond_to: oneshot::Sender<String>,
+    pub respond_to: oneshot::Sender<Result<String, String>>,
 }
 
 pub struct Agent {
@@ -932,14 +937,17 @@ impl Agent {
                 });
                 return result;
             }
-            answer = rx => answer.unwrap_or_else(|_| "User dismissed the question.".into()),
+            answer = rx => answer.unwrap_or_else(|_| Ok("User dismissed the question.".into())),
         };
 
-        let result = ToolResult::ok(format!("User answered: {answer}"));
+        let result = match answer {
+            Ok(answer) => ToolResult::ok(format!("User answered: {answer}")),
+            Err(reason) => ToolResult::error(reason),
+        };
         let _ = events.send(AgentEvent::ToolCallResult {
             id: id.to_string(),
             output: result.content.clone(),
-            is_error: false,
+            is_error: result.is_error,
         });
         result
     }
