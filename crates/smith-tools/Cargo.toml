@@ -16,5 +16,10 @@ reqwest = { workspace = true }
 chrono = { workspace = true }
 url = "2"
 
+# `killpg` for cancelling a whole shell process group; already in the tree via
+# tokio, so it costs no extra compilation.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

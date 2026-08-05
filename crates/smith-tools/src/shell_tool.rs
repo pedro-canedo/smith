@@ -9,7 +9,12 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Keeps a runaway command's output from blowing up the conversation context.
+/// Counted in `char`s, not bytes — the limit exists to bound how much the
+/// model has to read, and that maps to characters far better than to bytes.
 const MAX_OUTPUT_CHARS: usize = 20_000;
+/// How long a cancelled command gets to shut down on SIGTERM before SIGKILL.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_millis(200);
 
 pub struct RunBashTool;
 
@@ -52,16 +57,21 @@ impl Tool for RunBashTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        let mut child = match tokio::process::Command::new("sh")
-            .arg("-c")
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
             .arg(command)
             .current_dir(&ctx.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        // Give the shell its own process group so cancel/timeout can signal
+        // everything it spawned. Signalling `sh` alone leaves grandchildren
+        // (`npm run dev` -> node, `cargo build` -> rustc) running forever.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => return ToolResult::error(format!("failed to spawn `sh -c`: {e}")),
         };
@@ -69,11 +79,11 @@ impl Tool for RunBashTool {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 ToolResult::error("command cancelled by user")
             }
             _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 ToolResult::error(format!("command timed out after {timeout_secs}s"))
             }
             (status, stdout, stderr) = wait_with_output(&mut child) => {
@@ -81,6 +91,31 @@ impl Tool for RunBashTool {
             }
         }
     }
+}
+
+/// Kills the shell *and* everything it spawned, by signalling the process
+/// group created at spawn time.
+#[cfg(unix)]
+async fn kill_process_tree(child: &mut Child) {
+    // The child is its own group leader (`process_group(0)`), so its pid is
+    // also the group id. It hasn't been waited on yet, so the pid can't have
+    // been recycled onto some unrelated process.
+    if let Some(pid) = child.id() {
+        let pgid = pid as libc::pid_t;
+        // SAFETY: plain signal delivery to a group we created; the worst a
+        // stale pgid can do is return ESRCH, which we ignore.
+        unsafe { libc::killpg(pgid, libc::SIGTERM) };
+        tokio::time::sleep(KILL_GRACE).await;
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+    let _ = child.wait().await;
+}
+
+/// Non-Unix fallback: kills only the direct child. Reaching grandchildren on
+/// Windows needs a Job Object, which is out of scope here.
+#[cfg(not(unix))]
+async fn kill_process_tree(child: &mut Child) {
+    let _ = child.kill().await;
 }
 
 async fn wait_with_output(
@@ -117,14 +152,14 @@ fn format_result(
 
     let mut output = String::new();
     if !stdout.is_empty() {
-        output.push_str(&truncate(&stdout));
+        output.push_str(&truncate_tail(&stdout, MAX_OUTPUT_CHARS));
     }
     if !stderr.is_empty() {
         if !output.is_empty() {
             output.push('\n');
         }
         output.push_str("[stderr]\n");
-        output.push_str(&truncate(&stderr));
+        output.push_str(&truncate_tail(&stderr, MAX_OUTPUT_CHARS));
     }
     if output.is_empty() {
         output.push_str("(no output)");
@@ -141,12 +176,21 @@ fn format_result(
     }
 }
 
-fn truncate(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_CHARS {
-        s.to_string()
-    } else {
-        let tail = &s[s.len() - MAX_OUTPUT_CHARS..];
-        format!("... (truncated)\n{tail}")
+/// Keeps the last `max` *characters* of `text`, dropping the head.
+///
+/// The tail is what matters when diagnosing a failure, so the end is what
+/// survives. Indexing is by `char` boundary rather than byte offset: a byte
+/// cut lands mid-character on accented Latin, CJK or emoji and panics.
+pub fn truncate_tail(text: &str, max: usize) -> String {
+    if max == 0 {
+        return "... (truncated)".to_string();
+    }
+    // Byte offset of the `max`-th character from the end; `None` means the
+    // text is shorter than the limit, `Some(0)` that it fits exactly.
+    match text.char_indices().nth_back(max - 1) {
+        None => text.to_string(),
+        Some((0, _)) => text.to_string(),
+        Some((start, _)) => format!("... (truncated)\n{}", &text[start..]),
     }
 }
 
@@ -209,6 +253,38 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_grandchildren_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("grandchild-ran");
+        // The backgrounded subshell outlives `sh` unless the whole process
+        // group is signalled; it only writes the sentinel after its sleep.
+        let command = format!(
+            "sleep 2 && touch {} & wait",
+            sentinel.to_str().unwrap_or_default()
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel_clone.cancel();
+        });
+        let result = RunBashTool
+            .execute(serde_json::json!({ "command": command }), &ctx(), cancel)
+            .await;
+        assert!(result.is_error);
+
+        // Well past the grandchild's sleep: if it survived, the file is there.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !sentinel.exists(),
+            "grandchild survived cancellation and wrote {}",
+            sentinel.display()
+        );
+    }
+
     #[tokio::test]
     async fn timeout_kills_the_command() {
         let result = RunBashTool
@@ -220,5 +296,28 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("timed out"));
+    }
+
+    #[test]
+    fn truncate_tail_survives_multibyte_cut_points() {
+        // `€` is 3 bytes wide, so cutting at a byte offset lands inside a
+        // character: the old byte-indexed slice panicked here.
+        let text = "€".repeat(MAX_OUTPUT_CHARS + 1);
+        let out = truncate_tail(&text, MAX_OUTPUT_CHARS);
+        assert!(out.starts_with("... (truncated)\n"));
+        assert_eq!(out.matches('€').count(), MAX_OUTPUT_CHARS);
+    }
+
+    #[test]
+    fn truncate_tail_leaves_short_input_untouched() {
+        assert_eq!(truncate_tail("hello", 10), "hello");
+        assert_eq!(truncate_tail("hello", 5), "hello");
+        assert_eq!(truncate_tail("caí três vezes", 64), "caí três vezes");
+    }
+
+    #[test]
+    fn truncate_tail_keeps_the_tail_not_the_head() {
+        assert_eq!(truncate_tail("abcdef", 3), "... (truncated)\ndef");
+        assert_eq!(truncate_tail("áéíóú", 2), "... (truncated)\nóú");
     }
 }
