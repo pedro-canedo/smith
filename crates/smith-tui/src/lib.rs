@@ -8,6 +8,7 @@ pub mod pricing;
 pub mod slash;
 pub mod terminal;
 pub mod theme;
+pub mod transcript;
 pub mod ui;
 
 use std::time::Duration;

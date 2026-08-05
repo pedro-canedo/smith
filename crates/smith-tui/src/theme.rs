@@ -5,7 +5,9 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-#[derive(Debug, Clone)]
+/// `PartialEq` is load-bearing: the transcript memo keys its cached rows on
+/// the theme, since every span style comes from here.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub raised: Color,
     pub overlay: Color,

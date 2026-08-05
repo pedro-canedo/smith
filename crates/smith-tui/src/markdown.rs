@@ -67,8 +67,32 @@ fn options(theme: &Theme) -> Options<SmithStyleSheet> {
     })
 }
 
+// Counts `render` calls so the transcript memo's effectiveness can be
+// asserted on rather than argued about. Thread-local, so parallel tests
+// don't see each other's parses.
+#[cfg(test)]
+thread_local! {
+    static RENDER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn render_calls() -> usize {
+    RENDER_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub fn reset_render_calls() {
+    RENDER_CALLS.with(|c| c.set(0));
+}
+
 /// Renders markdown into owned ratatui lines (tables, headings, emphasis, code).
+///
+/// This is the single most expensive thing the transcript does, which is why
+/// `crate::transcript` exists to call it once per message rather than once per
+/// message per frame.
 pub fn render(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    #[cfg(test)]
+    RENDER_CALLS.with(|c| c.set(c.get() + 1));
     let rendered = from_str_with_options(text, &options(theme));
     owned_lines(rendered)
 }

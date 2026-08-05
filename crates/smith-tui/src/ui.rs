@@ -170,67 +170,79 @@ fn center_vertically(area: Rect, height: u16) -> Rect {
     }
 }
 
-fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
-    let theme = app.theme.clone();
-    let spinner = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
-    let verbose = app.verbose_tools;
-    let mut lines: Vec<Line> = Vec::new();
-    for line in &app.lines {
-        match line.role {
-            ChatRole::User => {
-                // Two blank lines before a user turn, one everywhere else —
-                // the bubble is the transcript's chapter break.
-                lines.push(Line::from(""));
-                lines.push(Line::from(""));
-                lines.extend(user_bubble(&theme, &line.text, area.width));
-            }
-            ChatRole::Assistant => {
-                lines.extend(assistant_block(
-                    &theme,
-                    &line.text,
-                    line.meta.as_deref(),
-                    area.width,
-                ));
-            }
-            ChatRole::System => {
-                lines.push(Line::from(vec![
-                    Span::styled("· ", theme.disabled()),
-                    Span::styled(line.text.clone(), theme.disabled()),
-                ]));
-            }
-            ChatRole::Thought => {
-                lines.push(Line::from(vec![
-                    Span::styled("+ ", theme.ember_bold()),
-                    Span::styled(format!("Thought: {}", line.text), theme.ember()),
-                ]));
-            }
-            ChatRole::Tool => {
-                lines.extend(tool_card(&theme, line, area.width, verbose, spinner));
-            }
+/// The rows one `ChatLine` contributes to the transcript, separators
+/// included, already narrowed to `width`.
+///
+/// Self-contained by construction — nothing here depends on a neighbouring
+/// line — which is what lets `crate::transcript` memoise it per line.
+pub(crate) fn render_chat_line(
+    line: &ChatLine,
+    theme: &Theme,
+    width: u16,
+    verbose: bool,
+    spinner: &str,
+) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    match line.role() {
+        ChatRole::User => {
+            // Two blank lines before a user turn, one everywhere else —
+            // the bubble is the transcript's chapter break.
+            rows.push(Line::from(""));
+            rows.push(Line::from(""));
+            rows.extend(user_bubble(theme, line.text(), width));
         }
-        lines.push(Line::from(""));
+        ChatRole::Assistant => {
+            rows.extend(assistant_block(theme, line.text(), line.meta(), width));
+        }
+        ChatRole::System => {
+            rows.push(Line::from(vec![
+                Span::styled("· ", theme.disabled()),
+                Span::styled(line.text().to_string(), theme.disabled()),
+            ]));
+        }
+        ChatRole::Thought => {
+            rows.push(Line::from(vec![
+                Span::styled("+ ", theme.ember_bold()),
+                Span::styled(format!("Thought: {}", line.text()), theme.ember()),
+            ]));
+        }
+        ChatRole::Tool => {
+            rows.extend(tool_card(theme, line, width, verbose, spinner));
+        }
     }
-    if let Some(text) = &app.in_flight_text {
-        // Same chrome as a finished reply, so the text doesn't shift when the
-        // turn completes and the streaming buffer becomes a ChatLine.
-        lines.extend(assistant_block(&theme, text, None, area.width));
-    }
+    rows.push(Line::from(""));
 
     // Nothing may exceed the pane width by the time it reaches the Paragraph:
     // a box row folded by `Wrap` puts its closing border on the next row and
     // breaks the frame. Wrapping here also gives System/Thought rows the line
     // breaking they never had.
-    let lines = fit_lines(lines, area.width as usize);
+    fit_lines(rows, width as usize)
+}
 
-    // Build the paragraph first so scroll uses wrapped (visual) height,
-    // not logical line count — long table rows otherwise leave the viewport
-    // stuck above the true bottom even with follow_bottom.
-    //
-    // `Wrap` is a no-op now that `fit_lines` runs, but it stays as a safety
-    // net for any future producer that forgets, and removing it would mean
-    // rewriting the scroll math below in the same change.
-    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    let content_height = paragraph.line_count(area.width) as u16;
+/// The streaming reply, with the same chrome a finished one gets so the text
+/// doesn't shift when the turn completes and the buffer becomes a `ChatLine`.
+pub(crate) fn render_in_flight(text: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    fit_lines(assistant_block(theme, text, None, width), width as usize)
+}
+
+fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
+    let key = crate::transcript::LayoutKey {
+        width: area.width,
+        verbose: app.verbose_tools,
+        theme: app.theme.clone(),
+    };
+    let spinner = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
+    let ember = app.theme.ember;
+    let overlay = app.theme.overlay;
+
+    app.transcript
+        .sync(&app.lines, app.in_flight_text.as_deref(), &key, spinner);
+
+    // The memo already knows every row's height, so the document height is a
+    // lookup rather than a `Paragraph::line_count` re-measure of the whole
+    // session. `fit_lines` guarantees no row is wider than the pane, so a
+    // logical row is a visual row and the two agree.
+    let content_height = u16::try_from(app.transcript.total_height()).unwrap_or(u16::MAX);
     let max_scroll = content_height.saturating_sub(area.height);
     if app.follow_bottom {
         app.scroll = max_scroll;
@@ -241,7 +253,18 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    frame.render_widget(paragraph.scroll((app.scroll, 0)), area);
+    // Virtualisation: only the viewport's rows are handed to ratatui, instead
+    // of the whole document with everything above the offset thrown away.
+    //
+    // `Wrap` is a no-op now that `fit_lines` runs, but it stays as a safety
+    // net for any future producer that forgets.
+    let window = app
+        .transcript
+        .window(app.scroll as usize, area.height as usize);
+    frame.render_widget(
+        Paragraph::new(Text::from(window)).wrap(Wrap { trim: false }),
+        area,
+    );
 
     // Jump pill — the user scrolled up to read history while the agent kept
     // working; offer a visible way back to the live edge.
@@ -258,10 +281,7 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
             height: 1,
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                label,
-                Style::default().fg(theme.ember).bg(theme.overlay),
-            )),
+            Paragraph::new(Span::styled(label, Style::default().fg(ember).bg(overlay))),
             pill,
         );
     }
@@ -279,10 +299,10 @@ fn tool_card(
 ) -> Vec<Line<'static>> {
     let w = area_width as usize;
     let bg = theme.raised_bg();
-    let name = line.tool_name.clone().unwrap_or_default();
+    let name = line.tool_name().unwrap_or_default().to_string();
     let target = tool_target(line);
 
-    let (icon, icon_style) = match line.tool_status {
+    let (icon, icon_style) = match line.tool_status() {
         Some(ActivityStatus::Running) | None => (spinner.to_string(), theme.ember()),
         Some(ActivityStatus::Done) => ("✓".to_string(), theme.success()),
         Some(ActivityStatus::Error) => ("✗".to_string(), theme.danger()),
@@ -303,13 +323,13 @@ fn tool_card(
     }
     let left_width: usize = left.iter().map(|s| s.width()).sum();
 
-    let duration = match line.tool_status {
+    let duration = match line.tool_status() {
         Some(ActivityStatus::Running) | None => line
-            .started_at
+            .started_at()
             .map(|t| format!(" {} ", format_thought(t.elapsed().as_secs_f32())))
             .unwrap_or_default(),
         _ => line
-            .tool_secs
+            .tool_secs()
             .map(|s| format!(" {} ", format_thought(s)))
             .unwrap_or_default(),
     };
@@ -321,14 +341,14 @@ fn tool_card(
 
     let mut out = vec![panel::fill_line(left, w, bg)];
 
-    let finished_error = matches!(line.tool_status, Some(ActivityStatus::Error));
+    let finished_error = matches!(line.tool_status(), Some(ActivityStatus::Error));
     let finished = matches!(
-        line.tool_status,
+        line.tool_status(),
         Some(ActivityStatus::Done) | Some(ActivityStatus::Error)
     );
 
     // Running: show what the call is actually doing.
-    if matches!(line.tool_status, Some(ActivityStatus::Running) | None) {
+    if matches!(line.tool_status(), Some(ActivityStatus::Running) | None) {
         if name == "run_bash" {
             if let Some(cmd) = tool_field(line, "command") {
                 let row = Line::from(vec![
@@ -400,7 +420,7 @@ fn tool_card(
             }
         }
 
-        if let Some(output) = line.tool_output.as_deref() {
+        if let Some(output) = line.tool_output() {
             let total = output.lines().count();
             let cap = total.min(VERBOSE_OUTPUT_CAP);
             let style = if finished_error {
@@ -430,8 +450,7 @@ fn tool_card(
 }
 
 fn tool_field<'a>(line: &'a ChatLine, key: &str) -> Option<&'a str> {
-    line.tool_input
-        .as_ref()
+    line.tool_input()
         .and_then(|v| v.get(key))
         .and_then(|v| v.as_str())
 }
@@ -439,7 +458,7 @@ fn tool_field<'a>(line: &'a ChatLine, key: &str) -> Option<&'a str> {
 /// The human-readable target of a tool call (path / command / pattern /
 /// query), for the card header.
 fn tool_target(line: &ChatLine) -> String {
-    let name = line.tool_name.as_deref().unwrap_or("");
+    let name = line.tool_name().unwrap_or("");
     let target = match name {
         "read_file" | "write_file" | "edit_file" | "list_dir" => tool_field(line, "path"),
         "glob" => tool_field(line, "pattern"),
@@ -462,8 +481,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 fn error_tail(line: &ChatLine, max: usize) -> Vec<String> {
-    line.tool_output
-        .as_deref()
+    line.tool_output()
         .map(|o| {
             o.lines()
                 .rev()
@@ -1190,18 +1208,12 @@ mod tests {
     }
 
     fn tool_line(name: &str, status: ActivityStatus) -> ChatLine {
-        ChatLine {
-            role: ChatRole::Tool,
-            text: format!("Running {name}"),
-            meta: None,
-            tool_id: Some("call_1".into()),
-            tool_status: Some(status),
-            tool_name: Some(name.into()),
-            tool_input: Some(serde_json::json!({"path": "src/main.rs"})),
-            tool_output: Some("file contents".into()),
-            tool_secs: Some(0.4),
-            started_at: None,
-        }
+        ChatLine::test_tool(
+            name,
+            status,
+            serde_json::json!({"path": "src/main.rs"}),
+            Some("file contents"),
+        )
     }
 
     #[test]
@@ -1251,9 +1263,12 @@ mod tests {
     #[test]
     fn tool_card_error_shows_tail_even_when_compact() {
         let theme = Theme::ansi();
-        let mut line = tool_line("run_bash", ActivityStatus::Error);
-        line.tool_input = Some(serde_json::json!({"command": "cargo test"}));
-        line.tool_output = Some("boom: permission denied".into());
+        let line = ChatLine::test_tool(
+            "run_bash",
+            ActivityStatus::Error,
+            serde_json::json!({"command": "cargo test"}),
+            Some("boom: permission denied"),
+        );
         let lines = tool_card(&theme, &line, 60, false, "⠋");
         let text: String = lines.iter().map(|l| l.to_string()).collect();
         assert!(text.contains("permission denied"), "{text}");
@@ -1645,5 +1660,258 @@ mod tests {
             screen_text(&terminal).contains(QUIT_HINT),
             "the second press has to be discoverable"
         );
+    }
+
+    /// The transcript renderer as it was before the memo: rebuild every row
+    /// from every `ChatLine`, measure the whole document, and let
+    /// `Paragraph::scroll` throw away everything above the offset.
+    ///
+    /// Kept only as the oracle for `caching_does_not_change_a_single_cell` —
+    /// if the memo and this disagree on any cell, the memo is wrong.
+    fn legacy_draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
+        let theme = app.theme.clone();
+        let spinner = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
+        let verbose = app.verbose_tools;
+        let mut lines: Vec<Line> = Vec::new();
+        for line in &app.lines {
+            match line.role() {
+                ChatRole::User => {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(""));
+                    lines.extend(user_bubble(&theme, line.text(), area.width));
+                }
+                ChatRole::Assistant => {
+                    lines.extend(assistant_block(
+                        &theme,
+                        line.text(),
+                        line.meta(),
+                        area.width,
+                    ));
+                }
+                ChatRole::System => {
+                    lines.push(Line::from(vec![
+                        Span::styled("· ", theme.disabled()),
+                        Span::styled(line.text().to_string(), theme.disabled()),
+                    ]));
+                }
+                ChatRole::Thought => {
+                    lines.push(Line::from(vec![
+                        Span::styled("+ ", theme.ember_bold()),
+                        Span::styled(format!("Thought: {}", line.text()), theme.ember()),
+                    ]));
+                }
+                ChatRole::Tool => {
+                    lines.extend(tool_card(&theme, line, area.width, verbose, spinner));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+        if let Some(text) = &app.in_flight_text {
+            lines.extend(assistant_block(&theme, text, None, area.width));
+        }
+
+        let lines = fit_lines(lines, area.width as usize);
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let content_height = paragraph.line_count(area.width) as u16;
+        let max_scroll = content_height.saturating_sub(area.height);
+        if app.follow_bottom {
+            app.scroll = max_scroll;
+        } else {
+            app.scroll = app.scroll.min(max_scroll);
+            if app.scroll >= max_scroll {
+                app.follow_bottom = true;
+            }
+        }
+        frame.render_widget(paragraph.scroll((app.scroll, 0)), area);
+    }
+
+    /// A transcript with everything the renderer has to handle: prose,
+    /// markdown structure that changes row counts, long unbroken tokens,
+    /// system/thought rows and a finished tool card.
+    fn long_transcript(app: &mut App, messages: usize) {
+        for i in 0..messages {
+            match i % 5 {
+                0 => app.lines.push(ChatLine::new(
+                    ChatRole::User,
+                    format!("pergunta {i} — {}", "palavra ".repeat(12)),
+                )),
+                1 => app.lines.push(ChatLine::new(
+                    ChatRole::Assistant,
+                    format!("## resposta {i}\n\ncom `código` e **negrito**\n\n- um\n- dois"),
+                )),
+                2 => app.lines.push(ChatLine::new(
+                    ChatRole::Assistant,
+                    format!("| col | {i} |\n| --- | --- |\n| linha | valor bem comprido aqui |"),
+                )),
+                3 => app.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("nota de sistema {i} {}", "s".repeat(90)),
+                )),
+                _ => app.lines.push(ChatLine::test_tool(
+                    "run_bash",
+                    ActivityStatus::Done,
+                    serde_json::json!({ "command": format!("cargo test --package p{i}") }),
+                    Some("ok\nmais uma linha\ne outra"),
+                )),
+            }
+        }
+    }
+
+    fn buffer_of(width: u16, height: u16, mut render: impl FnMut(&mut Frame, Rect)) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, area)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| format!("{}{:?}{:?}", c.symbol(), c.fg, c.bg))
+            .collect()
+    }
+
+    #[test]
+    fn caching_does_not_change_a_single_cell() {
+        for (follow, scroll) in [(true, 0u16), (false, 0), (false, 37), (false, 9_999)] {
+            let mut cached = app_for_input_tests();
+            long_transcript(&mut cached, 200);
+            let mut legacy = app_for_input_tests();
+            long_transcript(&mut legacy, 200);
+            for app in [&mut cached, &mut legacy] {
+                app.follow_bottom = follow;
+                app.scroll = scroll;
+            }
+
+            let a = buffer_of(72, 24, |f, area| draw_messages(f, &mut cached, area));
+            let b = buffer_of(72, 24, |f, area| legacy_draw_messages(f, &mut legacy, area));
+            assert_eq!(a, b, "follow_bottom={follow} scroll={scroll}");
+            assert_eq!(
+                cached.scroll, legacy.scroll,
+                "scroll math diverged (follow_bottom={follow})"
+            );
+            assert_eq!(cached.follow_bottom, legacy.follow_bottom);
+        }
+    }
+
+    #[test]
+    fn caching_does_not_change_a_single_cell_while_streaming() {
+        let mut cached = app_for_input_tests();
+        long_transcript(&mut cached, 40);
+        let mut legacy = app_for_input_tests();
+        long_transcript(&mut legacy, 40);
+        for app in [&mut cached, &mut legacy] {
+            app.in_flight_text = Some("resposta **parcial** ainda chegando…".repeat(4));
+        }
+
+        let a = buffer_of(72, 24, |f, area| draw_messages(f, &mut cached, area));
+        let b = buffer_of(72, 24, |f, area| legacy_draw_messages(f, &mut legacy, area));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_settled_transcript_parses_no_markdown_at_all_on_a_redraw() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_for_input_tests();
+        long_transcript(&mut app, 200);
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+
+        crate::markdown::reset_render_calls();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let cold = crate::markdown::render_calls();
+        assert!(
+            cold >= 80,
+            "expected one parse per assistant message: {cold}"
+        );
+
+        crate::markdown::reset_render_calls();
+        for _ in 0..20 {
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+        }
+        assert_eq!(
+            crate::markdown::render_calls(),
+            0,
+            "20 further frames must not re-parse a single message"
+        );
+    }
+
+    #[test]
+    fn resizing_mid_stream_never_leaves_a_row_wider_than_the_pane() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Position;
+        use ratatui::Terminal;
+
+        let mut app = app_for_input_tests();
+        long_transcript(&mut app, 30);
+
+        // Each resize both invalidates the memo and grows the stream, which is
+        // the combination that used to be able to leave half-wrapped rows on
+        // screen. Every user bubble that opens must still close in the last
+        // column of the pane.
+        for (i, width) in [80u16, 42, 61, 100, 38].into_iter().enumerate() {
+            app.in_flight_text = Some(format!("delta {i} {}", "texto ".repeat(6 * (i + 1))));
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+            let pane = clamp_width(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 24,
+                },
+                MAX_CONTENT_WIDTH,
+            );
+            let pane_right = if width >= SIDEBAR_MIN_TERMINAL_WIDTH {
+                pane.width - SIDEBAR_WIDTH - 1
+            } else {
+                pane.width - 1
+            };
+            let buf = terminal.backend().buffer();
+            for y in 0..20 {
+                if buf.cell(Position::new(0, y)).unwrap().symbol() == "│" {
+                    assert_eq!(
+                        buf.cell(Position::new(pane_right, y)).unwrap().symbol(),
+                        "│",
+                        "width {width}, row {y}: bubble opened but never closed"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn follow_bottom_pins_to_the_live_edge_and_a_manual_scroll_holds() {
+        let mut app = app_for_input_tests();
+        long_transcript(&mut app, 60);
+
+        buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
+        let bottom = app.scroll;
+        assert!(
+            bottom > 0,
+            "a long transcript must have somewhere to scroll"
+        );
+
+        app.follow_bottom = false;
+        app.scroll = bottom / 2;
+        buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
+        assert_eq!(app.scroll, bottom / 2, "the redraw clobbered the offset");
+        assert!(!app.follow_bottom);
+
+        // Growing the transcript while pinned keeps the view at the new bottom.
+        app.follow_bottom = true;
+        app.lines
+            .push(ChatLine::new(ChatRole::Assistant, "mais uma resposta"));
+        buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
+        assert!(app.scroll > bottom);
     }
 }

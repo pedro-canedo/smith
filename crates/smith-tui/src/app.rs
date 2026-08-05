@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use smith_core::{
@@ -7,6 +8,7 @@ use smith_core::{
 
 use crate::components::input::TextInput;
 use crate::theme::Theme;
+use crate::transcript::TranscriptCache;
 
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", ""];
 const MAX_LABEL_CHARS: usize = 64;
@@ -30,30 +32,52 @@ pub enum ChatRole {
     Thought,
 }
 
+/// Source of `LineStamp`s. Process-wide and monotonic, so a stamp is never
+/// reused across lines or across successive states of the same line.
+static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
+
+/// Identity of one *rendered form* of a `ChatLine`.
+///
+/// The transcript memo (`crate::transcript`) keys its cached rows on this and
+/// nothing else, which is only sound because a fresh stamp is drawn both when
+/// a line is created and on every mutation of it. That is enforced
+/// structurally rather than by discipline: every field of `ChatLine` is
+/// private, so `finish_tool` and `fail_if_running` are the only writers in the
+/// crate, and both end by calling `touch()`. A tool card frozen on "running"
+/// after its result landed — the classic memoisation bug here — would need a
+/// mutation path that skips `touch`, and there is none to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineStamp(u64);
+
+fn next_stamp() -> LineStamp {
+    LineStamp(NEXT_STAMP.fetch_add(1, Ordering::Relaxed))
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatLine {
-    pub role: ChatRole,
-    pub text: String,
+    role: ChatRole,
+    text: String,
     /// Small dim caption under an assistant reply, e.g. "ollama · qwen3.5 · 4.2s".
-    pub meta: Option<String>,
+    meta: Option<String>,
     /// Set only for `ChatRole::Tool` lines — the tool call id, used to find
     /// and update this same line in place when its result arrives.
-    pub tool_id: Option<String>,
+    tool_id: Option<String>,
     /// Set only for `ChatRole::Tool` lines — live while the call is running,
     /// then flipped to its final state so the icon reflects outcome.
-    pub tool_status: Option<ActivityStatus>,
+    tool_status: Option<ActivityStatus>,
     /// Tool name (e.g. `run_bash`, `read_file`) — for the card header.
-    pub tool_name: Option<String>,
+    tool_name: Option<String>,
     /// Raw JSON input from the provider — used to derive the target summary
     /// and, in verbose mode, to render the full input and a diff for edits.
-    pub tool_input: Option<serde_json::Value>,
+    tool_input: Option<serde_json::Value>,
     /// Tool output text, populated on `ToolCallResult`.
-    pub tool_output: Option<String>,
+    tool_output: Option<String>,
     /// Wall-clock seconds the call took, populated on `ToolCallResult`.
-    pub tool_secs: Option<f32>,
+    tool_secs: Option<f32>,
     /// When the call started — for the live elapsed counter in the header
     /// while the card is still `Running`.
-    pub started_at: Option<Instant>,
+    started_at: Option<Instant>,
+    stamp: LineStamp,
 }
 
 impl ChatLine {
@@ -69,7 +93,14 @@ impl ChatLine {
             tool_output: None,
             tool_secs: None,
             started_at: None,
+            stamp: next_stamp(),
         }
+    }
+
+    /// Attaches the dim caption shown under a finished assistant reply.
+    pub fn with_meta(mut self, meta: Option<String>) -> Self {
+        self.meta = meta;
+        self
     }
 
     /// A permanent transcript entry for a tool call, starting in the
@@ -81,32 +112,116 @@ impl ChatLine {
         input: serde_json::Value,
     ) -> Self {
         Self {
-            role: ChatRole::Tool,
-            text: label.into(),
-            meta: None,
             tool_id: Some(id.into()),
             tool_status: Some(ActivityStatus::Running),
             tool_name: Some(name.into()),
             tool_input: Some(input),
-            tool_output: None,
-            tool_secs: None,
             started_at: Some(Instant::now()),
+            ..Self::new(ChatRole::Tool, label.into())
         }
     }
 
     /// A thought-row entry: `+ Thought: 959ms` or `+ Thought: 1.1s`.
     fn thought(secs: f32) -> Self {
+        Self::new(ChatRole::Thought, format_thought(secs))
+    }
+
+    pub fn role(&self) -> ChatRole {
+        self.role
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn meta(&self) -> Option<&str> {
+        self.meta.as_deref()
+    }
+
+    pub fn tool_id(&self) -> Option<&str> {
+        self.tool_id.as_deref()
+    }
+
+    pub fn tool_status(&self) -> Option<ActivityStatus> {
+        self.tool_status
+    }
+
+    pub fn tool_name(&self) -> Option<&str> {
+        self.tool_name.as_deref()
+    }
+
+    pub fn tool_input(&self) -> Option<&serde_json::Value> {
+        self.tool_input.as_ref()
+    }
+
+    pub fn tool_output(&self) -> Option<&str> {
+        self.tool_output.as_deref()
+    }
+
+    pub fn tool_secs(&self) -> Option<f32> {
+        self.tool_secs
+    }
+
+    pub fn started_at(&self) -> Option<Instant> {
+        self.started_at
+    }
+
+    pub(crate) fn stamp(&self) -> LineStamp {
+        self.stamp
+    }
+
+    /// True while the card's rendered form is a function of the clock (spinner
+    /// frame + live elapsed counter) rather than of this struct — such a line
+    /// can never be memoised, no matter what its stamp says.
+    pub(crate) fn is_animating(&self) -> bool {
+        self.role == ChatRole::Tool
+            && matches!(self.tool_status, Some(ActivityStatus::Running) | None)
+    }
+
+    /// Records a tool call's outcome, on the `ToolCallResult` that ends it.
+    fn finish_tool(&mut self, status: ActivityStatus, output: String) {
+        self.tool_status = Some(status);
+        self.tool_output = Some(output);
+        if let Some(started) = self.started_at {
+            self.tool_secs = Some(started.elapsed().as_secs_f32());
+        }
+        // Drop the started_at now that the call is done — nothing reads it
+        // after this point, and keeping it would leave the card "animating".
+        self.started_at = None;
+        self.touch();
+    }
+
+    /// Marks a still-running card as failed when the turn dies under it.
+    /// A no-op on any other line, so an error never invalidates the whole
+    /// transcript's memo.
+    fn fail_if_running(&mut self) {
+        if self.tool_status == Some(ActivityStatus::Running) {
+            self.tool_status = Some(ActivityStatus::Error);
+            self.started_at = None;
+            self.touch();
+        }
+    }
+
+    fn touch(&mut self) {
+        self.stamp = next_stamp();
+    }
+
+    /// Builds an arbitrary tool card for rendering tests.
+    #[cfg(test)]
+    pub(crate) fn test_tool(
+        name: &str,
+        status: ActivityStatus,
+        input: serde_json::Value,
+        output: Option<&str>,
+    ) -> Self {
         Self {
-            role: ChatRole::Thought,
-            text: format_thought(secs),
-            meta: None,
-            tool_id: None,
-            tool_status: None,
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-            tool_secs: None,
-            started_at: None,
+            tool_id: Some("call_1".into()),
+            tool_status: Some(status),
+            tool_name: Some(name.into()),
+            tool_input: Some(input),
+            tool_output: output.map(str::to_string),
+            tool_secs: Some(0.4),
+            ..Self::new(ChatRole::Tool, format!("Running {name}"))
         }
     }
 }
@@ -321,6 +436,10 @@ pub struct App {
     /// When the first of the two `Ctrl+C` presses landed, if the quit is
     /// currently armed — see `quit_pending`.
     quit_armed_at: Option<Instant>,
+    /// Memoised rows for `lines` — see `crate::transcript`. Rebuilding the
+    /// transcript from scratch each frame is O(whole session) per keystroke,
+    /// which is what this replaces.
+    pub(crate) transcript: TranscriptCache,
 }
 
 impl App {
@@ -364,6 +483,7 @@ impl App {
             live_tokens_per_sec: None,
             tokens_per_sec: None,
             quit_armed_at: None,
+            transcript: TranscriptCache::default(),
         }
     }
 
@@ -1214,18 +1334,8 @@ impl App {
                         None
                     };
                     let plan_text = text.clone();
-                    self.lines.push(ChatLine {
-                        role: ChatRole::Assistant,
-                        text: text.clone(),
-                        meta,
-                        tool_id: None,
-                        tool_status: None,
-                        tool_name: None,
-                        tool_input: None,
-                        tool_output: None,
-                        tool_secs: None,
-                        started_at: None,
-                    });
+                    self.lines
+                        .push(ChatLine::new(ChatRole::Assistant, text.clone()).with_meta(meta));
 
                     if is_final && self.plan_turn_active {
                         self.plan_turn_active = false;
@@ -1308,20 +1418,14 @@ impl App {
                 if let Some(line) = self
                     .lines
                     .iter_mut()
-                    .find(|l| l.tool_id.as_deref() == Some(id.as_str()))
+                    .find(|l| l.tool_id() == Some(id.as_str()))
                 {
-                    line.tool_status = Some(if is_error {
+                    let status = if is_error {
                         ActivityStatus::Error
                     } else {
                         ActivityStatus::Done
-                    });
-                    line.tool_output = Some(output.clone());
-                    if let Some(started) = line.started_at {
-                        line.tool_secs = Some(started.elapsed().as_secs_f32());
-                    }
-                    // Drop the started_at now that the call is done — nothing
-                    // reads it after this point.
-                    line.started_at = None;
+                    };
+                    line.finish_tool(status, output.clone());
                 }
                 // Model starts thinking again after a result.
                 self.begin_thinking();
@@ -1515,9 +1619,7 @@ impl App {
                 // Don't leave any in-flight tool line spinning forever in
                 // the transcript if the turn errored out mid-call.
                 for line in self.lines.iter_mut() {
-                    if line.tool_status == Some(ActivityStatus::Running) {
-                        line.tool_status = Some(ActivityStatus::Error);
-                    }
+                    line.fail_if_running();
                 }
                 self.lines
                     .push(ChatLine::new(ChatRole::System, format!("error: {err}")));
