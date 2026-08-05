@@ -1,14 +1,17 @@
+use serde::{Deserialize, Serialize};
+
 use crate::message::{Message, StopReason, Usage};
 use crate::tool::PermissionPolicy;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
     AllowOnce,
     AllowSession,
     Deny,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionRequest {
     pub tool_call_id: String,
     pub tool_name: String,
@@ -21,14 +24,15 @@ pub struct PermissionRequest {
 /// A clarifying question the agent asks the user (via the `ask_user` tool).
 /// Always carries exactly three suggestions; the TUI also offers a free-text
 /// fourth option.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserQuestion {
     pub id: String,
     pub prompt: String,
     pub options: [String; 3],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
     InProgress,
@@ -38,14 +42,15 @@ pub enum TaskStatus {
 /// One step of a checklist the agent keeps visible via the `write_tasks`
 /// tool — mirrors how coding-agent CLIs surface a persistent todo list
 /// instead of just a transient "thinking…" status.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub content: String,
     pub status: TaskStatus,
 }
 
 /// High-level agent activity for status chrome (avoids a silent "stuck" UI).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentPhase {
     #[default]
     Idle,
@@ -60,7 +65,8 @@ pub enum AgentPhase {
 }
 
 /// Why a `/loop` run ended, reported on `AgentEvent::LoopFinished`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoopStopReason {
     /// The model's reply contained the loop's completion sentinel.
     Done,
@@ -75,7 +81,7 @@ pub enum LoopStopReason {
 /// A snapshot of local machine resource usage, polled independently of the
 /// LLM turn loop — only meaningful for local providers (e.g. Ollama), where
 /// there's no per-token cost to show instead.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ResourceStats {
     pub cpu_percent: f32,
     pub ram_used_mb: u64,
@@ -126,7 +132,19 @@ pub enum Action {
 }
 
 /// Events flowing from the agent orchestrator out to the TUI (and persistence).
-#[derive(Debug, Clone)]
+///
+/// The tagged serialization is not incidental: it *is* the wire format for
+/// `--output-format stream-json`, so variant and field names are a public
+/// interface that scripts will parse. Renaming one is a breaking change even
+/// though nothing in this crate reads it back.
+///
+/// Adjacent tagging (`{"type": ..., "data": ...}`) rather than internal:
+/// serde cannot internally-tag a newtype variant wrapping a string or a
+/// sequence, and several variants are exactly that (`AssistantTextDelta`,
+/// `TasksUpdated`). It also makes every event the same shape, so a consumer
+/// can branch on `.type` and read `.data` without special cases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     AssistantTextDelta(String),
     /// `stop_reason` tells the frontend whether this is an intermediate round
@@ -188,4 +206,72 @@ pub enum AgentEvent {
     /// list, not a diff; the frontend just swaps its copy wholesale.
     TasksUpdated(Vec<Task>),
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The serialized shape is the `--output-format stream-json` contract, so
+    /// it is pinned deliberately: a rename here breaks every script parsing
+    /// smith's output, and nothing inside this crate would notice.
+    #[test]
+    fn agent_event_serializes_as_a_tagged_snake_case_object() {
+        let json = serde_json::to_value(AgentEvent::AssistantTextDelta("hi".into())).unwrap();
+        assert_eq!(json["type"], "assistant_text_delta");
+
+        assert_eq!(json["data"], "hi");
+
+        let json = serde_json::to_value(AgentEvent::ToolCallResult {
+            id: "call_1".into(),
+            output: "done".into(),
+            is_error: false,
+        })
+        .unwrap();
+        assert_eq!(json["type"], "tool_call_result");
+        assert_eq!(json["data"]["id"], "call_1");
+        assert_eq!(json["data"]["output"], "done");
+        assert_eq!(json["data"]["is_error"], false);
+    }
+
+    #[test]
+    fn agent_event_round_trips_through_json() {
+        let events = vec![
+            AgentEvent::PhaseChanged(AgentPhase::Thinking),
+            AgentEvent::TokenUsage(Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+            }),
+            AgentEvent::TasksUpdated(vec![Task {
+                content: "ship it".into(),
+                status: TaskStatus::InProgress,
+            }]),
+            AgentEvent::Error("boom".into()),
+        ];
+
+        for event in events {
+            let encoded = serde_json::to_string(&event).unwrap();
+            let decoded: AgentEvent = serde_json::from_str(&encoded)
+                .unwrap_or_else(|e| panic!("{encoded} failed to round-trip: {e}"));
+            assert_eq!(format!("{event:?}"), format!("{decoded:?}"));
+        }
+    }
+
+    /// Enum payloads go over the wire too; `snake_case` keeps them idiomatic
+    /// for `jq` rather than leaking Rust's PascalCase.
+    #[test]
+    fn enum_payloads_are_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TaskStatus::InProgress).unwrap(),
+            "in_progress"
+        );
+        assert_eq!(
+            serde_json::to_value(AgentPhase::WaitingPermission).unwrap(),
+            "waiting_permission"
+        );
+        assert_eq!(
+            serde_json::to_value(PermissionDecision::AllowSession).unwrap(),
+            "allow_session"
+        );
+    }
 }

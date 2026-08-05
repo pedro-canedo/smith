@@ -18,7 +18,8 @@ pub enum PermissionClass {
 /// Session-wide override for how the permission gate behaves, set via
 /// `/permission` (or persisted in config). Independent of the per-tool
 /// "allow for this session" grants a user can still give from the modal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionPolicy {
     /// Always prompt for Mutating/Dangerous tools (the original behavior).
     #[default]
