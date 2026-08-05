@@ -1,13 +1,88 @@
 use async_trait::async_trait;
 use smith_core::{PermissionClass, Tool, ToolContext, ToolResult};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-fn resolve(ctx: &ToolContext, path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
+/// Resolves `path` for a file tool and refuses anything that escapes the
+/// session directory.
+///
+/// The jail root is `ctx.cwd` — the directory smith was started in. Before
+/// this existed, `read_file` happily returned `/etc/passwd` and `write_file`
+/// would overwrite `../../.ssh/authorized_keys`; the staging layer looked
+/// like a defence but only sanitised its own mirror before copying to the
+/// unsanitised target.
+///
+/// Two escapes have to be closed, and they need different treatment:
+///
+/// - `..` is normalised away *lexically* first. `starts_with` is
+///   component-wise, so `<root>/a/../../etc/passwd` would otherwise pass a
+///   naive prefix check.
+/// - Symlinks are resolved by canonicalising, so a link inside the project
+///   pointing outside it isn't a side door. Canonicalising fails on paths
+///   that don't exist yet (every `write_file` creating a new file), so we
+///   canonicalise the deepest existing ancestor and re-append the rest.
+fn resolve(ctx: &ToolContext, path: &str) -> Result<PathBuf, String> {
+    let requested = Path::new(path);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
     } else {
-        ctx.cwd.join(p)
+        ctx.cwd.join(requested)
+    };
+
+    let root = real_path(&lexical_normalize(&ctx.cwd));
+    let resolved = real_path(&lexical_normalize(&candidate));
+
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "{path} is outside the project directory ({}). smith only reads and \
+             writes below the directory it was started in.",
+            root.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Drops `.` and resolves `..` textually, without touching the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Popping past the root is a no-op, which is what we want:
+                // `/../..` is `/`.
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Canonicalises as much of `path` as exists, keeping the rest verbatim.
+/// Expects `path` to already be lexically normalised — re-appending a `..`
+/// after canonicalising would reintroduce the escape this is meant to close.
+fn real_path(path: &Path) -> PathBuf {
+    let mut trailing: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = path.to_path_buf();
+
+    loop {
+        if let Ok(real) = probe.canonicalize() {
+            let mut out = real;
+            for part in trailing.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (probe.file_name(), probe.parent()) {
+            (Some(name), Some(parent)) => {
+                trailing.push(name.to_os_string());
+                probe = parent.to_path_buf();
+            }
+            // Nothing along the path exists (or we hit the filesystem root
+            // and even that didn't canonicalise) — fall back to the lexical
+            // form, which is still `..`-free.
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -52,7 +127,10 @@ impl Tool for ReadFileTool {
         let Some(path) = field_str(&input, "path") else {
             return ToolResult::error("missing required field: path");
         };
-        let full = resolve(ctx, path);
+        let full = match resolve(ctx, path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
 
         let content = match tokio::fs::read_to_string(&full).await {
             Ok(c) => c,
@@ -113,7 +191,10 @@ impl Tool for ListDirTool {
         let Some(path) = field_str(&input, "path") else {
             return ToolResult::error("missing required field: path");
         };
-        let full = resolve(ctx, path);
+        let full = match resolve(ctx, path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
 
         let mut read_dir = match tokio::fs::read_dir(&full).await {
             Ok(rd) => rd,
@@ -170,7 +251,10 @@ impl Tool for GlobTool {
         let Some(pattern) = field_str(&input, "pattern") else {
             return ToolResult::error("missing required field: pattern");
         };
-        let full_pattern = resolve(ctx, pattern);
+        let full_pattern = match resolve(ctx, pattern) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
         let full_pattern = full_pattern.to_string_lossy().into_owned();
 
         let paths = match glob::glob(&full_pattern) {
@@ -178,10 +262,18 @@ impl Tool for GlobTool {
             Err(e) => return ToolResult::error(format!("invalid glob pattern: {e}")),
         };
 
+        // Checking the pattern isn't enough: a wildcard can expand *through*
+        // a symlink that points out of the project, so every match is
+        // re-checked against the jail and silently skipped if it escapes.
+        let root = real_path(&lexical_normalize(&ctx.cwd));
         let mut matches = Vec::new();
         for entry in paths {
             match entry {
-                Ok(p) => matches.push(p.to_string_lossy().into_owned()),
+                Ok(p) => {
+                    if real_path(&lexical_normalize(&p)).starts_with(&root) {
+                        matches.push(p.to_string_lossy().into_owned());
+                    }
+                }
                 Err(e) => return ToolResult::error(format!("glob error: {e}")),
             }
         }
@@ -231,7 +323,10 @@ impl Tool for WriteFileTool {
         else {
             return ToolResult::error("missing required fields: path, content");
         };
-        let full = resolve(ctx, path);
+        let full = match resolve(ctx, path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
 
         let staged = match crate::staging::write_staged(ctx, path, content).await {
             Ok(p) => p,
@@ -287,7 +382,10 @@ impl Tool for EditFileTool {
         ) else {
             return ToolResult::error("missing required fields: path, old_str, new_str");
         };
-        let full = resolve(ctx, path);
+        let full = match resolve(ctx, path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
 
         let original = match tokio::fs::read_to_string(&full).await {
             Ok(c) => c,
@@ -519,5 +617,156 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.ends_with("a.rs"));
         assert!(!result.content.contains("b.txt"));
+    }
+
+    // --- path jail -------------------------------------------------------
+    //
+    // Each of these used to succeed. They are the concrete escapes an agent
+    // (or a prompt-injected instruction inside a file it read) could use to
+    // reach outside the project it was pointed at.
+
+    #[tokio::test]
+    async fn read_file_refuses_an_absolute_path_outside_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "/etc/passwd"}),
+                &ctx(&dir),
+                cancel(),
+            )
+            .await;
+        assert!(result.is_error, "got: {}", result.content);
+        assert!(result.content.contains("outside the project directory"));
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_a_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inside.txt"), "ok").unwrap();
+        let result = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "../../../../etc/passwd"}),
+                &ctx(&dir),
+                cancel(),
+            )
+            .await;
+        assert!(result.is_error, "got: {}", result.content);
+    }
+
+    /// `starts_with` is component-wise, so a traversal that dips back inside
+    /// the root would pass a naive prefix check: `<root>/a/../../etc/passwd`
+    /// literally begins with `<root>`.
+    #[tokio::test]
+    async fn read_file_refuses_a_traversal_that_re_enters_the_root_textually() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        let result = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "a/../../etc/passwd"}),
+                &ctx(&dir),
+                cancel(),
+            )
+            .await;
+        assert!(result.is_error, "got: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn write_file_refuses_to_escape_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = WriteFileTool
+            .execute(
+                serde_json::json!({"path": "../escaped.txt", "content": "nope"}),
+                &ctx(&dir),
+                cancel(),
+            )
+            .await;
+        assert!(result.is_error, "got: {}", result.content);
+        assert!(!dir.path().parent().unwrap().join("escaped.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_refuses_a_symlink_pointing_out_of_the_project() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "classified").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("link.txt"),
+        )
+        .unwrap();
+
+        let result = ReadFileTool
+            .execute(
+                serde_json::json!({"path": "link.txt"}),
+                &ctx(&dir),
+                cancel(),
+            )
+            .await;
+        assert!(result.is_error, "got: {}", result.content);
+        assert!(!result.content.contains("classified"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_skips_matches_that_escape_through_a_symlink() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "classified").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mine.rs"), "ok").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("elsewhere")).unwrap();
+
+        let result = GlobTool
+            .execute(
+                serde_json::json!({"pattern": "**/*.rs"}),
+                &ctx(&dir),
+                cancel(),
+            )
+            .await;
+        assert!(!result.is_error, "got: {}", result.content);
+        assert!(result.content.contains("mine.rs"));
+        assert!(
+            !result.content.contains("secret.rs"),
+            "glob leaked outside the project: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_paths_inside_the_project_still_work() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Relative, nested-relative, `.`-prefixed and absolute-inside all
+        // have to keep working — the jail must not cost normal usage.
+        for path in [
+            "src/main.rs",
+            "./src/main.rs",
+            "src/../src/main.rs",
+            dir.path().join("src/main.rs").to_str().unwrap(),
+        ] {
+            let result = ReadFileTool
+                .execute(serde_json::json!({"path": path}), &ctx(&dir), cancel())
+                .await;
+            assert!(!result.is_error, "{path} was rejected: {}", result.content);
+            assert!(result.content.contains("fn main"));
+        }
+    }
+
+    #[test]
+    fn lexical_normalize_resolves_parent_segments() {
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/./b")),
+            PathBuf::from("/a/b")
+        );
+        // Climbing past the root stays at the root rather than going negative.
+        assert_eq!(lexical_normalize(Path::new("/../..")), PathBuf::from("/"));
     }
 }
