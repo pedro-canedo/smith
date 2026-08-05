@@ -91,8 +91,17 @@ impl ToolRegistry {
 
 #[async_trait]
 impl ToolExecutor for ToolRegistry {
+    /// Sorted by name, deliberately.
+    ///
+    /// The tool array is part of the stable prefix providers cache on, so a
+    /// `HashMap`'s arbitrary iteration order would reshuffle it between
+    /// requests and miss the cache every single time. The failure mode is
+    /// invisible — no error, just `cache_read` stuck at zero and a bill to
+    /// match — so this stays sorted even though nothing reads the order.
     fn tool_defs(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|t| t.definition()).collect()
+        let mut defs: Vec<ToolDefinition> = self.tools.values().map(|t| t.definition()).collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        defs
     }
 
     fn permission_class(&self, name: &str) -> Option<PermissionClass> {
@@ -234,5 +243,22 @@ mod tests {
         // `register` panics on collision, so this just has to not panic.
         let registry = ToolRegistry::with_builtin_tools();
         assert_eq!(registry.tool_defs().len(), 9);
+    }
+
+    /// Prompt caching keys on a stable prefix, and the tool array is in it.
+    /// A `HashMap`'s iteration order is arbitrary *per process*, so this has
+    /// to compare two independently built registries, not two calls on one.
+    #[test]
+    fn tool_defs_order_is_stable_across_registries() {
+        let names = |r: &ToolRegistry| -> Vec<String> {
+            r.tool_defs().into_iter().map(|d| d.name).collect()
+        };
+        let a = ToolRegistry::with_builtin_tools();
+        let b = ToolRegistry::with_builtin_tools();
+        assert_eq!(names(&a), names(&b));
+
+        let mut sorted = names(&a);
+        sorted.sort();
+        assert_eq!(names(&a), sorted, "tool_defs must be sorted by name");
     }
 }

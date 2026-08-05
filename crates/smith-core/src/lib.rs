@@ -5,6 +5,7 @@ pub mod event;
 pub mod message;
 pub mod permission_detail;
 pub mod provider;
+pub mod redact;
 pub mod tool;
 
 pub use agent::{parse_tasks, Agent, NoTools, PermissionAsk, QuestionAsk, ToolExecutor};
@@ -17,4 +18,5 @@ pub use message::{
 };
 pub use permission_detail::format_permission_detail;
 pub use provider::{LlmProvider, ProviderError};
+pub use redact::Redactor;
 pub use tool::{PermissionClass, PermissionPolicy, Tool, ToolContext, ToolResult};

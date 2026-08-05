@@ -11,6 +11,7 @@ use crate::event::{
 use crate::message::{CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent};
 use crate::permission_detail::format_permission_detail;
 use crate::provider::LlmProvider;
+use crate::redact::Redactor;
 use crate::tool::{PermissionClass, PermissionPolicy, ToolContext, ToolResult};
 
 /// Stand-in result recorded for a tool call the turn never got to run. The
@@ -100,6 +101,11 @@ pub struct Agent {
     /// The agent's current checklist, replaced wholesale on each `write_tasks`
     /// call — see `AgentEvent::TasksUpdated`.
     tasks: Vec<Task>,
+    /// Strips known API keys out of tool output before it reaches anything
+    /// that keeps or forwards it. Empty by default so `smith-core` has no
+    /// opinion about which secrets exist — the frontend, which loaded them,
+    /// supplies the list.
+    redactor: Redactor,
 }
 
 impl Agent {
@@ -123,7 +129,13 @@ impl Agent {
             goal: None,
             context_provider: None,
             tasks: Vec::new(),
+            redactor: Redactor::default(),
         }
+    }
+
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -539,10 +551,21 @@ impl Agent {
             tool_name: name.to_string(),
             input: input.clone(),
         });
-        let result = self
+        let mut result = self
             .tools
             .execute(name, input, &self.tool_ctx, cancel)
             .await;
+
+        // The only place raw tool output exists before it fans out to the
+        // transcript, the session database and the next provider request.
+        // Redacting here covers all three at once — and covers MCP tools for
+        // free, which matters because their output is the least trusted of
+        // the lot. The gated/denied paths above return strings we wrote
+        // ourselves, so they can't carry a secret.
+        if !self.redactor.is_empty() {
+            result.content = self.redactor.redact(&result.content).into_owned();
+        }
+
         let _ = events.send(AgentEvent::ToolCallResult {
             id: id.to_string(),
             output: result.content.clone(),
@@ -1688,6 +1711,93 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A tool that echoes a secret back, standing in for `run_bash {"command":
+    /// "env"}` or `cat ~/.smith/config.toml`.
+    struct LeakySecretTool {
+        secret: String,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for LeakySecretTool {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            vec![crate::message::ToolDefinition {
+                name: "slow_tool".into(),
+                description: "test tool".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            ToolResult::ok(format!("ANTHROPIC_API_KEY={}\nPATH=/usr/bin", self.secret))
+        }
+    }
+
+    /// A leaked key must not survive into history: history is what gets
+    /// persisted to SQLite *and* what is sent to the provider on the next
+    /// request, so a secret landing there is handed to a third party.
+    #[tokio::test]
+    async fn a_secret_in_tool_output_never_reaches_history() {
+        const SECRET: &str = "sk-ant-api03-supersecretvalue";
+
+        let tool_ctx = ToolContext {
+            cwd: std::path::PathBuf::from("."),
+            session_id: "test-session".into(),
+        };
+        let mut agent = Agent::new(
+            Arc::new(TwoToolCallProvider {
+                called: std::sync::atomic::AtomicBool::new(false),
+            }),
+            Arc::new(LeakySecretTool {
+                secret: SECRET.to_string(),
+            }),
+            "fake-model".to_string(),
+            tool_ctx,
+        )
+        .with_permission_policy(PermissionPolicy::Skip)
+        .with_redactor(Redactor::new([SECRET.to_string()]));
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (perm_tx, _perm_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        agent
+            .run_turn(
+                "what's in the env?".into(),
+                events_tx,
+                perm_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let history = format!("{:?}", agent.history());
+        assert!(!history.contains(SECRET), "secret reached history");
+        assert!(history.contains(crate::redact::REDACTED));
+        // Everything else in the output has to survive, or redaction would be
+        // destroying the tool result it's protecting.
+        assert!(history.contains("PATH=/usr/bin"));
+
+        // The transcript the user sees comes from these events, not history.
+        let mut saw_result = false;
+        while let Ok(event) = events_rx.try_recv() {
+            if let AgentEvent::ToolCallResult { output, .. } = event {
+                saw_result = true;
+                assert!(!output.contains(SECRET), "secret reached the transcript");
+            }
+        }
+        assert!(saw_result, "expected at least one tool result event");
     }
 
     /// Emits a partial tool call and then reports the stream as cancelled —

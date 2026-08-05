@@ -10,7 +10,7 @@ use std::sync::Arc;
 use clap::ValueEnum;
 use smith_core::{
     Action, Agent, AgentEvent, AgentPhase, LlmProvider, Message, PermissionAsk, QuestionAsk,
-    ToolContext,
+    Redactor, ToolContext,
 };
 use smith_provider::{AnthropicProvider, OpenAiProvider};
 use smith_store::{Config, SessionStore};
@@ -98,6 +98,28 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
             Ok(Arc::new(OpenAiProvider::ollama(base_url)))
         }
     }
+}
+
+/// Every credential this process has loaded, from either source, so tool
+/// output can be scrubbed of them before it is shown, stored or sent onward.
+///
+/// Both the environment and the config file are read, because either can be
+/// the live one for a given provider (`build_provider` prefers the env var)
+/// and a stale value in the other is still a real secret worth hiding.
+fn secret_redactor(config: &Config) -> Redactor {
+    let from_env = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "EXA_API_KEY"]
+        .into_iter()
+        .filter_map(|k| std::env::var(k).ok());
+
+    let from_config = [
+        config.anthropic.api_key.clone(),
+        config.openai.api_key.clone(),
+        config.exa.api_key.clone(),
+    ]
+    .into_iter()
+    .flatten();
+
+    Redactor::new(from_env.chain(from_config))
 }
 
 pub struct Persistence {
@@ -245,6 +267,10 @@ impl OrchestratorState {
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
             .with_system(SYSTEM_PROMPT)
             .with_context_provider(environment_now)
+            // Rebuilt from config rather than carried over, so a key added
+            // since startup is covered too. Forgetting it here would silently
+            // disable redaction for the rest of the session.
+            .with_redactor(secret_redactor(config))
             .with_permission_policy(permission_policy);
         agent.set_plan_gated(plan_gated);
         agent.set_goal(goal);
@@ -381,6 +407,7 @@ pub async fn run_orchestrator(
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_system(SYSTEM_PROMPT)
         .with_context_provider(environment_now)
+        .with_redactor(secret_redactor(&config))
         .with_permission_policy(permission_policy);
     agent.set_goal(initial_goal);
     let seeded_tasks = crate::last_write_tasks_call(&initial_messages);
