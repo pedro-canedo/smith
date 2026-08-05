@@ -8,12 +8,13 @@
 use std::sync::Arc;
 
 use clap::ValueEnum;
+use smith_config::Config;
 use smith_core::{
     Action, Agent, AgentEvent, AgentPhase, LlmProvider, Message, PermissionAsk, QuestionAsk,
     Redactor, RetryPolicy, ToolContext, TurnLimits,
 };
 use smith_provider::{AnthropicProvider, OpenAiProvider};
-use smith_store::{Config, SessionStore};
+use smith_store::SessionStore;
 use smith_tools::ToolRegistry;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -94,7 +95,7 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
                 .ollama
                 .base_url
                 .clone()
-                .unwrap_or_else(|| smith_store::DEFAULT_OLLAMA_BASE_URL.to_string());
+                .unwrap_or_else(|| smith_config::DEFAULT_OLLAMA_BASE_URL.to_string());
             Ok(Arc::new(OpenAiProvider::ollama(base_url)))
         }
     }

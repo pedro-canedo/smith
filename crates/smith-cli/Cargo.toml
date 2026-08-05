@@ -15,6 +15,7 @@ smith-provider = { workspace = true }
 smith-tools = { workspace = true }
 smith-mcp = { workspace = true }
 smith-store = { workspace = true }
+smith-config = { workspace = true }
 smith-tui = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

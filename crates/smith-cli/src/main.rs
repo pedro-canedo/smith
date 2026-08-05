@@ -4,8 +4,9 @@ mod resources;
 mod setup;
 
 use clap::{Parser, Subcommand};
+use smith_config::Config;
 use smith_core::{Action, AgentEvent, ContentBlock, Message, PermissionAsk, QuestionAsk};
-use smith_store::{Config, SessionStore};
+use smith_store::SessionStore;
 use smith_tui::{ChatLine, ChatRole, IdleHint, TuiConfig};
 use tokio::sync::mpsc;
 
@@ -57,7 +58,8 @@ async fn main() -> color_eyre::Result<()> {
         return setup::run(jump_to_model).await;
     }
 
-    let config = Config::load().unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = Config::load_layered(&cwd).unwrap_or_default();
     let provider_kind = cli
         .provider
         .or_else(|| {
@@ -80,7 +82,6 @@ async fn main() -> color_eyre::Result<()> {
         .and_then(smith_core::PermissionPolicy::parse)
         .unwrap_or_default();
 
-    let cwd = std::env::current_dir().unwrap_or_default();
     let session_store = SessionStore::open(&cwd).ok();
 
     let (session_id, initial_messages, idle_hint, initial_goal) =

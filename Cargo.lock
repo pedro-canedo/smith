@@ -2489,6 +2489,7 @@ dependencies = [
  "directories",
  "reqwest",
  "serde_json",
+ "smith-config",
  "smith-core",
  "smith-mcp",
  "smith-provider",
@@ -2498,6 +2499,17 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "smith-config"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.19",
+ "toml",
 ]
 
 [[package]]
@@ -2547,14 +2559,12 @@ dependencies = [
 name = "smith-store"
 version = "0.1.0"
 dependencies = [
- "directories",
  "rusqlite",
  "serde",
  "serde_json",
  "smith-core",
  "tempfile",
  "thiserror 2.0.19",
- "toml",
  "uuid",
 ]
 

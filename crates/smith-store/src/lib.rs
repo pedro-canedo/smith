@@ -1,9 +1,12 @@
-//! Session/history persistence (SQLite) and global + project config loading.
+//! Session/history persistence (SQLite) and the model catalogue.
+//!
+//! Configuration deliberately lives in `smith-config` rather than here:
+//! reading a TOML file should not pull in `rusqlite`, whose `bundled` feature
+//! compiles SQLite from C and dominates a cold build — and `smith setup`,
+//! which touches no database at all, was paying that cost.
 
-pub mod config;
 pub mod models;
 pub mod session;
 
-pub use config::{Config, ConfigError, DEFAULT_OLLAMA_BASE_URL, OLLAMA_HOST};
 pub use models::{is_known_provider, known_models};
 pub use session::{SessionError, SessionStore, SessionSummary};

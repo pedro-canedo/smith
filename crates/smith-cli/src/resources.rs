@@ -85,7 +85,7 @@ async fn ollama_model_vram(model: &str) -> Option<(u64, Option<u64>)> {
         .build()
         .ok()?;
     let resp = client
-        .get(format!("{}/api/ps", smith_store::OLLAMA_HOST))
+        .get(format!("{}/api/ps", smith_config::OLLAMA_HOST))
         .send()
         .await
         .ok()?;

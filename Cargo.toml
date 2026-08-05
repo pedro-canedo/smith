@@ -6,6 +6,7 @@ members = [
     "crates/smith-tools",
     "crates/smith-mcp",
     "crates/smith-store",
+    "crates/smith-config",
     "crates/smith-tui",
     "crates/smith-cli",
 ]
@@ -27,6 +28,7 @@ smith-provider = { path = "crates/smith-provider" }
 smith-tools = { path = "crates/smith-tools" }
 smith-mcp = { path = "crates/smith-mcp" }
 smith-store = { path = "crates/smith-store" }
+smith-config = { path = "crates/smith-config" }
 smith-tui = { path = "crates/smith-tui" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time", "signal", "io-util"] }

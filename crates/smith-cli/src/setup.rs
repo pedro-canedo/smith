@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
-use smith_store::{Config, DEFAULT_OLLAMA_BASE_URL, OLLAMA_HOST};
+use smith_config::{Config, DEFAULT_OLLAMA_BASE_URL, OLLAMA_HOST};
 
 const ANTHROPIC_MODELS: &[&str] = &["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
 const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3"];
@@ -46,10 +46,7 @@ pub async fn run(jump_to_model: bool) -> color_eyre::Result<()> {
     }
 
     config.save()?;
-    println!(
-        "\nSaved to {}",
-        smith_store::config::config_path()?.display()
-    );
+    println!("\nSaved to {}", smith_config::config_path()?.display());
     println!("Run `smith` to start chatting.");
     Ok(())
 }
