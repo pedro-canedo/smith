@@ -112,21 +112,28 @@ impl Tool for WebSearchTool {
 
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-        if let Ok(results) = self.search_exa(query, num_results).await {
-            return ToolResult::ok(format_results("Exa", query, &today, &results));
+        // Why the reasons are collected rather than discarded: "the search ran
+        // and found nothing" and "no search backend works here" are completely
+        // different facts, and they used to be indistinguishable to the model.
+        // Both produced "No results", so the model would rephrase, try again,
+        // fail again, and eventually answer from its training data — which is
+        // the exact failure this tool exists to prevent. Only a backend that
+        // genuinely ran gets to say "nothing found".
+        let mut unavailable: Vec<String> = Vec::new();
+
+        match self.search_exa(query, num_results).await {
+            Ok(results) => return ToolResult::ok(format_results("Exa", query, &today, &results)),
+            Err(reason) => unavailable.push(format!("Exa: {reason}")),
         }
 
         // Only worth a browser launch if there is a browser: `is_available`
         // is a cached lookup, so skipping the tier on a machine without one
         // costs nothing per query.
         if crate::chromium::is_available() {
-            if let Ok(results) = crate::chromium::search(query, num_results as usize, &cancel).await
-            {
-                // An empty page here is far more likely to be a challenge or
-                // rate-limit page than a genuine zero-result query, so it
-                // falls through to the last tier instead of being reported as
-                // "nothing found".
-                if !results.is_empty() {
+            match crate::chromium::search(query, num_results as usize, &cancel).await {
+                // An empty page from a browser is far more likely to be a
+                // challenge or rate-limit than a genuine zero-result query.
+                Ok(results) if !results.is_empty() => {
                     return ToolResult::ok(format_results(
                         "headless Chromium (DuckDuckGo)",
                         query,
@@ -134,25 +141,60 @@ impl Tool for WebSearchTool {
                         &results,
                     ));
                 }
+                Ok(_) => unavailable.push(
+                    "headless Chromium: the results page came back empty (challenge or rate limit)"
+                        .into(),
+                ),
+                Err(e) => unavailable.push(format!("headless Chromium: {e}")),
             }
+        } else {
+            unavailable.push(
+                "headless Chromium: no Chrome/Chromium binary found on PATH or in \
+                 SMITH_CHROMIUM_PATH"
+                    .into(),
+            );
         }
 
         match search_duckduckgo_lite(&self.client, query, num_results).await {
             Ok(results) => ToolResult::ok(format_results("DuckDuckGo", query, &today, &results)),
-            Err(_) => ToolResult::error(
-                "web_search failed: Exa, the headless-browser backend and the DuckDuckGo \
-                 fallback all came up empty or unreachable. Installing Chromium (or setting \
-                 SMITH_CHROMIUM_PATH to an existing Chrome/Chromium binary) enables the free \
-                 browser backend. For a paid but more reliable path, set an Exa API key — add \
-                 `[exa]\\napi_key = \"...\"` to ~/.smith/config.toml (get one at \
-                 https://dashboard.exa.ai).",
-            ),
+            Err(reason) => {
+                unavailable.push(format!("DuckDuckGo: {reason}"));
+                ToolResult::error(unavailable_message(&unavailable))
+            }
         }
     }
 }
 
+/// What the model is told when *no* backend could run.
+///
+/// It must not read like "nothing was found", or the model rephrases and
+/// retries until it gives up and answers from memory — which is exactly what
+/// happened in practice. The instruction is therefore explicit: stop, and tell
+/// the user the tool needs configuring. The remedy belongs to the user, not to
+/// a better query.
+fn unavailable_message(reasons: &[String]) -> String {
+    format!(
+        "web_search is UNAVAILABLE — no backend could run. This is NOT \"no results were \
+         found\": nothing was searched at all.\n\n{}\n\nDo not retry with a different query; \
+         no query will work until this is fixed, and do not answer from your training data \
+         instead. Tell the user plainly that web search is not configured, and that either \
+         of these fixes it:\n\
+         - install Chromium or Google Chrome (free; smith drives it headlessly), or point \
+         SMITH_CHROMIUM_PATH at an existing binary;\n\
+         - set an Exa API key: add `[exa]` with `api_key = \"...\"` to ~/.smith/config.toml \
+         (https://dashboard.exa.ai).",
+        reasons
+            .iter()
+            .map(|r| format!("  - {r}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 impl WebSearchTool {
-    async fn search_exa(&self, query: &str, num_results: u64) -> Result<Vec<SearchResult>, ()> {
+    /// `Err` carries why this tier could not answer, so the caller can tell
+    /// the user what to fix rather than reporting an empty result set.
+    async fn search_exa(&self, query: &str, num_results: u64) -> Result<Vec<SearchResult>, String> {
         let mut req = self.client.post(EXA_SEARCH_URL).json(&serde_json::json!({
             "query": query,
             "numResults": num_results,
@@ -163,11 +205,19 @@ impl WebSearchTool {
         if let Some(key) = &self.exa_api_key {
             req = req.header("x-api-key", key);
         }
-        let resp = req.send().await.map_err(|_| ())?;
-        if !resp.status().is_success() {
-            return Err(());
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(match (status.as_u16(), self.exa_api_key.is_some()) {
+                // The keyless attempt is a courtesy probe, not a configuration
+                // error — saying "no API key configured" is the actionable half.
+                (401 | 403, false) => "no API key configured".to_string(),
+                (401 | 403, true) => "the configured API key was rejected".to_string(),
+                (429, _) => "rate limited".to_string(),
+                _ => format!("HTTP {status}"),
+            });
         }
-        let body: serde_json::Value = resp.json().await.map_err(|_| ())?;
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
         Ok(parse_exa_response(&body))
     }
 }
@@ -218,19 +268,43 @@ async fn search_duckduckgo_lite(
     client: &reqwest::Client,
     query: &str,
     num_results: u64,
-) -> Result<Vec<SearchResult>, ()> {
+) -> Result<Vec<SearchResult>, String> {
     let resp = client
         .get(DUCKDUCKGO_LITE_URL)
         .query(&[("q", query)])
         .header("User-Agent", "Mozilla/5.0 (compatible; smith-agent/1.0)")
         .send()
         .await
-        .map_err(|_| ())?;
-    if !resp.status().is_success() {
-        return Err(());
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
     }
-    let html = resp.text().await.map_err(|_| ())?;
-    Ok(parse_duckduckgo_lite(&html, num_results as usize))
+    let html = resp.text().await.map_err(|e| e.to_string())?;
+    let results = parse_duckduckgo_lite(&html, num_results as usize);
+
+    // A 200 that parses to nothing is the interesting case, and it is what
+    // this endpoint now returns in practice: DuckDuckGo answers plain HTTP
+    // scrapers with an anti-bot challenge page — same status, same content
+    // type, no result anchors. Reporting that as "no results" told the model
+    // its query was bad, so it rephrased, failed again, and finally answered
+    // from memory. It is an unavailable backend, not an empty search.
+    if results.is_empty() {
+        return Err(if looks_like_challenge(&html) {
+            "blocked by an anti-bot challenge page".to_string()
+        } else {
+            "the results page had no parseable results".to_string()
+        });
+    }
+    Ok(results)
+}
+
+/// Whether an HTML body is DuckDuckGo refusing to serve a scraper.
+fn looks_like_challenge(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    ["anomaly", "challenge", "captcha", "unusual traffic"]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 /// Minimal, best-effort scrape of DuckDuckGo's lite HTML — a fallback path
@@ -524,5 +598,62 @@ mod tests {
         let html = r#"<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F">Example</a>"#;
         let results = parse_duckduckgo_lite(html, 5);
         assert_eq!(results[0].published, None);
+    }
+
+    // ---- "unavailable" must never look like "found nothing" ----------------
+
+    #[test]
+    fn a_challenge_page_is_detected_rather_than_parsed_as_zero_results() {
+        // Trimmed from what lite.duckduckgo.com actually serves a scraper: a
+        // 200, correct content type, and not one result anchor.
+        let challenge = r#"<!DOCTYPE html><html><head><title>DuckDuckGo</title></head>
+            <body><p>Our systems have detected unusual traffic (anomaly detected).
+            Please complete the challenge to continue.</p></body></html>"#;
+        assert!(looks_like_challenge(challenge));
+        assert!(
+            parse_duckduckgo_lite(challenge, 5).is_empty(),
+            "the premise: a challenge page parses to nothing"
+        );
+    }
+
+    #[test]
+    fn a_genuine_results_page_is_not_mistaken_for_a_challenge() {
+        let html = r#"<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F">Example</a>"#;
+        assert!(!looks_like_challenge(html));
+        assert_eq!(parse_duckduckgo_lite(html, 5).len(), 1);
+    }
+
+    #[test]
+    fn the_unavailable_message_tells_the_model_to_stop_and_report() {
+        let msg = unavailable_message(&[
+            "Exa: no API key configured".to_string(),
+            "headless Chromium: no Chrome/Chromium binary found".to_string(),
+            "DuckDuckGo: blocked by an anti-bot challenge page".to_string(),
+        ]);
+
+        // The distinction that was missing, stated outright.
+        assert!(msg.contains("UNAVAILABLE"));
+        assert!(msg.contains("NOT \"no results were found\""));
+        // Retrying is what the model actually did, four times, before giving
+        // up and answering from training data. Both halves are forbidden.
+        assert!(msg.contains("Do not retry"));
+        assert!(msg.contains("do not answer from your training data"));
+        // Every reason survives, so the user learns which fix applies to them.
+        assert!(msg.contains("no API key configured"));
+        assert!(msg.contains("no Chrome/Chromium binary"));
+        assert!(msg.contains("anti-bot challenge"));
+        // And both remedies are named.
+        assert!(msg.contains("SMITH_CHROMIUM_PATH"));
+        assert!(msg.contains("dashboard.exa.ai"));
+    }
+
+    #[test]
+    fn an_empty_result_set_from_a_working_backend_still_reads_as_no_results() {
+        // The other side of the distinction: a backend that genuinely ran and
+        // found nothing must still invite a refined query.
+        let text = format_results("Exa", "obscure query", "2026-08-05", &[]);
+        assert!(text.contains("No results"));
+        assert!(!text.contains("UNAVAILABLE"));
+        assert!(text.contains("refined query"));
     }
 }
