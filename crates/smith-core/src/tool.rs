@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
+use crate::event::ProgressReporter;
 use crate::message::ToolDefinition;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,12 +87,54 @@ impl ToolResult {
 }
 
 /// Context handed to a tool at execution time.
+///
+/// Build one with `ToolContext::new`: the struct grows over time and every
+/// literal is a site that has to change when it does.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
     /// Stable id for this chat session — used for on-disk staging under
     /// `.smith/staging/<session_id>/`.
     pub session_id: String,
+    /// Progress channel for the call currently executing, stamped on by
+    /// `Agent::run_one_tool`. `None` on the agent's own session-long context
+    /// and anywhere a context is built outside a tool call, so a tool must
+    /// treat progress as best-effort — report through `report_progress`,
+    /// which no-ops when there's nothing attached.
+    pub progress: Option<ProgressReporter>,
+}
+
+impl ToolContext {
+    pub fn new(cwd: impl Into<PathBuf>, session_id: impl Into<String>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            session_id: session_id.into(),
+            progress: None,
+        }
+    }
+
+    /// A copy of this context scoped to one tool call. The agent keeps a
+    /// single call-agnostic context for the session and stamps the current
+    /// call onto a clone at dispatch time.
+    pub fn with_progress(&self, progress: ProgressReporter) -> Self {
+        Self {
+            progress: Some(progress),
+            ..self.clone()
+        }
+    }
+
+    /// The id of the tool call being executed, if this context belongs to one.
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.progress.as_ref().map(ProgressReporter::id)
+    }
+
+    /// Reports one line of progress while the tool is still running. A no-op
+    /// when no channel is attached, so tools never have to branch on it.
+    pub fn report_progress(&self, line: impl Into<String>) {
+        if let Some(progress) = &self.progress {
+            progress.send(line);
+        }
+    }
 }
 
 #[async_trait]
@@ -165,6 +208,36 @@ mod tests {
             Some(PermissionPolicy::Skip)
         );
         assert_eq!(PermissionPolicy::parse("bogus"), None);
+    }
+
+    #[test]
+    fn a_context_built_outside_a_tool_call_has_no_progress_channel() {
+        let ctx = ToolContext::new(".", "test-session");
+        assert!(ctx.progress.is_none());
+        assert!(ctx.tool_call_id().is_none());
+        // Must not panic — tools call this unconditionally.
+        ctx.report_progress("into the void");
+    }
+
+    #[test]
+    fn with_progress_scopes_a_copy_to_one_call_and_leaves_the_original_alone() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let base = ToolContext::new("/tmp", "test-session");
+        let scoped = base.with_progress(ProgressReporter::new("call_1", tx));
+
+        assert_eq!(scoped.tool_call_id(), Some("call_1"));
+        assert_eq!(scoped.cwd, base.cwd);
+        assert_eq!(scoped.session_id, base.session_id);
+        assert!(base.tool_call_id().is_none());
+
+        scoped.report_progress("halfway");
+        match rx.try_recv().unwrap() {
+            crate::event::AgentEvent::ToolProgress { id, line } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(line, "halfway");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

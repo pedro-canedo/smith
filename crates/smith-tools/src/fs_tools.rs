@@ -429,10 +429,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &tempfile::TempDir) -> ToolContext {
-        ToolContext {
-            cwd: dir.path().to_path_buf(),
-            session_id: "test-session".into(),
-        }
+        ToolContext::new(dir.path(), "test-session")
     }
 
     fn cancel() -> CancellationToken {

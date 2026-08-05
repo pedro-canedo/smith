@@ -157,10 +157,7 @@ mod tests {
     }
 
     fn ctx() -> ToolContext {
-        ToolContext {
-            cwd: std::env::temp_dir(),
-            session_id: "test".to_string(),
-        }
+        ToolContext::new(std::env::temp_dir(), "test")
     }
 
     #[test]

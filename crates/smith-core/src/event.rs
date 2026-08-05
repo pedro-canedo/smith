@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::message::{Message, StopReason, Usage};
 use crate::tool::PermissionPolicy;
@@ -158,6 +159,15 @@ pub enum AgentEvent {
         tool_name: String,
         input: serde_json::Value,
     },
+    /// A line emitted by a tool that is still running, between its
+    /// `ToolCallStarted` and `ToolCallResult`. `id` matches that pair, so a
+    /// frontend can attach the line to the right call even while several
+    /// tools are in flight. Advisory only — a tool's real answer is always
+    /// the `ToolCallResult`, never the progress lines.
+    ToolProgress {
+        id: String,
+        line: String,
+    },
     ToolCallResult {
         id: String,
         output: String,
@@ -208,6 +218,44 @@ pub enum AgentEvent {
     Error(String),
 }
 
+/// A handle onto the `AgentEvent` stream scoped to a single tool call. Handed
+/// to a tool through `ToolContext` so it can report progress mid-execution
+/// without knowing anything about the agent loop — or even its own call id.
+///
+/// It rides the *same* channel as `ToolCallStarted`/`ToolCallResult` rather
+/// than one of its own: the ordering between the three is what makes the
+/// stream renderable, and a separate channel could deliver a progress line
+/// ahead of the call it belongs to.
+#[derive(Debug, Clone)]
+pub struct ProgressReporter {
+    id: String,
+    events: mpsc::UnboundedSender<AgentEvent>,
+}
+
+impl ProgressReporter {
+    pub fn new(id: impl Into<String>, events: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        Self {
+            id: id.into(),
+            events,
+        }
+    }
+
+    /// The id of the tool call this reporter belongs to.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Emits one progress line. A closed receiver means the frontend is gone,
+    /// which is not a running tool's problem — so send failures are dropped
+    /// rather than surfaced.
+    pub fn send(&self, line: impl Into<String>) {
+        let _ = self.events.send(AgentEvent::ToolProgress {
+            id: self.id.clone(),
+            line: line.into(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +303,52 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{encoded} failed to round-trip: {e}"));
             assert_eq!(format!("{event:?}"), format!("{decoded:?}"));
         }
+    }
+
+    #[test]
+    fn tool_progress_serializes_alongside_the_rest_of_the_tool_call_events() {
+        let json = serde_json::to_value(AgentEvent::ToolProgress {
+            id: "call_1".into(),
+            line: "compiling...".into(),
+        })
+        .unwrap();
+        assert_eq!(json["type"], "tool_progress");
+        assert_eq!(json["data"]["id"], "call_1");
+        assert_eq!(json["data"]["line"], "compiling...");
+    }
+
+    #[test]
+    fn progress_reporter_tags_every_line_with_its_call_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ProgressReporter::new("call_7", tx);
+        assert_eq!(reporter.id(), "call_7");
+
+        reporter.send("first");
+        reporter.send("second".to_string());
+
+        let lines: Vec<(String, String)> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| match e {
+                AgentEvent::ToolProgress { id, line } => (id, line),
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("call_7".to_string(), "first".to_string()),
+                ("call_7".to_string(), "second".to_string()),
+            ]
+        );
+    }
+
+    /// A tool holding a reporter must not care that the frontend went away —
+    /// it is fire-and-forget by design.
+    #[test]
+    fn progress_reporter_survives_a_dropped_receiver() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let reporter = ProgressReporter::new("call_1", tx);
+        drop(rx);
+        reporter.send("nobody is listening");
     }
 
     /// Enum payloads go over the wire too; `snake_case` keeps them idiomatic

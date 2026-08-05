@@ -115,10 +115,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn ctx(dir: &tempfile::TempDir) -> ToolContext {
-        ToolContext {
-            cwd: dir.path().to_path_buf(),
-            session_id: "sess-test".into(),
-        }
+        ToolContext::new(dir.path(), "sess-test")
     }
 
     #[test]

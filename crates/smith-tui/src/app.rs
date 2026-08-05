@@ -1326,6 +1326,10 @@ impl App {
                 // Model starts thinking again after a result.
                 self.begin_thinking();
             }
+            // The channel exists but nothing emits on it yet, and no tool
+            // renders live output — deliberately dropped until the transcript
+            // grows a place to put it.
+            AgentEvent::ToolProgress { .. } => {}
             AgentEvent::PermissionPromptNeeded(request) => {
                 self.phase = AgentPhase::WaitingPermission;
                 self.modal = Modal::Permission(PermissionModal { request, scroll: 0 });

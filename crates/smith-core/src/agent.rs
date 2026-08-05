@@ -6,7 +6,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::event::{
-    AgentEvent, AgentPhase, PermissionDecision, PermissionRequest, Task, TaskStatus, UserQuestion,
+    AgentEvent, AgentPhase, PermissionDecision, PermissionRequest, ProgressReporter, Task,
+    TaskStatus, UserQuestion,
 };
 use crate::message::{CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent};
 use crate::permission_detail::format_permission_detail;
@@ -551,10 +552,13 @@ impl Agent {
             tool_name: name.to_string(),
             input: input.clone(),
         });
-        let mut result = self
-            .tools
-            .execute(name, input, &self.tool_ctx, cancel)
-            .await;
+        // The one place a tool learns which call it is: the context the agent
+        // holds is session-long and call-agnostic, so the id and its progress
+        // channel are stamped onto a per-dispatch clone.
+        let ctx = self
+            .tool_ctx
+            .with_progress(ProgressReporter::new(id, events.clone()));
+        let mut result = self.tools.execute(name, input, &ctx, cancel).await;
 
         // The only place raw tool output exists before it fans out to the
         // transcript, the session database and the next provider request.
@@ -838,45 +842,22 @@ async fn consume_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{empty_reply, text_reply, tool_calls_reply, ScriptedProvider};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Always replies with a completely empty turn (no text, no tool use) —
-    /// exercises the "provider returned nothing" edge case.
-    struct EmptyReplyProvider;
+    /// The agent retries an empty turn twice before giving up, so a provider
+    /// that only ever returns nothing has to be scripted for all three.
+    const EMPTY_TURN_ATTEMPTS: usize = 3;
 
-    #[async_trait]
-    impl LlmProvider for EmptyReplyProvider {
-        fn id(&self) -> &'static str {
-            "fake"
-        }
-
-        async fn stream_completion(
-            &self,
-            _request: CompletionRequest,
-            _cancel: CancellationToken,
-        ) -> Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<StreamEvent, crate::provider::ProviderError>,
-            >,
-            crate::provider::ProviderError,
-        > {
-            let events = vec![Ok(StreamEvent::MessageComplete {
-                stop_reason: StopReason::EndTurn,
-                usage: crate::message::Usage::default(),
-            })];
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
+    fn always_empty() -> ScriptedProvider {
+        ScriptedProvider::streams(std::iter::repeat_with(empty_reply).take(EMPTY_TURN_ATTEMPTS))
     }
 
     #[tokio::test]
     async fn empty_assistant_turn_is_not_pushed_to_history() {
-        let provider = Arc::new(EmptyReplyProvider);
+        let provider = Arc::new(always_empty());
         let tools = Arc::new(NoTools);
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx);
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
@@ -900,60 +881,18 @@ mod tests {
         assert_eq!(agent.history()[0].role, Role::User);
     }
 
-    /// Replies with an empty turn twice, then text on the third attempt —
-    /// exercises the auto-retry path for providers that stall right after a
-    /// tool round instead of writing up the results.
-    #[derive(Default)]
-    struct FlakyThenTextProvider {
-        attempts: std::sync::atomic::AtomicU32,
-    }
-
-    #[async_trait]
-    impl LlmProvider for FlakyThenTextProvider {
-        fn id(&self) -> &'static str {
-            "fake"
-        }
-
-        async fn stream_completion(
-            &self,
-            _request: CompletionRequest,
-            _cancel: CancellationToken,
-        ) -> Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<StreamEvent, crate::provider::ProviderError>,
-            >,
-            crate::provider::ProviderError,
-        > {
-            let n = self
-                .attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let events = if n < 2 {
-                vec![Ok(StreamEvent::MessageComplete {
-                    stop_reason: StopReason::EndTurn,
-                    usage: crate::message::Usage::default(),
-                })]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta("finally".to_string())),
-                    Ok(StreamEvent::MessageComplete {
-                        stop_reason: StopReason::EndTurn,
-                        usage: crate::message::Usage::default(),
-                    }),
-                ]
-            };
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
+    /// Empty turns twice, then text on the third attempt — exercises the
+    /// auto-retry path for providers that stall right after a tool round
+    /// instead of writing up the results.
     #[tokio::test]
     async fn empty_turns_are_retried_before_giving_up() {
-        let provider = Arc::new(FlakyThenTextProvider::default());
+        let provider = Arc::new(ScriptedProvider::streams([
+            empty_reply(),
+            empty_reply(),
+            text_reply("finally"),
+        ]));
         let tools = Arc::new(NoTools);
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider.clone(), tools, "fake-model".to_string(), tool_ctx);
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
@@ -970,70 +909,16 @@ mod tests {
             )
             .await;
 
-        assert_eq!(
-            provider.attempts.load(std::sync::atomic::Ordering::SeqCst),
-            3
-        );
+        assert_eq!(provider.request_count(), 3);
         assert_eq!(agent.history().len(), 2);
         assert_eq!(agent.history()[1].role, Role::Assistant);
         assert_eq!(agent.history()[1].text(), "finally");
     }
 
-    /// Proposes calling `write_file` (a Mutating tool) on the first request,
-    /// then ends the turn with plain text on the next — stateful so
-    /// `run_turn`'s tool-use loop actually terminates instead of looping
-    /// forever asking to call the same tool again.
-    #[derive(Default)]
-    struct SingleToolCallProvider {
-        called: std::sync::atomic::AtomicBool,
-    }
-
-    #[async_trait]
-    impl LlmProvider for SingleToolCallProvider {
-        fn id(&self) -> &'static str {
-            "fake"
-        }
-
-        async fn stream_completion(
-            &self,
-            _request: CompletionRequest,
-            _cancel: CancellationToken,
-        ) -> Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<StreamEvent, crate::provider::ProviderError>,
-            >,
-            crate::provider::ProviderError,
-        > {
-            let events = if self.called.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".to_string())),
-                    Ok(StreamEvent::MessageComplete {
-                        stop_reason: StopReason::EndTurn,
-                        usage: crate::message::Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::ToolUseStart {
-                        id: "call_1".to_string(),
-                        name: "write_file".to_string(),
-                    }),
-                    Ok(StreamEvent::ToolUseInputDelta {
-                        id: "call_1".to_string(),
-                        partial_json: "{}".to_string(),
-                    }),
-                    Ok(StreamEvent::ToolUseComplete {
-                        id: "call_1".to_string(),
-                    }),
-                    Ok(StreamEvent::MessageComplete {
-                        stop_reason: StopReason::ToolUse,
-                        usage: crate::message::Usage::default(),
-                    }),
-                ]
-            };
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
+    /// Proposes calling `write_file` (a Mutating tool), then ends the turn
+    /// with plain text once its result comes back.
+    fn write_file_then_done() -> ScriptedProvider {
+        ScriptedProvider::tool_call_then_text("call_1", "write_file", serde_json::json!({}), "done")
     }
 
     /// Classifies `write_file` as Mutating and records whether it was ever
@@ -1068,14 +953,11 @@ mod tests {
     #[tokio::test]
     async fn plan_gate_blocks_mutating_tools_even_under_skip_policy() {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let provider = Arc::new(SingleToolCallProvider::default());
+        let provider = Arc::new(write_file_then_done());
         let tools = Arc::new(RecordingTools {
             executed: executed.clone(),
         });
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
             .with_permission_policy(PermissionPolicy::Skip); // would normally auto-allow everything
         agent.set_plan_gated(true);
@@ -1119,14 +1001,11 @@ mod tests {
     #[tokio::test]
     async fn plan_gate_lifted_allows_the_tool_to_run() {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let provider = Arc::new(SingleToolCallProvider::default());
+        let provider = Arc::new(write_file_then_done());
         let tools = Arc::new(RecordingTools {
             executed: executed.clone(),
         });
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
             .with_permission_policy(PermissionPolicy::Skip);
         assert!(!agent.plan_gated());
@@ -1151,76 +1030,21 @@ mod tests {
         );
     }
 
-    /// Calls `write_tasks` with a fixed task list on the first request, then
-    /// ends the turn with plain text on the next.
-    #[derive(Default)]
-    struct WriteTasksProvider {
-        called: std::sync::atomic::AtomicBool,
-    }
-
-    #[async_trait]
-    impl LlmProvider for WriteTasksProvider {
-        fn id(&self) -> &'static str {
-            "fake"
-        }
-
-        async fn stream_completion(
-            &self,
-            _request: CompletionRequest,
-            _cancel: CancellationToken,
-        ) -> Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<StreamEvent, crate::provider::ProviderError>,
-            >,
-            crate::provider::ProviderError,
-        > {
-            let events = if self.called.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".to_string())),
-                    Ok(StreamEvent::MessageComplete {
-                        stop_reason: StopReason::EndTurn,
-                        usage: crate::message::Usage::default(),
-                    }),
-                ]
-            } else {
-                let json = serde_json::json!({
-                    "tasks": [
-                        {"content": "step one", "status": "in_progress"},
-                        {"content": "step two", "status": "pending"},
-                    ]
-                })
-                .to_string();
-                vec![
-                    Ok(StreamEvent::ToolUseStart {
-                        id: "call_1".to_string(),
-                        name: "write_tasks".to_string(),
-                    }),
-                    Ok(StreamEvent::ToolUseInputDelta {
-                        id: "call_1".to_string(),
-                        partial_json: json,
-                    }),
-                    Ok(StreamEvent::ToolUseComplete {
-                        id: "call_1".to_string(),
-                    }),
-                    Ok(StreamEvent::MessageComplete {
-                        stop_reason: StopReason::ToolUse,
-                        usage: crate::message::Usage::default(),
-                    }),
-                ]
-            };
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
     #[tokio::test]
     async fn write_tasks_updates_agent_state_even_while_plan_gated() {
-        let provider = Arc::new(WriteTasksProvider::default());
+        let provider = Arc::new(ScriptedProvider::tool_call_then_text(
+            "call_1",
+            "write_tasks",
+            serde_json::json!({
+                "tasks": [
+                    {"content": "step one", "status": "in_progress"},
+                    {"content": "step two", "status": "pending"},
+                ]
+            }),
+            "done",
+        ));
         let tools = Arc::new(NoTools);
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx);
         agent.set_plan_gated(true);
 
@@ -1324,67 +1148,21 @@ mod tests {
         assert!(find_fallback_tool_call("just a normal reply", &known).is_none());
     }
 
-    /// Emits the tool call as plain text content (no ToolUseStart at all) —
-    /// simulates a local model that doesn't use the structured tool-calling
-    /// channel, e.g. Ollama serving a model with weak function-calling.
-    struct TextOnlyToolCallProvider {
-        called: std::sync::atomic::AtomicBool,
-    }
-
-    #[async_trait]
-    impl LlmProvider for TextOnlyToolCallProvider {
-        fn id(&self) -> &'static str {
-            "fake"
-        }
-
-        async fn stream_completion(
-            &self,
-            _request: CompletionRequest,
-            _cancel: CancellationToken,
-        ) -> Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<StreamEvent, crate::provider::ProviderError>,
-            >,
-            crate::provider::ProviderError,
-        > {
-            let events = if self.called.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".to_string())),
-                    Ok(StreamEvent::MessageComplete {
-                        stop_reason: StopReason::EndTurn,
-                        usage: crate::message::Usage::default(),
-                    }),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::TextDelta(
-                        r#"{"name": "write_file", "arguments": {"path": "a.txt"}}"#.to_string(),
-                    )),
-                    Ok(StreamEvent::MessageComplete {
-                        stop_reason: StopReason::EndTurn,
-                        usage: crate::message::Usage::default(),
-                    }),
-                ]
-            };
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
+    /// The tool call arrives as plain text content (no `ToolUseStart` at all)
+    /// — a local model that doesn't use the structured tool-calling channel,
+    /// e.g. Ollama serving a model with weak function-calling.
     #[tokio::test]
     async fn text_only_tool_call_is_recovered_and_actually_executed() {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let provider = Arc::new(TextOnlyToolCallProvider {
-            called: std::sync::atomic::AtomicBool::new(false),
-        });
+        let provider = Arc::new(ScriptedProvider::streams([
+            text_reply(r#"{"name": "write_file", "arguments": {"path": "a.txt"}}"#),
+            text_reply("done"),
+        ]));
         let tools = Arc::new(RecordingToolsNamed {
             name: "write_file".to_string(),
             executed: executed.clone(),
         });
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
             .with_permission_policy(PermissionPolicy::Skip);
 
@@ -1452,13 +1230,12 @@ mod tests {
         }
     }
 
+    /// For the tests below, which only inspect agent state and never run a
+    /// turn — hence the empty script.
     fn fake_agent() -> Agent {
-        let provider = Arc::new(EmptyReplyProvider);
+        let provider = Arc::new(ScriptedProvider::streams([]));
         let tools = Arc::new(NoTools);
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let tool_ctx = ToolContext::new(".", "test-session");
         Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
     }
 
@@ -1547,57 +1324,15 @@ mod tests {
         );
     }
 
-    /// Asks for two tool calls in one turn, then ends the turn.
-    struct TwoToolCallProvider {
-        called: std::sync::atomic::AtomicBool,
-    }
-
-    #[async_trait]
-    impl LlmProvider for TwoToolCallProvider {
-        fn id(&self) -> &'static str {
-            "fake"
-        }
-
-        async fn stream_completion(
-            &self,
-            _request: CompletionRequest,
-            _cancel: CancellationToken,
-        ) -> Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<StreamEvent, crate::provider::ProviderError>,
-            >,
-            crate::provider::ProviderError,
-        > {
-            let events = if self.called.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                vec![
-                    Ok(StreamEvent::TextDelta("done".to_string())),
-                    Ok(StreamEvent::MessageComplete {
-                        stop_reason: StopReason::EndTurn,
-                        usage: crate::message::Usage::default(),
-                    }),
-                ]
-            } else {
-                let mut events = Vec::new();
-                for id in ["call_1", "call_2"] {
-                    events.push(Ok(StreamEvent::ToolUseStart {
-                        id: id.to_string(),
-                        name: "slow_tool".to_string(),
-                    }));
-                    events.push(Ok(StreamEvent::ToolUseInputDelta {
-                        id: id.to_string(),
-                        partial_json: "{}".to_string(),
-                    }));
-                    events.push(Ok(StreamEvent::ToolUseComplete { id: id.to_string() }));
-                }
-                events.push(Ok(StreamEvent::MessageComplete {
-                    stop_reason: StopReason::ToolUse,
-                    usage: crate::message::Usage::default(),
-                }));
-                events
-            };
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
+    /// Asks for two `slow_tool` calls in one turn, then ends the turn.
+    fn two_tool_calls_then_done() -> ScriptedProvider {
+        ScriptedProvider::streams([
+            tool_calls_reply(&[
+                ("call_1", "slow_tool", serde_json::json!({})),
+                ("call_2", "slow_tool", serde_json::json!({})),
+            ]),
+            text_reply("done"),
+        ])
     }
 
     /// Cancels the turn from inside the first tool call — the exact shape of
@@ -1647,13 +1382,8 @@ mod tests {
             cancel: cancel.clone(),
             calls: calls.clone(),
         });
-        let provider = Arc::new(TwoToolCallProvider {
-            called: std::sync::atomic::AtomicBool::new(false),
-        });
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let provider = Arc::new(two_tool_calls_then_done());
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
             .with_permission_policy(PermissionPolicy::Skip);
 
@@ -1713,6 +1443,111 @@ mod tests {
             .collect()
     }
 
+    /// Reports progress mid-execution and records the call id it was handed,
+    /// standing in for a tool that streams output while it runs.
+    struct ProgressingTool {
+        seen_call_id: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ProgressingTool {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            vec![crate::message::ToolDefinition {
+                name: "slow_tool".into(),
+                description: "test tool".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            *self.seen_call_id.lock().unwrap() = ctx.tool_call_id().map(str::to_string);
+            ctx.report_progress("line one");
+            ctx.report_progress("line two");
+            ToolResult::ok("finished")
+        }
+    }
+
+    /// The channel a later task will use to stream `run_bash` output: a tool
+    /// must be able to emit lines *between* its start and result events, and
+    /// each line must carry the id of the call that produced it — otherwise a
+    /// frontend can't attach output to the right call when several tools run
+    /// in one round.
+    #[tokio::test]
+    async fn a_tool_can_report_progress_between_its_start_and_result_events() {
+        let tools = Arc::new(ProgressingTool {
+            seen_call_id: std::sync::Mutex::new(None),
+        });
+        let mut agent = Agent::new(
+            Arc::new(two_tool_calls_then_done()),
+            tools.clone(),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_permission_policy(PermissionPolicy::Skip);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (perm_tx, _perm_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        agent
+            .run_turn(
+                "go".into(),
+                events_tx,
+                perm_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        // The tool learned which call it was without being told explicitly.
+        assert_eq!(
+            tools.seen_call_id.lock().unwrap().as_deref(),
+            Some("call_2"),
+            "the context must carry the id of the call currently executing"
+        );
+
+        // Ordering is the whole reason progress rides the same channel.
+        let sequence: Vec<String> = std::iter::from_fn(|| events_rx.try_recv().ok())
+            .filter_map(|e| match e {
+                AgentEvent::ToolCallStarted { id, .. } => Some(format!("start:{id}")),
+                AgentEvent::ToolProgress { id, line } => Some(format!("progress:{id}:{line}")),
+                AgentEvent::ToolCallResult { id, .. } => Some(format!("result:{id}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec![
+                "start:call_1",
+                "progress:call_1:line one",
+                "progress:call_1:line two",
+                "result:call_1",
+                "start:call_2",
+                "progress:call_2:line one",
+                "progress:call_2:line two",
+                "result:call_2",
+            ]
+        );
+    }
+
+    /// The agent's own context is session-long and must stay call-agnostic —
+    /// `/model` clones it into a rebuilt agent, so a stale call id or a
+    /// channel from a finished turn would outlive its call.
+    #[test]
+    fn the_agents_own_context_carries_no_call_id() {
+        assert!(fake_agent().tool_ctx().tool_call_id().is_none());
+    }
+
     /// A tool that echoes a secret back, standing in for `run_bash {"command":
     /// "env"}` or `cat ~/.smith/config.toml`.
     struct LeakySecretTool {
@@ -1751,14 +1586,9 @@ mod tests {
     async fn a_secret_in_tool_output_never_reaches_history() {
         const SECRET: &str = "sk-ant-api03-supersecretvalue";
 
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(
-            Arc::new(TwoToolCallProvider {
-                called: std::sync::atomic::AtomicBool::new(false),
-            }),
+            Arc::new(two_tool_calls_then_done()),
             Arc::new(LeakySecretTool {
                 secret: SECRET.to_string(),
             }),
@@ -1800,56 +1630,32 @@ mod tests {
         assert!(saw_result, "expected at least one tool result event");
     }
 
-    /// Emits a partial tool call and then reports the stream as cancelled —
-    /// what a mid-stream Esc looks like.
-    struct CancelledMidStreamProvider;
-
-    #[async_trait]
-    impl LlmProvider for CancelledMidStreamProvider {
-        fn id(&self) -> &'static str {
-            "fake"
-        }
-
-        async fn stream_completion(
-            &self,
-            _request: CompletionRequest,
-            _cancel: CancellationToken,
-        ) -> Result<
-            futures::stream::BoxStream<
-                'static,
-                Result<StreamEvent, crate::provider::ProviderError>,
-            >,
-            crate::provider::ProviderError,
-        > {
-            Ok(Box::pin(futures::stream::iter(vec![
-                Ok(StreamEvent::TextDelta("let me check ".to_string())),
-                Ok(StreamEvent::ToolUseStart {
-                    id: "half_call".to_string(),
-                    name: "slow_tool".to_string(),
-                }),
-                Ok(StreamEvent::ToolUseInputDelta {
-                    id: "half_call".to_string(),
-                    partial_json: "{\"pa".to_string(),
-                }),
-                Ok(StreamEvent::MessageComplete {
-                    stop_reason: StopReason::Cancelled,
-                    usage: crate::message::Usage::default(),
-                }),
-            ])))
-        }
-    }
-
     /// A tool call cut off mid-stream was never dispatched and its arguments
     /// may be truncated JSON — it must not reach history, or it becomes a
-    /// dangling `tool_use` that breaks every later request.
+    /// dangling `tool_use` that breaks every later request. The script is
+    /// spelled out rather than built from a helper: a half-emitted call with
+    /// truncated input and no `ToolUseComplete` is exactly what makes this
+    /// case interesting.
     #[tokio::test]
     async fn cancelling_mid_stream_drops_the_half_built_tool_call() {
-        let tool_ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            session_id: "test-session".into(),
-        };
+        let provider = ScriptedProvider::streams([vec![
+            StreamEvent::TextDelta("let me check ".to_string()),
+            StreamEvent::ToolUseStart {
+                id: "half_call".to_string(),
+                name: "slow_tool".to_string(),
+            },
+            StreamEvent::ToolUseInputDelta {
+                id: "half_call".to_string(),
+                partial_json: "{\"pa".to_string(),
+            },
+            StreamEvent::MessageComplete {
+                stop_reason: StopReason::Cancelled,
+                usage: crate::message::Usage::default(),
+            },
+        ]]);
+        let tool_ctx = ToolContext::new(".", "test-session");
         let mut agent = Agent::new(
-            Arc::new(CancelledMidStreamProvider),
+            Arc::new(provider),
             Arc::new(NoTools),
             "fake-model".to_string(),
             tool_ctx,

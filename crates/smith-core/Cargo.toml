@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Exposes `smith_core::testkit` (ScriptedProvider and friends) to other
+# crates' tests. Off by default — always a dev-dependency, never a build one.
+testkit = []
+
 [dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }

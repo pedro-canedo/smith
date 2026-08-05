@@ -400,10 +400,7 @@ pub async fn run_orchestrator(
         }
     }
 
-    let tool_ctx = ToolContext {
-        cwd: std::env::current_dir().unwrap_or_default(),
-        session_id,
-    };
+    let tool_ctx = ToolContext::new(std::env::current_dir().unwrap_or_default(), session_id);
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_system(SYSTEM_PROMPT)
         .with_context_provider(environment_now)

@@ -203,10 +203,7 @@ mod tests {
     // Only the `sh`-driven tests need a context, and those are all `cfg(unix)`.
     #[cfg(unix)]
     fn ctx() -> ToolContext {
-        ToolContext {
-            cwd: PathBuf::from("."),
-            session_id: "test-session".into(),
-        }
+        ToolContext::new(PathBuf::from("."), "test-session")
     }
 
     // --- POSIX shell behaviour --------------------------------------------

@@ -100,7 +100,15 @@ Independently, a pending plan (`plan_gated`) blocks everything above
   the session database and the next provider request together.
 - `AgentEvent`'s serialization is adjacently tagged (`{"type":…,"data":…}`)
   because that *is* the `--output-format stream-json` wire format. Variant
-  and field names are a public interface.
+  and field names are a public interface. `app.rs::on_agent_event` matches it
+  exhaustively with no wildcard, so a new variant is never purely additive to
+  smith-core — it always needs a TUI arm too.
+- `smith-core` has a `testkit` feature (`testkit.rs`) exposing
+  `ScriptedProvider`: replays scripted `StreamEvent`s, records the
+  `CompletionRequest`s it received, and can fail a given request. Reach for it
+  before hand-rolling another `impl LlmProvider`. Running past the end of a
+  script panics on purpose — a turn making more requests than scripted is a
+  finding, not something to paper over with a default reply.
 - Built-in tools: `read_file`, `list_dir`, `glob`, `write_file`, `edit_file`,
   `run_bash`, `ask_user`, `write_tasks`, `web_search`.
 - Runtime state: global `~/.smith/config.toml`; per-project
