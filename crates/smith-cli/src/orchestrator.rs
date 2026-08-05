@@ -702,6 +702,32 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                     let _ = event_tx.send(AgentEvent::GoalChanged(goal));
                 });
             }
+            Action::Remember(note) => {
+                let state = state.clone();
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    let guard = state.lock().await;
+                    // The chain root, not the cwd: a note dropped in whatever
+                    // subdirectory you happened to be in would only apply
+                    // while you stayed there, which isn't what "remember this"
+                    // means.
+                    let path = smith_config::memory::memory_path(&guard.memory.scope().root);
+                    match smith_config::memory::remember(&path, &note) {
+                        Ok(()) => {
+                            // The next request re-reads memory, so the note is
+                            // in effect immediately — but only if the cache is
+                            // told its fingerprint is stale.
+                            guard.memory.invalidate();
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(AgentEvent::Error(format!(
+                                "could not write {}: {e}",
+                                path.display()
+                            )));
+                        }
+                    }
+                });
+            }
             Action::Compact => {
                 // Shares `current_cancel` with turns: compaction spends a
                 // provider request, so Esc has to be able to stop it.

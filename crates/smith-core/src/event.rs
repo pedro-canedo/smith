@@ -136,6 +136,11 @@ pub enum Action {
     /// `/compact`: summarise the older part of the conversation now, instead
     /// of waiting for the context to cross the auto-compaction threshold.
     Compact,
+    /// `/remember <note>`: append a standing instruction to the project's
+    /// `SMITH.md`. Distinct from `SetGoal` — a goal is what this session is
+    /// for and dies with it; a memory outlives the session and every later
+    /// one in this project inherits it.
+    Remember(String),
     /// `/loop [<N>] <task>`: runs `task` repeatedly — each iteration after the
     /// first is a "continue" turn — until the model's reply contains the
     /// completion sentinel, `max_iterations` is reached (defaults to a safety

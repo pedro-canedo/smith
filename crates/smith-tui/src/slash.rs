@@ -3,12 +3,14 @@
 /// Known slash commands: (name without `/`, short description).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("clear", "clear the visible transcript"),
+    ("compact", "summarise old history to reclaim context"),
     ("goal", "set, show, or clear the session goal"),
     ("help", "list available commands"),
     ("loop", "repeat a task until done, N iterations, or Esc"),
     ("model", "show or switch provider/model"),
     ("permission", "show or set tool permission policy"),
     ("plan", "propose a plan before executing"),
+    ("remember", "append a standing note to the project SMITH.md"),
     ("usage", "session token/cost/tool summary"),
 ];
 

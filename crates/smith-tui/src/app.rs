@@ -931,7 +931,7 @@ impl App {
             "help" | "" => {
                 self.lines.push(ChatLine::new(
                     ChatRole::System,
-                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /help (this message)",
+                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /compact (summarise old history to reclaim context), /remember <note> (append a standing note to this project's SMITH.md), /help (this message)",
                 ));
                 None
             }
@@ -944,6 +944,37 @@ impl App {
             "plan" => self.run_plan_command(args),
             "goal" => self.run_goal_command(args),
             "loop" => self.run_loop_command(args),
+            "compact" => {
+                if self.waiting_on_assistant {
+                    self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        "can't compact mid-turn — wait for the current turn to finish",
+                    ));
+                    return None;
+                }
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    "compacting the conversation…",
+                ));
+                self.waiting_on_assistant = true;
+                self.phase = AgentPhase::Thinking;
+                Some(Action::Compact)
+            }
+            "remember" => {
+                let note = args.trim();
+                if note.is_empty() {
+                    self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        "usage: /remember <note> — appends a standing instruction to this project's SMITH.md",
+                    ));
+                    return None;
+                }
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("remembered: {note}"),
+                ));
+                Some(Action::Remember(note.to_string()))
+            }
             other => {
                 self.lines.push(ChatLine::new(
                     ChatRole::System,
@@ -2226,6 +2257,43 @@ mod tests {
         assert!(matches!(action, Some(Action::ApprovePlan)));
         assert!(app.modal.is_none());
         assert!(app.waiting_on_assistant);
+    }
+
+    #[test]
+    fn compact_is_refused_mid_turn_rather_than_racing_the_agent() {
+        let mut app = test_app();
+        app.waiting_on_assistant = true;
+        assert!(app.run_slash_command("compact").is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text().contains("can't compact mid-turn")));
+    }
+
+    #[test]
+    fn compact_emits_the_action_when_idle() {
+        let mut app = test_app();
+        assert!(matches!(
+            app.run_slash_command("compact"),
+            Some(Action::Compact)
+        ));
+        assert!(app.waiting_on_assistant, "the UI must show it is working");
+    }
+
+    #[test]
+    fn remember_without_a_note_explains_itself_instead_of_saving_nothing() {
+        let mut app = test_app();
+        assert!(app.run_slash_command("remember   ").is_none());
+        assert!(app.lines.iter().any(|l| l.text().contains("usage:")));
+    }
+
+    #[test]
+    fn remember_carries_the_note_to_the_orchestrator() {
+        let mut app = test_app();
+        match app.run_slash_command("remember always run cargo fmt") {
+            Some(Action::Remember(note)) => assert_eq!(note, "always run cargo fmt"),
+            other => panic!("expected Remember, got {other:?}"),
+        }
     }
 
     #[test]
