@@ -170,6 +170,11 @@ impl ChatLine {
         self.stamp
     }
 
+    /// True while this is a tool card whose call has not answered yet.
+    pub(crate) fn is_running_tool(&self) -> bool {
+        self.tool_status == Some(ActivityStatus::Running)
+    }
+
     /// True while the card's rendered form is a function of the clock (spinner
     /// frame + live elapsed counter) rather than of this struct — such a line
     /// can never be memoised, no matter what its stamp says.
@@ -1519,8 +1524,15 @@ impl App {
                     };
                     line.finish_tool(status, output.clone());
                 }
-                // Model starts thinking again after a result.
-                self.begin_thinking();
+                // Model starts thinking again after a result — but only once
+                // the *last* result of a concurrent round has landed. A round
+                // of ReadOnly calls runs in parallel and finishes out of
+                // order, so starting the clock on the first one home would
+                // report the slowest call's remaining runtime as time the
+                // model spent thinking.
+                if !self.lines.iter().any(|l| l.is_running_tool()) {
+                    self.begin_thinking();
+                }
             }
             // A long `run_bash` is otherwise indistinguishable from a hang:
             // the card sat on its spinner for the whole build with nothing to
@@ -2212,6 +2224,81 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("permission denied"));
+    }
+
+    /// A round of ReadOnly calls runs concurrently, so starts, progress lines
+    /// and results arrive interleaved rather than in start/result pairs. Every
+    /// one of those events carries the call's id and every lookup here is by
+    /// id, so the cards resolve independently — asserted rather than assumed,
+    /// because "matches by id" is only true as long as nothing starts matching
+    /// by position instead.
+    #[test]
+    fn three_concurrent_tool_calls_resolve_independently_when_events_interleave() {
+        let mut app = test_app();
+        for id in ["call_1", "call_2", "call_3"] {
+            app.on_agent_event(AgentEvent::ToolCallStarted {
+                id: id.into(),
+                tool_name: "read_file".into(),
+                input: serde_json::json!({ "path": format!("src/{id}.rs") }),
+            });
+        }
+        // Three cards, all spinning, in the order the model asked for them.
+        let running: Vec<&str> = app
+            .lines
+            .iter()
+            .filter(|l| l.tool_status == Some(ActivityStatus::Running))
+            .map(|l| l.tool_id.as_deref().unwrap())
+            .collect();
+        assert_eq!(running, vec!["call_1", "call_2", "call_3"]);
+
+        // Results and progress arrive in whatever order the calls finish.
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: "call_3".into(),
+            output: "third".into(),
+            is_error: false,
+        });
+        app.on_agent_event(AgentEvent::ToolProgress {
+            id: "call_1".into(),
+            line: "still reading".into(),
+        });
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: "call_1".into(),
+            output: "first".into(),
+            is_error: true,
+        });
+
+        let card = |id: &str| {
+            app.lines
+                .iter()
+                .find(|l| l.tool_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("{id} has no card"))
+        };
+        assert_eq!(card("call_1").tool_status, Some(ActivityStatus::Error));
+        assert_eq!(card("call_1").tool_output.as_deref(), Some("first"));
+        // Still running, untouched by its neighbours' results.
+        assert_eq!(card("call_2").tool_status, Some(ActivityStatus::Running));
+        assert!(card("call_2").tool_output.is_none());
+        assert_eq!(card("call_3").tool_status, Some(ActivityStatus::Done));
+        assert_eq!(card("call_3").tool_output.as_deref(), Some("third"));
+
+        // The thinking clock has not started: call_2 is still working, and
+        // the time it takes is not the model thinking.
+        assert!(app.thinking_since.is_none());
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: "call_2".into(),
+            output: "second".into(),
+            is_error: false,
+        });
+        assert!(app.thinking_since.is_some());
+
+        // Transcript order is still the model's order — cards are updated in
+        // place, never re-appended as they finish.
+        let ids: Vec<&str> = app
+            .lines
+            .iter()
+            .filter_map(|l| l.tool_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec!["call_1", "call_2", "call_3"]);
     }
 
     #[test]

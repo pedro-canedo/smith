@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -33,6 +34,39 @@ const NOT_EXECUTED_CANCELLED: &str = "not executed — the turn was cancelled by
 /// The same idea for a call the turn had no budget left to run.
 const NOT_EXECUTED_TOOL_BUDGET: &str =
     "not executed — this turn reached its tool-call budget before this call";
+
+/// How many tool calls from one round may be in flight at once.
+///
+/// Only `ReadOnly` calls are ever run concurrently (see
+/// [`Agent::is_concurrency_safe`]), so this bounds reads, globs and greps —
+/// work that is dominated by the filesystem, not the CPU.
+///
+/// Eight, rather than "however many the model asked for":
+/// - A model exploring a codebase emits three to six reads in a batch, so
+///   eight covers the realistic case without a queue ever forming.
+/// - Past roughly eight concurrent traversals a single disk is seek-bound;
+///   the extra parallelism buys latency, not throughput, and on a spinning
+///   disk actively costs it.
+/// - It keeps file-descriptor use trivially bounded. A `glob` over a deep
+///   tree holds several directory handles open at once, and an unbounded
+///   `join_all` over fifty of them can walk into `EMFILE` against the usual
+///   1024 soft limit — a failure mode that shows up as tool calls failing at
+///   random, which is far worse than being a little slower.
+/// - Eight simultaneously-spinning tool cards is already the most a terminal
+///   transcript can show without becoming noise.
+const MAX_CONCURRENT_TOOLS: usize = 8;
+
+/// What one entry of a round's execution plan does. The plan is built in the
+/// model's own order before anything runs, so neither the tool-call budget
+/// nor the grouping can depend on which call happens to finish first.
+enum ToolStep {
+    /// A maximal contiguous run of concurrency-safe calls, by slot index.
+    Concurrent(Vec<usize>),
+    /// One call that must run on its own, with `&mut self` available.
+    Serial(usize),
+    /// A call the turn had no budget left for.
+    OverBudget(usize),
+}
 
 /// How long one call to `run_turn` may keep going on its own.
 ///
@@ -1004,44 +1038,94 @@ impl Agent {
                 })
                 .collect();
 
+            // Grouping is decided here, up front, and preserves the model's
+            // order: a maximal *contiguous* run of concurrency-safe calls
+            // becomes one concurrent group, and anything else splits the run.
+            //
+            // The alternative — hoisting every ReadOnly call in the round to
+            // the front and running the rest afterwards — would produce one
+            // bigger group, but it reorders execution relative to what the
+            // model asked for, so a read placed *after* a write in the same
+            // round would stop seeing that write. Nothing in the protocol
+            // promises a round's calls are independent, and a silently stale
+            // read is exactly the class of bug that survives a test suite.
+            // The cost of splitting instead is real but small: in
+            // `[read, write, read, read]` the first read runs alone. Models
+            // batch their reads together, which is the case this optimises.
+            let mut steps: Vec<ToolStep> = Vec::new();
+            for (slot, (_, name, _)) in tool_uses.iter().enumerate() {
+                // The one cap that has to bite mid-round: a single round can
+                // ask for more calls than the whole turn has left. Spending
+                // the budget here, in order, keeps which calls get refused
+                // independent of how long any of them takes to run.
+                if tool_calls >= self.limits.max_tool_calls_per_turn {
+                    steps.push(ToolStep::OverBudget(slot));
+                    continue;
+                }
+                tool_calls += 1;
+                match (self.is_concurrency_safe(name), steps.last_mut()) {
+                    (true, Some(ToolStep::Concurrent(group))) => group.push(slot),
+                    (true, _) => steps.push(ToolStep::Concurrent(vec![slot])),
+                    (false, _) => steps.push(ToolStep::Serial(slot)),
+                }
+            }
+
             let mut cancelled = false;
-            for (slot, (id, name, input)) in tool_uses.into_iter().enumerate() {
+            for step in steps {
                 if cancel.is_cancelled() {
                     cancelled = true;
                     break;
                 }
 
-                // The one cap that has to bite mid-round: a single round can
-                // ask for more calls than the whole turn has left. The seeded
-                // slot is overwritten rather than left at the cancellation
-                // wording, so the model isn't told the user stopped it when
-                // the user did nothing of the sort.
-                if tool_calls >= self.limits.max_tool_calls_per_turn {
-                    results[slot] = ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        content: NOT_EXECUTED_TOOL_BUDGET.to_string(),
-                        is_error: true,
-                    };
-                    continue;
+                match step {
+                    // The seeded slot is overwritten rather than left at the
+                    // cancellation wording, so the model isn't told the user
+                    // stopped it when the user did nothing of the sort.
+                    ToolStep::OverBudget(slot) => {
+                        results[slot] = ContentBlock::ToolResult {
+                            tool_use_id: tool_uses[slot].0.clone(),
+                            content: NOT_EXECUTED_TOOL_BUDGET.to_string(),
+                            is_error: true,
+                        };
+                    }
+                    ToolStep::Serial(slot) => {
+                        let (id, name, input) = &tool_uses[slot];
+                        let result = self
+                            .run_one_tool(
+                                id,
+                                name,
+                                input.clone(),
+                                &events,
+                                &permission_tx,
+                                &question_tx,
+                                cancel.clone(),
+                            )
+                            .await;
+                        results[slot] = ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: result.content,
+                            is_error: result.is_error,
+                        };
+                    }
+                    ToolStep::Concurrent(group) => {
+                        self.run_concurrent_group(
+                            &group,
+                            &tool_uses,
+                            &mut results,
+                            &events,
+                            &cancel,
+                        )
+                        .await;
+                        // A group swallows the cancellation itself (it has to
+                        // — the calls already in flight still owe the model a
+                        // result), so re-check rather than waiting for the top
+                        // of the next iteration to notice.
+                        if cancel.is_cancelled() {
+                            cancelled = true;
+                            break;
+                        }
+                    }
                 }
-                tool_calls += 1;
-
-                let result = self
-                    .run_one_tool(
-                        &id,
-                        &name,
-                        input,
-                        &events,
-                        &permission_tx,
-                        &question_tx,
-                        cancel.clone(),
-                    )
-                    .await;
-                results[slot] = ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content: result.content,
-                    is_error: result.is_error,
-                };
             }
 
             // Checked here, with the round's results in hand and before they
@@ -1390,6 +1474,109 @@ impl Agent {
             }
         }
 
+        self.dispatch_tool(id, name, input, class, events, cancel)
+            .await
+    }
+
+    /// Whether this call may run alongside others from the same round.
+    ///
+    /// `PermissionClass::ReadOnly` and nothing else — permanently, not
+    /// pending further work. Three reasons, none of which a future tool
+    /// changes:
+    /// - Nearly all the wall-clock win is here anyway. A model exploring a
+    ///   codebase issues reads, globs and greps in batches; it issues writes
+    ///   one or two at a time.
+    /// - A concurrency bug in a `Mutating` tool is a data-loss bug. Two
+    ///   `edit_file` calls racing on one path corrupt it in a way no test
+    ///   reliably catches, and the damage is to the user's work, not ours.
+    /// - The permission round-trip is serial by construction: you cannot show
+    ///   two modals at once. `Mutating` and `Dangerous` calls would spend
+    ///   their time queued behind each other's prompts even if the execution
+    ///   underneath them were parallel.
+    ///
+    /// `ask_user` and `write_tasks` both declare `ReadOnly`, but they are
+    /// intercepted by name before dispatch and need `&mut self` (a checklist
+    /// to rewrite, a modal to wait on) — so they are excluded here and stay
+    /// on the serial path with the interception that owns them.
+    fn is_concurrency_safe(&self, name: &str) -> bool {
+        if name == "ask_user" || name == "write_tasks" {
+            return false;
+        }
+        self.tools.permission_class(name) == Some(PermissionClass::ReadOnly)
+    }
+
+    /// Runs one group of concurrency-safe calls, filling each one's slot in
+    /// `results`.
+    ///
+    /// Slots are written by index as answers arrive, so the model still sees
+    /// the round's results in the order it asked for them no matter which
+    /// call finishes first. `results` is already seeded with "not executed",
+    /// so a call this function never gets to still has an answer.
+    async fn run_concurrent_group(
+        &self,
+        group: &[usize],
+        tool_uses: &[(String, String, serde_json::Value)],
+        results: &mut [ContentBlock],
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) {
+        let mut running = futures::stream::iter(group.iter().copied().map(|slot| {
+            let (id, name, input) = &tool_uses[slot];
+            let cancel = cancel.clone();
+            async move {
+                // A queued call is admitted to the window only when an
+                // earlier one frees a place, which makes this the point where
+                // an Esc part-way through a group stops the rest of it.
+                // Returning `None` leaves the seeded "not executed" answer in
+                // place *and* emits no events, so the TUI never sees a card
+                // start that will never finish. Calls already in flight are
+                // not dropped: they hold the same token, race it themselves,
+                // and come back with a real result and a real
+                // `ToolCallResult`.
+                if cancel.is_cancelled() {
+                    return (slot, None);
+                }
+                let result = self
+                    .dispatch_tool(
+                        id,
+                        name,
+                        input.clone(),
+                        PermissionClass::ReadOnly,
+                        events,
+                        cancel,
+                    )
+                    .await;
+                (slot, Some(result))
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_TOOLS);
+
+        while let Some((slot, result)) = running.next().await {
+            let Some(result) = result else { continue };
+            results[slot] = ContentBlock::ToolResult {
+                tool_use_id: tool_uses[slot].0.clone(),
+                content: result.content,
+                is_error: result.is_error,
+            };
+        }
+    }
+
+    /// The dispatch half of a tool call: announce, checkpoint, execute,
+    /// redact, answer.
+    ///
+    /// It takes `&self`, and that is the whole reason concurrency is possible
+    /// at all — everything in `run_one_tool` that needs `&mut self` (recording
+    /// a session permission grant, rewriting the checklist) happens strictly
+    /// before this point, and none of it applies to a `ReadOnly` call.
+    async fn dispatch_tool(
+        &self,
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+        class: PermissionClass,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: CancellationToken,
+    ) -> ToolResult {
         let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Working));
         let _ = events.send(AgentEvent::ToolCallStarted {
             id: id.to_string(),
@@ -4898,5 +5085,395 @@ mod tests {
         // Delivered once, not re-sent on every later turn.
         run_collect(&mut agent, "again", CancellationToken::new()).await;
         assert!(!agent.history()[2].text().contains("restored"));
+    }
+
+    // ---- concurrent ReadOnly tool calls ------------------------------------
+
+    /// Builds a round of `n` `read_file` calls, ids `call_0..call_n`, followed
+    /// by a plain text turn.
+    fn read_round(n: usize) -> Arc<ScriptedProvider> {
+        let ids: Vec<String> = (0..n).map(|i| format!("call_{i}")).collect();
+        let calls: Vec<(&str, &str, serde_json::Value)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), "read_file", serde_json::json!({ "n": i })))
+            .collect();
+        Arc::new(ScriptedProvider::streams([
+            tool_calls_reply(&calls),
+            text_reply("done"),
+        ]))
+    }
+
+    /// Every call rendezvouses at a barrier before returning, so the turn can
+    /// only finish if that many calls were inside `execute` *at the same
+    /// instant*. Serial execution deadlocks instead of merely being slower,
+    /// which is the point — "it finished" proves nothing on its own.
+    struct BarrierTools {
+        barrier: Arc<tokio::sync::Barrier>,
+        /// Once the barrier has opened, later calls sail past it. Without this
+        /// a round longer than the barrier's width would hang on the second
+        /// cycle. Only ever read by a call admitted *after* one of the first
+        /// batch returned, so it is always already set by then.
+        opened: Arc<std::sync::atomic::AtomicBool>,
+        live: Arc<AtomicUsize>,
+        /// High-water mark of `live` — the concurrency bound, observed.
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl BarrierTools {
+        fn new(width: usize) -> Self {
+            Self {
+                barrier: Arc::new(tokio::sync::Barrier::new(width)),
+                opened: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                live: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for BarrierTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            Vec::new()
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(live, Ordering::SeqCst);
+            if !self.opened.load(Ordering::SeqCst) {
+                self.barrier.wait().await;
+                self.opened.store(true, Ordering::SeqCst);
+            }
+            // A call that has merely been *woken* has not yet freed its place.
+            // Yielding once more here is what gives a round wider than the
+            // bound the chance to admit its surplus — and so what lets `peak`
+            // catch an unbounded implementation instead of silently agreeing
+            // with a bounded one.
+            tokio::task::yield_now().await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            ToolResult::ok("read")
+        }
+    }
+
+    #[tokio::test]
+    async fn three_readonly_calls_in_one_round_actually_overlap() {
+        let tools = BarrierTools::new(3);
+        let peak = tools.peak.clone();
+        let mut agent = agent_for(read_round(3), Arc::new(tools));
+
+        // A serial loop can never satisfy a three-way barrier, so it hangs —
+        // the timeout is what turns that into a failure instead of a hung suite.
+        let turn = run_collect(&mut agent, "explore", CancellationToken::new());
+        let (completed, _) = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("the three reads never ran at the same time");
+
+        assert!(completed);
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn no_more_than_the_bound_run_at_once() {
+        // Wider than the bound: the extra calls have to queue behind the
+        // first batch rather than pile on.
+        const CALLS: usize = MAX_CONCURRENT_TOOLS + 4;
+        let tools = BarrierTools::new(MAX_CONCURRENT_TOOLS);
+        let peak = tools.peak.clone();
+        let mut agent = agent_for(read_round(CALLS), Arc::new(tools));
+
+        let turn = run_collect(&mut agent, "explore", CancellationToken::new());
+        let (completed, _) = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("fewer than the bound ever ran at once");
+
+        assert!(completed);
+        // Exactly the bound: the barrier opening proves it reached it, and
+        // this proves nothing beyond it was ever admitted.
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_TOOLS);
+    }
+
+    /// Three ReadOnly calls that finish in the exact reverse of the order the
+    /// model asked for them. The last call is released as soon as everything
+    /// has started, and each call opens its predecessor's gate on the way out.
+    struct ReverseOrderTools {
+        started: Arc<tokio::sync::Barrier>,
+        gates: std::sync::Mutex<Vec<Option<oneshot::Receiver<()>>>>,
+        openers: std::sync::Mutex<Vec<Option<oneshot::Sender<()>>>>,
+        finished: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl ReverseOrderTools {
+        fn new(n: usize) -> Self {
+            let mut gates = Vec::with_capacity(n);
+            let mut openers = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (tx, rx) = oneshot::channel();
+                gates.push(Some(rx));
+                openers.push(Some(tx));
+            }
+            // The last call needs no predecessor to let it through.
+            if let Some(last) = openers.last_mut().and_then(Option::take) {
+                let _ = last.send(());
+            }
+            Self {
+                started: Arc::new(tokio::sync::Barrier::new(n)),
+                gates: std::sync::Mutex::new(gates),
+                openers: std::sync::Mutex::new(openers),
+                finished: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ReverseOrderTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            Vec::new()
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            let n = input["n"].as_u64().unwrap() as usize;
+            self.started.wait().await;
+            let gate = self.gates.lock().unwrap()[n].take().unwrap();
+            let _ = gate.await;
+            self.finished.lock().unwrap().push(n);
+            if n > 0 {
+                if let Some(opener) = self.openers.lock().unwrap()[n - 1].take() {
+                    let _ = opener.send(());
+                }
+            }
+            ToolResult::ok(format!("body of file {n}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn results_keep_the_models_order_however_the_calls_finish() {
+        let tools = Arc::new(ReverseOrderTools::new(3));
+        let finished = Arc::clone(&tools);
+        let mut agent = agent_for(read_round(3), tools);
+
+        let turn = run_collect(&mut agent, "explore", CancellationToken::new());
+        let (completed, _) = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("the reads did not overlap, so nothing could finish out of order");
+        assert!(completed);
+
+        // The premise: they really did complete backwards.
+        assert_eq!(*finished.finished.lock().unwrap(), vec![2, 1, 0]);
+
+        // The guarantee: the model still sees them forwards, each result
+        // attached to the call it belongs to.
+        assert_eq!(
+            collect_ids(agent.history(), false),
+            vec!["call_0", "call_1", "call_2"]
+        );
+        for n in 0..3 {
+            assert_eq!(
+                tool_result_for(agent.history(), &format!("call_{n}")),
+                format!("body of file {n}")
+            );
+        }
+    }
+
+    /// Logs `start:<id>` and `end:<id>` for every call, and yields once in
+    /// between so a call that is genuinely concurrent with another shows up as
+    /// two starts before either end.
+    struct LoggingTools {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for LoggingTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            Vec::new()
+        }
+
+        fn permission_class(&self, name: &str) -> Option<PermissionClass> {
+            Some(match name {
+                "read_file" => PermissionClass::ReadOnly,
+                _ => PermissionClass::Mutating,
+            })
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            input: serde_json::Value,
+            ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            let id = ctx.tool_call_id().unwrap_or("?").to_string();
+            let _ = input;
+            self.log.lock().unwrap().push(format!("start:{id}"));
+            tokio::task::yield_now().await;
+            self.log.lock().unwrap().push(format!("end:{id}"));
+            ToolResult::ok("ok")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mutating_call_splits_the_round_and_runs_on_its_own() {
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_calls_reply(&[
+                ("read_a", "read_file", json_empty()),
+                ("read_b", "read_file", json_empty()),
+                ("write_c", "write_file", json_empty()),
+                ("read_d", "read_file", json_empty()),
+            ]),
+            text_reply("done"),
+        ]));
+        let tools = Arc::new(LoggingTools {
+            log: std::sync::Mutex::new(Vec::new()),
+        });
+        // Skip, so the Mutating call is not serialised merely by its prompt.
+        let mut agent = agent_for(provider, tools.clone());
+
+        let (completed, _) = run_collect(&mut agent, "go", CancellationToken::new()).await;
+        assert!(completed);
+
+        let log = tools.log.lock().unwrap().clone();
+        let at = |entry: &str| {
+            log.iter()
+                .position(|e| e == entry)
+                .unwrap_or_else(|| panic!("{entry} missing from {log:?}"))
+        };
+
+        // The leading run of reads overlaps.
+        assert!(at("start:read_b") < at("end:read_a"), "{log:?}");
+
+        // The write does not overlap anything: its end is the very next entry.
+        assert_eq!(log[at("start:write_c") + 1], "end:write_c", "{log:?}");
+
+        // And nothing that follows the write starts before it is done — this
+        // is what makes a read placed after a write in the same round still
+        // see that write.
+        assert!(at("start:read_d") > at("end:write_c"), "{log:?}");
+
+        // The cost of splitting into contiguous runs rather than hoisting
+        // every read to the front: `read_d` runs alone instead of joining the
+        // other two. Asserted so the trade-off is visible, not incidental.
+        assert!(at("start:read_d") > at("end:read_b"), "{log:?}");
+    }
+
+    /// Cancels the turn from inside the first call of a wide concurrent round.
+    struct CancelOnFirstReadTools {
+        cancel: CancellationToken,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CancelOnFirstReadTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            Vec::new()
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.cancel.cancel();
+            ToolResult::ok("read")
+        }
+    }
+
+    /// The invariant a concurrent round is most likely to break: results are
+    /// no longer appended in completion order, so an early exit could leave a
+    /// gap. It cannot — the slots are pre-seeded and only ever overwritten.
+    #[tokio::test]
+    async fn cancelling_a_concurrent_round_still_answers_every_tool_use() {
+        const CALLS: usize = MAX_CONCURRENT_TOOLS + 4;
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tools = Arc::new(CancelOnFirstReadTools {
+            cancel: cancel.clone(),
+            calls: calls.clone(),
+        });
+        let mut agent = agent_for(read_round(CALLS), tools);
+
+        let (completed, _) = run_collect(&mut agent, "explore", cancel).await;
+
+        assert!(!completed, "a cancelled turn is not a normal completion");
+        let ran = calls.load(Ordering::SeqCst);
+        assert!(ran < CALLS, "cancellation stopped nothing: {ran} calls ran");
+
+        let uses = collect_ids(agent.history(), true);
+        let answers = collect_ids(agent.history(), false);
+        assert_eq!(uses.len(), CALLS);
+        assert_eq!(uses, answers, "every tool_use must have a tool_result");
+
+        // The calls that never started say so, rather than looking successful.
+        let last = tool_result_for(agent.history(), &format!("call_{}", CALLS - 1));
+        assert!(last.contains("cancelled"), "got: {last}");
+    }
+
+    #[test]
+    fn only_readonly_tools_are_ever_run_concurrently() {
+        struct Classes;
+        #[async_trait]
+        impl ToolExecutor for Classes {
+            fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+                Vec::new()
+            }
+            fn permission_class(&self, name: &str) -> Option<PermissionClass> {
+                match name {
+                    "read_file" | "ask_user" | "write_tasks" => Some(PermissionClass::ReadOnly),
+                    "write_file" => Some(PermissionClass::Mutating),
+                    "run_bash" => Some(PermissionClass::Dangerous),
+                    _ => None,
+                }
+            }
+            async fn execute(
+                &self,
+                _name: &str,
+                _input: serde_json::Value,
+                _ctx: &ToolContext,
+                _cancel: CancellationToken,
+            ) -> ToolResult {
+                ToolResult::error("unused")
+            }
+        }
+
+        let agent = Agent::new(
+            Arc::new(ScriptedProvider::streams([])),
+            Arc::new(Classes),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        );
+
+        assert!(agent.is_concurrency_safe("read_file"));
+        assert!(!agent.is_concurrency_safe("write_file"));
+        assert!(!agent.is_concurrency_safe("run_bash"));
+        // ReadOnly, but intercepted by name and needing `&mut self`.
+        assert!(!agent.is_concurrency_safe("ask_user"));
+        assert!(!agent.is_concurrency_safe("write_tasks"));
+        // An unregistered name is treated as Dangerous everywhere else too.
+        assert!(!agent.is_concurrency_safe("mystery_tool"));
     }
 }
