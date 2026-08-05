@@ -8,6 +8,7 @@ pub mod grep;
 pub mod registry;
 pub mod shell_tool;
 pub mod staging;
+pub mod web_fetch;
 pub mod web_search;
 pub mod write_tasks;
 

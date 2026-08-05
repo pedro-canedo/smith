@@ -87,6 +87,7 @@ impl ToolRegistry {
         // back to DuckDuckGo lite. A caller holding an Exa key upgrades this
         // with `replace`.
         registry.register(Arc::new(crate::web_search::WebSearchTool::new(None)));
+        registry.register(Arc::new(crate::web_fetch::WebFetchTool::new()));
         registry
     }
 }
@@ -273,6 +274,7 @@ mod tests {
             "ask_user",
             "write_tasks",
             "web_search",
+            "web_fetch",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),

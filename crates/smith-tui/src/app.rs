@@ -191,6 +191,19 @@ impl ChatLine {
         self.touch();
     }
 
+    /// Shows the newest line a running tool has produced.
+    ///
+    /// Only the latest is kept, not a scrollback: the card is a one-line
+    /// status while the tool runs, and the complete output arrives with the
+    /// result anyway. `touch()` is not called — a running card is excluded
+    /// from the render memo by `is_animating` already, and stamping it would
+    /// invalidate nothing that isn't already being re-rendered.
+    fn set_progress(&mut self, line: String) {
+        if self.tool_status == Some(ActivityStatus::Running) {
+            self.tool_output = Some(line);
+        }
+    }
+
     /// Marks a still-running card as failed when the turn dies under it.
     /// A no-op on any other line, so an error never invalidates the whole
     /// transcript's memo.
@@ -1509,10 +1522,19 @@ impl App {
                 // Model starts thinking again after a result.
                 self.begin_thinking();
             }
-            // The channel exists but nothing emits on it yet, and no tool
-            // renders live output — deliberately dropped until the transcript
-            // grows a place to put it.
-            AgentEvent::ToolProgress { .. } => {}
+            // A long `run_bash` is otherwise indistinguishable from a hang:
+            // the card sat on its spinner for the whole build with nothing to
+            // show. Only the newest line is kept — see `set_progress`.
+            AgentEvent::ToolProgress { id, line } => {
+                if let Some(entry) = self
+                    .lines
+                    .iter_mut()
+                    .rev()
+                    .find(|l| l.tool_id() == Some(id.as_str()))
+                {
+                    entry.set_progress(line);
+                }
+            }
             AgentEvent::PermissionPromptNeeded(request) => {
                 self.phase = AgentPhase::WaitingPermission;
                 self.modal = Modal::Permission(PermissionModal { request, scroll: 0 });
@@ -2311,6 +2333,66 @@ mod tests {
         assert!(matches!(action, Some(Action::ApprovePlan)));
         assert!(app.modal.is_none());
         assert!(app.waiting_on_assistant);
+    }
+
+    #[tokio::test]
+    async fn progress_lines_reach_the_running_tool_card() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "run_bash".into(),
+            input: serde_json::json!({"command": "cargo build"}),
+        });
+
+        app.on_agent_event(AgentEvent::ToolProgress {
+            id: "call_1".into(),
+            line: "   Compiling smith-core".into(),
+        });
+        let card = app
+            .lines
+            .iter()
+            .find(|l| l.tool_id() == Some("call_1"))
+            .expect("the card exists");
+        assert_eq!(card.tool_output(), Some("   Compiling smith-core"));
+
+        // Only the newest line: the card is a status, not a scrollback.
+        app.on_agent_event(AgentEvent::ToolProgress {
+            id: "call_1".into(),
+            line: "   Compiling smith-tui".into(),
+        });
+        let card = app
+            .lines
+            .iter()
+            .find(|l| l.tool_id() == Some("call_1"))
+            .unwrap();
+        assert_eq!(card.tool_output(), Some("   Compiling smith-tui"));
+    }
+
+    #[tokio::test]
+    async fn progress_for_a_finished_call_does_not_overwrite_its_result() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "run_bash".into(),
+            input: serde_json::json!({"command": "echo hi"}),
+        });
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: "call_1".into(),
+            output: "hi".into(),
+            is_error: false,
+        });
+        // A late progress line must not resurrect the card or clobber what it
+        // actually returned.
+        app.on_agent_event(AgentEvent::ToolProgress {
+            id: "call_1".into(),
+            line: "stale".into(),
+        });
+        let card = app
+            .lines
+            .iter()
+            .find(|l| l.tool_id() == Some("call_1"))
+            .unwrap();
+        assert_eq!(card.tool_output(), Some("hi"));
     }
 
     #[test]
