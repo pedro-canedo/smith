@@ -49,9 +49,14 @@ way: `smith-core` defines traits and knows nothing about HTTP, SQLite, or
   box, permission/plan/question modals, sidebar). Never talks to
   `smith-provider` or `smith-tools` directly — only through the
   `Action`/`AgentEvent` channels.
-- **`smith-cli`** — binary entry point: CLI flags (`clap`), the system
-  prompt, and the orchestrator loop in `main.rs` that matches on `Action` and
-  drives the `Agent`.
+- **`smith-config`** — layered configuration: global `~/.smith/config.toml`
+  with `<project>/.smith/config.toml` merged over it, field by field. Split
+  out of `smith-store` so reading a TOML file doesn't compile SQLite from C.
+- **`smith-cli`** — binary entry point: CLI flags (`clap`), the system prompt,
+  and `orchestrator.rs`, which owns the `Action` → `Agent` loop. Two frontends
+  drive that same orchestrator over the same channel bundle: `smith_tui::run`
+  and `headless.rs`. Headless is chosen by `-p`, by `--output-format`, or by
+  stdout not being a terminal.
 
 ### The `Action` / `AgentEvent` loop
 
@@ -105,6 +110,24 @@ row and folded into every request's system prompt via
 `Agent::effective_system`.
 Both live under the project's `.smith/` directory (gitignored), separate from
 the global `~/.smith/config.toml`.
+
+### Headless mode
+
+`smith -p "task"` runs one turn without a terminal. `--output-format` is
+`text` (prose on stdout, all chrome on stderr, so `> out.txt` gets just the
+reply), `json` (one object) or `stream-json` (one `AgentEvent` per line — the
+same adjacently-tagged shape `AgentEvent` serializes to).
+
+Exit codes: `0` success, `1` the turn failed, `2` usage/config error (matching
+clap's own bad-flag code), `3` stopped by a safety cap. `3` is distinct from
+`1` because they warrant opposite reactions in CI — a failure is a bug, a cap
+is a budget to raise with all prior work intact.
+
+Permissions deny by default; `--allowed-tools` is the only gate, and headless
+forces `PermissionPolicy::Ask` regardless of saved config (a stored `skip`
+would auto-allow tools before they ever reach the channel `--allowed-tools`
+inspects). `ask_user` is refused rather than answered — there is no user, and
+inventing one puts words in their mouth.
 
 ### Provider/model switching mid-session
 
