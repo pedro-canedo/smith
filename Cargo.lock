@@ -2487,6 +2487,7 @@ dependencies = [
  "color-eyre",
  "dialoguer",
  "directories",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

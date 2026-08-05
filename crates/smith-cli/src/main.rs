@@ -37,6 +37,12 @@ struct Cli {
     #[arg(long)]
     resume: Option<String>,
 
+    /// Resume the most recent session in this project. The idle screen used
+    /// to print the id for you to copy — this is the same thing without the
+    /// copying.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_: bool,
+
     /// Run one turn non-interactively with this prompt and exit. Anything
     /// piped to stdin is appended to it as context.
     #[arg(short = 'p', long = "print", value_name = "PROMPT")]
@@ -95,6 +101,43 @@ enum Commands {
         #[arg(long)]
         global: bool,
     },
+    /// Inspect and manage this project's saved conversations.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionAction {
+    /// Most recently touched first.
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Delete a session and everything recorded against it.
+    Delete { id: String },
+    /// Branch a session into a new one, optionally truncating it first.
+    Fork {
+        id: String,
+        /// Copy messages up to and including this sequence number. Omit to
+        /// copy the whole conversation; `sessions list` shows the range.
+        #[arg(long)]
+        through: Option<i64>,
+    },
+    /// Write a session to stdout as markdown or JSON, for sharing or
+    /// archiving outside smith.
+    Export {
+        id: String,
+        #[arg(long, value_enum, default_value_t = ExportFormat::Markdown)]
+        format: ExportFormat,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ExportFormat {
+    Markdown,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -105,6 +148,7 @@ enum SetupResource {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    restore_default_sigpipe();
     let mut cli = Cli::parse();
     let command = cli.command.take();
 
@@ -135,11 +179,135 @@ async fn main() -> ExitCode {
         return run_remember(&note.join(" "), *global);
     }
 
+    if let Some(Commands::Sessions { action }) = &command {
+        return run_sessions(action);
+    }
+
     if cli.is_headless(std::io::stdout().is_terminal()) {
         ExitCode::from(run_headless(cli).await)
     } else {
         run_tui(cli).await
     }
+}
+
+/// Rust sets `SIGPIPE` to `SIG_IGN` at startup, which turns `smith sessions
+/// list | head` into a panic — "failed printing to stdout: Broken pipe" —
+/// instead of the silent exit every other Unix tool gives you. A CLI that
+/// documents piping its output has to behave like one.
+///
+/// Restoring the default handler is the standard fix and has to happen before
+/// anything writes. There is no stable safe API for it.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: setting a signal disposition to the OS default, before any
+    // thread has been spawned or any output written.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
+/// `smith sessions …` — list, delete, fork or export saved conversations.
+///
+/// Read-only by default and destructive only on an explicit `delete`; every
+/// subcommand names the session it acted on, since ids are opaque and a
+/// silent success on the wrong one is unrecoverable.
+fn run_sessions(action: &SessionAction) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut store = match SessionStore::open(&cwd) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("smith: could not open this project's session store: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let result = match action {
+        SessionAction::List { limit } => list_sessions(&store, *limit),
+        SessionAction::Delete { id } => match store.delete_session(id) {
+            Ok(true) => {
+                println!("deleted {id}");
+                Ok(())
+            }
+            Ok(false) => Err(format!("no session {id} in this project")),
+            Err(e) => Err(e.to_string()),
+        },
+        SessionAction::Fork { id, through } => match store.fork_session(id, *through) {
+            Ok(new_id) => {
+                println!("forked {id} -> {new_id}");
+                println!("resume it with: smith --resume {new_id}");
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        },
+        SessionAction::Export { id, format } => export_session(&store, id, *format),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("smith: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn list_sessions(store: &SessionStore, limit: u32) -> Result<(), String> {
+    let sessions = store
+        .list_sessions(Some(limit))
+        .map_err(|e| e.to_string())?;
+    if sessions.is_empty() {
+        println!("no saved sessions in this project");
+        return Ok(());
+    }
+    for summary in sessions {
+        let turns = store.turn_totals(&summary.id).map(|t| t.turns).unwrap_or(0);
+        let last = store.last_seq(&summary.id).ok().flatten();
+        // The seq range is printed because `sessions fork --through` is
+        // meaningless without knowing what the numbers can be.
+        let range = match last {
+            Some(seq) => format!("seq 0..={seq}"),
+            None => "empty".to_string(),
+        };
+        println!(
+            "{}  {}  ({turns} turns, {range})",
+            summary.id, summary.title
+        );
+    }
+    Ok(())
+}
+
+fn export_session(store: &SessionStore, id: &str, format: ExportFormat) -> Result<(), String> {
+    if !store.session_exists(id).map_err(|e| e.to_string())? {
+        return Err(format!("no session {id} in this project"));
+    }
+    let messages = store.load_messages(id).map_err(|e| e.to_string())?;
+
+    match format {
+        ExportFormat::Json => {
+            let json = serde_json::to_string_pretty(&messages).map_err(|e| e.to_string())?;
+            println!("{json}");
+        }
+        ExportFormat::Markdown => {
+            println!("# smith session {id}\n");
+            for message in &messages {
+                let text = message.text();
+                if text.trim().is_empty() {
+                    // Tool-call rounds carry no prose; a heading with nothing
+                    // under it is noise in a document meant to be read.
+                    continue;
+                }
+                let who = match message.role {
+                    smith_core::Role::User => "user",
+                    smith_core::Role::Assistant => "assistant",
+                };
+                println!("## {who}\n\n{text}\n");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `smith remember <note>` — appends a standing instruction to a `SMITH.md`.
@@ -218,7 +386,7 @@ impl Startup {
 
         let session_store = SessionStore::open(&cwd).ok();
         let (session_id, initial_messages, idle_hint, initial_goal) =
-            resolve_session(session_store.as_ref(), cli.resume.as_deref())?;
+            resolve_session(session_store.as_ref(), cli.resume.as_deref(), cli.continue_)?;
 
         Ok(Self {
             cwd,
@@ -464,6 +632,7 @@ fn read_piped_stdin() -> Option<String> {
 fn resolve_session(
     store: Option<&SessionStore>,
     resume: Option<&str>,
+    continue_latest: bool,
 ) -> Result<(Option<String>, Vec<Message>, IdleHint, Option<String>), String> {
     let Some(store) = store else {
         return Ok((
@@ -474,7 +643,21 @@ fn resolve_session(
         ));
     };
 
-    if let Some(id) = resume {
+    // Resolved to a concrete id up front so `--continue` and `--resume` share
+    // one code path — and one set of error messages — from here on.
+    let resolved: Option<String> = match (resume, continue_latest) {
+        (Some(id), _) => Some(id.to_string()),
+        (None, true) => match store.latest_session() {
+            Ok(Some(summary)) => Some(summary.id),
+            Ok(None) => {
+                return Err("no saved sessions in this project yet".to_string());
+            }
+            Err(e) => return Err(format!("could not read the session store: {e}")),
+        },
+        (None, false) => None,
+    };
+
+    if let Some(id) = resolved.as_deref() {
         // `--resume` is an explicit instruction, so failing it must be loud.
         // Falling through to a blank session looked identical to a successful
         // resume of an empty conversation — the user would keep working,
@@ -615,6 +798,61 @@ mod tests {
     #[test]
     fn the_flag_surface_is_wired_up_the_way_clap_expects() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn continue_and_resume_are_mutually_exclusive() {
+        // Both name a session; accepting both would mean silently picking one.
+        assert!(Cli::try_parse_from(["smith", "--continue", "--resume", "abc"]).is_err());
+    }
+
+    #[test]
+    fn continue_is_spelled_without_the_rust_keyword_escape() {
+        let parsed = cli(&["--continue"]);
+        assert!(parsed.continue_);
+        assert!(parsed.resume.is_none());
+    }
+
+    #[test]
+    fn sessions_list_defaults_to_a_screenful() {
+        let Some(Commands::Sessions {
+            action: SessionAction::List { limit },
+        }) = cli(&["sessions", "list"]).command
+        else {
+            panic!("expected sessions list");
+        };
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn sessions_fork_takes_an_optional_cutoff() {
+        let Some(Commands::Sessions {
+            action: SessionAction::Fork { id, through },
+        }) = cli(&["sessions", "fork", "abc", "--through", "4"]).command
+        else {
+            panic!("expected sessions fork");
+        };
+        assert_eq!(id, "abc");
+        assert_eq!(through, Some(4));
+
+        let Some(Commands::Sessions {
+            action: SessionAction::Fork { through, .. },
+        }) = cli(&["sessions", "fork", "abc"]).command
+        else {
+            panic!("expected sessions fork");
+        };
+        assert_eq!(through, None, "omitting --through copies everything");
+    }
+
+    #[test]
+    fn sessions_export_defaults_to_markdown() {
+        let Some(Commands::Sessions {
+            action: SessionAction::Export { format, .. },
+        }) = cli(&["sessions", "export", "abc"]).command
+        else {
+            panic!("expected sessions export");
+        };
+        assert_eq!(format, ExportFormat::Markdown);
     }
 
     #[test]

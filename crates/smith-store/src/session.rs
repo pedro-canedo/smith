@@ -22,6 +22,8 @@ pub enum SessionError {
          only understands up to {supported} — upgrade smith, or move .smith/sessions.db aside"
     )]
     SchemaTooNew { found: u32, supported: u32 },
+    #[error("no session {0} in this project")]
+    NoSuchSession(String),
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +509,94 @@ impl SessionStore {
             )
             .optional()
             .map(|found| found.is_some())
+            .map_err(SessionError::from)
+    }
+
+    /// Sessions in this project, most recently touched first.
+    ///
+    /// `limit` exists because a long-lived project accumulates hundreds and a
+    /// picker only ever shows a screenful; callers wanting all of them pass
+    /// `None` and accept the cost.
+    pub fn list_sessions(&self, limit: Option<u32>) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, COALESCE(title, '(untitled)'), updated_at
+             FROM sessions ORDER BY updated_at DESC LIMIT ?1",
+        )?;
+        // SQLite reads a negative LIMIT as "no limit", which is exactly the
+        // `None` case and saves a second query shape.
+        let rows = stmt.query_map(params![limit.map(i64::from).unwrap_or(-1)], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(SessionError::from)
+    }
+
+    /// Deletes a session and everything hanging off it. Returns whether a row
+    /// was actually removed, so a caller can tell "deleted" from "no such id"
+    /// rather than reporting success for a typo.
+    pub fn delete_session(&self, session_id: &str) -> Result<bool, SessionError> {
+        // `ON DELETE CASCADE` is declared on the child tables, but SQLite
+        // ignores it unless foreign keys are switched on per connection — off
+        // by default, which would silently orphan every message and turn row.
+        self.conn.execute("PRAGMA foreign_keys = ON", [])?;
+        let removed = self
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        Ok(removed > 0)
+    }
+
+    /// Copies a session up to and including `through_seq` into a new one, so a
+    /// conversation can branch without losing the original.
+    ///
+    /// Turn accounting is deliberately **not** copied: those rows record what
+    /// was actually spent with a provider, and duplicating them would double
+    /// the reported cost of money that was only spent once.
+    pub fn fork_session(
+        &mut self,
+        session_id: &str,
+        through_seq: Option<i64>,
+    ) -> Result<String, SessionError> {
+        let tx = self.conn.transaction()?;
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = now_millis();
+
+        let copied = tx.execute(
+            "INSERT INTO sessions (id, title, created_at, updated_at, provider, model, cwd, goal)
+             SELECT ?1, title, ?2, ?2, provider, model, cwd, goal FROM sessions WHERE id = ?3",
+            params![new_id, now, session_id],
+        )?;
+        if copied == 0 {
+            return Err(SessionError::NoSuchSession(session_id.to_string()));
+        }
+
+        // -1 means "everything", matching `list_sessions`'s LIMIT convention.
+        let cutoff = through_seq.unwrap_or(i64::MAX);
+        tx.execute(
+            "INSERT INTO messages (session_id, seq, role, content, created_at)
+             SELECT ?1, seq, role, content, created_at
+             FROM messages WHERE session_id = ?2 AND seq <= ?3 ORDER BY seq",
+            params![new_id, session_id, cutoff],
+        )?;
+
+        tx.commit()?;
+        Ok(new_id)
+    }
+
+    /// Highest message `seq` in a session, or `None` when it has no messages.
+    /// A fork's cutoff is meaningless without knowing the range.
+    pub fn last_seq(&self, session_id: &str) -> Result<Option<i64>, SessionError> {
+        self.conn
+            .query_row(
+                "SELECT MAX(seq) FROM messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
             .map_err(SessionError::from)
     }
 }
@@ -1073,5 +1163,133 @@ mod tests {
             store.turn_totals("no-such-session").unwrap(),
             TurnTotals::default()
         );
+    }
+
+    // ---- session management ------------------------------------------------
+
+    #[test]
+    fn list_sessions_is_most_recent_first_and_respects_a_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let id = store.create_session("anthropic", "m", "/tmp").unwrap();
+            // `updated_at` is millisecond-resolution, so without a nudge all
+            // three sort arbitrarily and the assertion below tests nothing.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            store
+                .append_message(&id, &Message::user_text("hi"))
+                .unwrap();
+            ids.push(id);
+        }
+
+        let all = store.list_sessions(None).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, ids[2], "newest first");
+        assert_eq!(all[2].id, ids[0]);
+
+        assert_eq!(store.list_sessions(Some(2)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_session_takes_its_messages_and_turns_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let id = store.create_session("anthropic", "m", "/tmp").unwrap();
+        store
+            .append_message(&id, &Message::user_text("hi"))
+            .unwrap();
+        store
+            .record_turn(
+                &id,
+                &TurnRecord {
+                    provider: "anthropic".into(),
+                    model: "m".into(),
+                    usage: Usage::default(),
+                    cost_usd: Some(1.0),
+                },
+            )
+            .unwrap();
+
+        assert!(store.delete_session(&id).unwrap());
+        assert!(!store.session_exists(&id).unwrap());
+        // The cascade only fires with foreign keys switched on, which is off
+        // by default in SQLite — without the pragma these rows would survive
+        // as orphans and keep counting toward totals.
+        assert!(store.load_messages(&id).unwrap().is_empty());
+        assert_eq!(store.turn_totals(&id).unwrap().turns, 0);
+
+        // A typo'd id is not a silent success.
+        assert!(!store.delete_session("no-such-session").unwrap());
+    }
+
+    #[test]
+    fn forking_copies_history_up_to_the_cutoff_and_leaves_the_original_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SessionStore::open(dir.path()).unwrap();
+        let id = store.create_session("anthropic", "m", "/tmp").unwrap();
+        for text in ["one", "two", "three"] {
+            store
+                .append_message(&id, &Message::user_text(text))
+                .unwrap();
+        }
+
+        let last = store.last_seq(&id).unwrap().unwrap();
+        assert_eq!(last, 2);
+
+        let forked = store.fork_session(&id, Some(1)).unwrap();
+        let branch = store.load_messages(&forked).unwrap();
+        assert_eq!(branch.len(), 2, "cutoff is inclusive");
+        assert_eq!(branch[0].text(), "one");
+        assert_eq!(branch[1].text(), "two");
+
+        // Branching must not disturb what it branched from.
+        assert_eq!(store.load_messages(&id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_fork_does_not_inherit_the_original_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SessionStore::open(dir.path()).unwrap();
+        let id = store.create_session("anthropic", "m", "/tmp").unwrap();
+        store
+            .append_message(&id, &Message::user_text("hi"))
+            .unwrap();
+        store
+            .record_turn(
+                &id,
+                &TurnRecord {
+                    provider: "anthropic".into(),
+                    model: "m".into(),
+                    usage: Usage::default(),
+                    cost_usd: Some(4.20),
+                },
+            )
+            .unwrap();
+
+        let forked = store.fork_session(&id, None).unwrap();
+        // Those dollars were spent once. Copying the rows would report them
+        // twice and make the project's total a lie.
+        assert_eq!(store.turn_totals(&forked).unwrap().cost_usd, 0.0);
+        assert_eq!(store.turn_totals(&id).unwrap().cost_usd, 4.20);
+    }
+
+    #[test]
+    fn forking_an_unknown_session_is_an_error_not_an_empty_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SessionStore::open(dir.path()).unwrap();
+        assert!(matches!(
+            store.fork_session("no-such-session", None),
+            Err(SessionError::NoSuchSession(_))
+        ));
+    }
+
+    #[test]
+    fn last_seq_is_none_for_a_session_with_no_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let id = store.create_session("anthropic", "m", "/tmp").unwrap();
+        assert_eq!(store.last_seq(&id).unwrap(), None);
     }
 }

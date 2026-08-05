@@ -9,6 +9,11 @@ rust-version.workspace = true
 name = "smith"
 path = "src/main.rs"
 
+[target.'cfg(unix)'.dependencies]
+# Restoring the default SIGPIPE disposition so piping into `head` exits
+# quietly instead of panicking. Already in the tree via tokio.
+libc = "0.2"
+
 [dependencies]
 smith-core = { workspace = true }
 smith-provider = { workspace = true }
