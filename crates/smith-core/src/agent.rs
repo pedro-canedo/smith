@@ -178,6 +178,18 @@ impl Agent {
         self.tasks = tasks;
     }
 
+    /// Tools the user has approved for the rest of the session ("allow
+    /// always"). Exposed so a `/model` switch — which rebuilds the whole
+    /// `Agent` — can carry the grants over instead of silently revoking
+    /// them and re-prompting for things the user already approved.
+    pub fn allowed_session_tools(&self) -> &HashSet<String> {
+        &self.allowed_session_tools
+    }
+
+    pub fn seed_allowed_session_tools(&mut self, allowed: HashSet<String>) {
+        self.allowed_session_tools = allowed;
+    }
+
     pub fn tool_ctx(&self) -> &ToolContext {
         &self.tool_ctx
     }

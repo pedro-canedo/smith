@@ -172,8 +172,12 @@ fn parse_chunk(payload: &serde_json::Value, state: &mut SseState) -> Vec<StreamE
             "length" => StopReason::MaxTokens,
             _ => StopReason::EndTurn,
         };
-        for id in state.index_to_id.values() {
-            out.push(StreamEvent::ToolUseComplete { id: id.clone() });
+        // Drain rather than iterate: the map is per-stream state, and a
+        // provider that sends more than one `finish_reason` (or a caller that
+        // reuses the state) would otherwise re-announce every tool call it
+        // has ever seen, completing ids that were already closed.
+        for (_, id) in std::mem::take(&mut state.index_to_id) {
+            out.push(StreamEvent::ToolUseComplete { id });
         }
     }
 

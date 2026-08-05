@@ -227,6 +227,14 @@ impl OrchestratorState {
         let plan_gated = self.agent.plan_gated();
         let goal = self.agent.goal().map(str::to_string);
         let tool_ctx = self.agent.tool_ctx().clone();
+        // Session state that isn't part of the conversation but is still the
+        // user's: tools they approved with "allow always" (revoking those
+        // silently would re-prompt for work they already signed off on) and
+        // the task checklist (the TUI keeps its own copy, so dropping the
+        // agent's made the two disagree).
+        let allowed = self.agent.allowed_session_tools().clone();
+        let tasks = self.agent.tasks().to_vec();
+
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
             .with_system(SYSTEM_PROMPT)
             .with_context_provider(environment_now)
@@ -234,6 +242,8 @@ impl OrchestratorState {
         agent.set_plan_gated(plan_gated);
         agent.set_goal(goal);
         agent.seed_history(history);
+        agent.seed_allowed_session_tools(allowed);
+        agent.seed_tasks(tasks);
 
         self.agent = agent;
         self.provider_kind = new_kind;

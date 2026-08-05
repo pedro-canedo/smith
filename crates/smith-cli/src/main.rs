@@ -171,15 +171,39 @@ fn resolve_session(
     };
 
     if let Some(id) = resume {
-        if let Ok(messages) = store.load_messages(id) {
-            let goal = store.load_goal(id).ok().flatten();
-            return (
-                Some(id.to_string()),
-                messages,
-                IdleHint::Tip(GENERIC_TIP.to_string()),
-                goal,
-            );
+        // `--resume` is an explicit instruction, so failing it must be loud.
+        // Falling through to a blank session looked identical to a successful
+        // resume of an empty conversation — the user would keep working,
+        // believing their history was loaded, and only notice much later.
+        match store.session_exists(id) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("smith: no session {id} in this project.");
+                if let Ok(Some(latest)) = store.latest_session() {
+                    eprintln!("smith: the most recent one here is {}.", latest.id);
+                }
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("smith: could not read the session store: {e}");
+                std::process::exit(1);
+            }
         }
+
+        let messages = match store.load_messages(id) {
+            Ok(messages) => messages,
+            Err(e) => {
+                eprintln!("smith: could not resume session {id}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let goal = store.load_goal(id).ok().flatten();
+        return (
+            Some(id.to_string()),
+            messages,
+            IdleHint::Tip(GENERIC_TIP.to_string()),
+            goal,
+        );
     }
 
     let idle_hint = match store.latest_session() {

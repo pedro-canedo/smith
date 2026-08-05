@@ -209,6 +209,21 @@ impl SessionStore {
             .map(Option::flatten)
             .map_err(SessionError::from)
     }
+
+    /// Whether a session row exists. `load_messages` can't answer this — an
+    /// unknown id and a session with no messages both come back as an empty
+    /// vector, so `--resume <typo>` would look like a successful resume.
+    pub fn session_exists(&self, session_id: &str) -> Result<bool, SessionError> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                params![session_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(SessionError::from)
+    }
 }
 
 fn derive_title(message: &Message) -> Option<String> {
@@ -335,5 +350,22 @@ mod tests {
         let latest = store.latest_session().unwrap().unwrap();
         assert_eq!(latest.id, second);
         assert_ne!(latest.id, first);
+    }
+
+    /// An unknown id and a session that simply has no messages are
+    /// indistinguishable through `load_messages` — which is exactly why
+    /// `--resume <typo>` used to look like a successful resume.
+    #[test]
+    fn session_exists_distinguishes_unknown_ids_from_empty_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let id = store.create_session("anthropic", "m", "/tmp").unwrap();
+
+        assert!(store.session_exists(&id).unwrap());
+        assert!(!store.session_exists("no-such-session").unwrap());
+
+        // Both come back empty, which is the trap.
+        assert!(store.load_messages(&id).unwrap().is_empty());
+        assert!(store.load_messages("no-such-session").unwrap().is_empty());
     }
 }
