@@ -72,15 +72,42 @@ Independently, a pending plan (`plan_gated`) blocks everything above
   otherwise) — no `Color::` literal may appear outside that module. Visual
   primitives live in `smith-tui/src/components/`; the spec is
   `docs/design-system.md`.
-- Mutating file tools (`write_file`, `edit_file`) stage content under
-  `.smith/staging/<session_id>/…` before applying to the real path
-  (`smith-tools/src/staging.rs`); tests assert no staging residue remains.
-- `ToolRegistry::with_defaults` registers `web_search` with no API key; if a
-  key is configured, `orchestrator.rs` re-registers it with the key
-  (`register` overwrites by name — keep this order).
+- File tools are confined to the session directory (`fs_tools.rs::resolve`):
+  `..` is normalised lexically *before* the prefix check (`starts_with` is
+  component-wise, so `<root>/a/../../etc/passwd` would otherwise pass) and
+  symlinks are resolved by canonicalising. `run_bash` is deliberately NOT
+  confined — jailing a shell needs a real sandbox.
+- Mutating file tools stage content under `.smith/staging/<session_id>/…`
+  before applying (`smith-tools/src/staging.rs`). This is a crash-safety
+  mechanism, **not** a security boundary: it sanitises its own mirror and
+  then copies to the unsanitised target. The path jail above is the boundary.
+- Tool registration has three entry points by intent: `try_register` fails on
+  a name collision (what untrusted MCP tools go through), `register` panics
+  (trusted startup wiring), `replace` overwrites deliberately (only used to
+  upgrade the keyless `web_search` once an Exa key is configured).
+- MCP tools are exposed as `mcp__{server}__{tool}`; the wire call still uses
+  the bare remote name. Without the prefix a remote server publishing
+  `read_file` would displace the sandboxed built-in.
+- `tool_defs()` is sorted by name. The tool array is part of the prefix
+  providers cache on, and a `HashMap`'s order would miss the cache on every
+  request with no visible symptom.
+- Every `tool_use` must be answered by a `tool_result` on *every* exit path
+  from the tool loop, cancellation included — `agent.rs` seeds the results
+  vector and fills it in rather than appending, so the invariant can't
+  regress. A dangling `tool_use` makes the next request fail outright.
+- Known API keys are stripped from tool output at one choke point in
+  `run_one_tool` (`smith-core/src/redact.rs`), which covers the transcript,
+  the session database and the next provider request together.
+- `AgentEvent`'s serialization is adjacently tagged (`{"type":…,"data":…}`)
+  because that *is* the `--output-format stream-json` wire format. Variant
+  and field names are a public interface.
 - Built-in tools: `read_file`, `list_dir`, `glob`, `write_file`, `edit_file`,
   `run_bash`, `ask_user`, `write_tasks`, `web_search`.
 - Runtime state: global `~/.smith/config.toml`; per-project
-  `.smith/sessions.db` and `.smith/goal.md` (gitignored, never commit).
+  `.smith/sessions.db` (gitignored, never commit). `/goal` is a column on the
+  session row, not a file — several doc comments still say `.smith/goal.md`.
 - Env keys `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` take priority over saved
   config.
+- MSRV is 1.88, set in `[workspace.package]` and enforced by a CI job. The
+  floor comes from the dependency graph (ratatui 0.30, darling 0.24), not
+  from first-party syntax.

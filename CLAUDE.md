@@ -100,8 +100,9 @@ plan. Both checks happen in `Agent::run_one_tool`
 ### Session/goal persistence
 
 Conversations persist per-project to `.smith/sessions.db` (SQLite, via
-`smith-store::SessionStore`). `/goal` writes to `.smith/goal.md` and is
-folded into every request's system prompt via `Agent::effective_system`.
+`smith-store::SessionStore`). `/goal` is stored as a column on the session
+row and folded into every request's system prompt via
+`Agent::effective_system`.
 Both live under the project's `.smith/` directory (gitignored), separate from
 the global `~/.smith/config.toml`.
 
