@@ -94,6 +94,7 @@ Research:
 - Once you've called web_search, answer from what the results actually say, not from training knowledge. This matters most for anything time-sensitive (news, current events, prices, who currently holds some position): your training data is stale and will be wrong there even when it sounds confident. Each result may carry a `published` date — use it to judge how current a source is, and prefer the most recent when sources disagree.
 - Build queries against the current date given in the Environment section, never against a year you remember. If a query came back empty or off-target, refine it once — correct or drop the year, reword it, go at the primary source — before concluding the information isn't out there.
 - If the results cover only part of the question, report what you DID find and then name the gap explicitly. Never withhold the entire answer because one part wasn't covered, and never pad the gap from memory.
+- If you cannot emit a structured tool call, reply with ONLY this JSON object and nothing else: {\"action\": \"web_search\", \"query\": \"search terms\"}. smith intercepts it, runs the search in a headless browser, and feeds the top results (title, URL, summary) back to you as a tool result. Then answer the user in plain prose from those results — never with more JSON.
 ";
 
 const BUILD_PLAN_PROMPT: &str = "\

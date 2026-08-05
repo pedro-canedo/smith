@@ -1,30 +1,42 @@
 //! `web_search` — lets the agent look things up instead of guessing (or,
-//! worse, telling the user to run search commands themselves). Two-tier
-//! backend: Exa (structured, includes extracted page text) first, falling
-//! back to scraping DuckDuckGo's lite HTML endpoint if Exa is unreachable,
-//! unconfigured, or errors. Any query that fails on both is reported as a
-//! single friendly error rather than two stack traces.
+//! worse, telling the user to run search commands themselves). Three-tier
+//! backend, tried in order: Exa (structured, includes extracted page text), a
+//! headless Chromium rendering the results page like a real visitor, and
+//! finally scraping DuckDuckGo's lite HTML endpoint over plain HTTP. Each tier
+//! falls through to the next when it is unreachable, unconfigured, or errors;
+//! a query that fails on all three is reported as a single friendly error
+//! rather than three stack traces.
+//!
+//! The middle tier is what keeps this useful with no API key at all: a browser
+//! the user already has installed costs nothing per query and sees the page a
+//! human would.
 
 use async_trait::async_trait;
 use smith_core::{PermissionClass, Tool, ToolContext, ToolResult};
 
 const EXA_SEARCH_URL: &str = "https://api.exa.ai/search";
 const DUCKDUCKGO_LITE_URL: &str = "https://lite.duckduckgo.com/lite/";
-const DEFAULT_NUM_RESULTS: u64 = 5;
+/// The top three results — title, URL and summary each — is what a synthesised
+/// answer actually needs; past that the extra rows mostly cost context. Callers
+/// wanting more say so with `num_results`.
+const DEFAULT_NUM_RESULTS: u64 = 3;
 const MAX_NUM_RESULTS: u64 = 10;
 /// Caps each backend attempt so a stalled request falls through to the next
 /// tier (or the final error) instead of hanging the whole turn.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// `pub(crate)` so the Chromium backend in `crate::chromium` can produce the
+/// same rows every other tier does — the formatting below is then shared, and
+/// a result reads identically to the model whichever backend found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SearchResult {
-    title: String,
-    url: String,
-    snippet: String,
+pub(crate) struct SearchResult {
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) snippet: String,
     /// Publication date as `YYYY-MM-DD`, when the backend reports one. This
     /// is the only recency signal the model gets: without it, a five-year-old
     /// page and this morning's are indistinguishable in the result list.
-    published: Option<String>,
+    pub(crate) published: Option<String>,
 }
 
 pub struct WebSearchTool {
@@ -82,7 +94,7 @@ impl Tool for WebSearchTool {
         &self,
         input: serde_json::Value,
         _ctx: &ToolContext,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> ToolResult {
         let query = input
             .get("query")
@@ -104,11 +116,34 @@ impl Tool for WebSearchTool {
             return ToolResult::ok(format_results("Exa", query, &today, &results));
         }
 
+        // Only worth a browser launch if there is a browser: `is_available`
+        // is a cached lookup, so skipping the tier on a machine without one
+        // costs nothing per query.
+        if crate::chromium::is_available() {
+            if let Ok(results) = crate::chromium::search(query, num_results as usize, &cancel).await
+            {
+                // An empty page here is far more likely to be a challenge or
+                // rate-limit page than a genuine zero-result query, so it
+                // falls through to the last tier instead of being reported as
+                // "nothing found".
+                if !results.is_empty() {
+                    return ToolResult::ok(format_results(
+                        "headless Chromium (DuckDuckGo)",
+                        query,
+                        &today,
+                        &results,
+                    ));
+                }
+            }
+        }
+
         match search_duckduckgo_lite(&self.client, query, num_results).await {
             Ok(results) => ToolResult::ok(format_results("DuckDuckGo", query, &today, &results)),
             Err(_) => ToolResult::error(
-                "web_search failed: Exa and the DuckDuckGo fallback both came up empty or \
-                 unreachable. For reliable results, set an Exa API key — add \
+                "web_search failed: Exa, the headless-browser backend and the DuckDuckGo \
+                 fallback all came up empty or unreachable. Installing Chromium (or setting \
+                 SMITH_CHROMIUM_PATH to an existing Chrome/Chromium binary) enables the free \
+                 browser backend. For a paid but more reliable path, set an Exa API key — add \
                  `[exa]\\napi_key = \"...\"` to ~/.smith/config.toml (get one at \
                  https://dashboard.exa.ai).",
             ),
@@ -259,8 +294,9 @@ fn parse_duckduckgo_lite(html: &str, limit: usize) -> Vec<SearchResult> {
 }
 
 /// DuckDuckGo lite links point at `//duckduckgo.com/l/?uddg=<encoded>&rut=…`
-/// rather than the target directly — pull the real URL back out.
-fn resolve_duckduckgo_redirect(href: &str) -> Option<String> {
+/// rather than the target directly — pull the real URL back out. Shared with
+/// the Chromium backend, whose page uses the same redirect shape.
+pub(crate) fn resolve_duckduckgo_redirect(href: &str) -> Option<String> {
     let full = if href.starts_with("//") {
         format!("https:{href}")
     } else {
@@ -274,7 +310,7 @@ fn resolve_duckduckgo_redirect(href: &str) -> Option<String> {
         .or(Some(full))
 }
 
-fn strip_tags(fragment: &str) -> String {
+pub(crate) fn strip_tags(fragment: &str) -> String {
     let mut out = String::with_capacity(fragment.len());
     let mut in_tag = false;
     for c in fragment.chars() {
@@ -288,7 +324,7 @@ fn strip_tags(fragment: &str) -> String {
     decode_html_entities(out.trim())
 }
 
-fn decode_html_entities(s: &str) -> String {
+pub(crate) fn decode_html_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")

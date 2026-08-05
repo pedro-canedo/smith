@@ -135,3 +135,38 @@ inventing one puts words in their mouth.
 just the model or rebuild the `Agent` against a different provider entirely;
 conversation history carries over either way, since `messages: Vec<Message>`
 lives independently of the `Arc<dyn LlmProvider>`.
+
+### Web search backends
+
+`web_search` (`smith-tools/src/web_search.rs`) tries three backends in order,
+each falling through to the next on error or an empty page:
+
+1. **Exa** — paid, structured, the only tier that reports publication dates.
+   Needs `[exa] api_key` in `~/.smith/config.toml`.
+2. **Headless Chromium** (`smith-tools/src/chromium.rs`) — launches whatever
+   Chrome/Chromium-family browser is on `PATH` with `--headless --dump-dom`
+   against DuckDuckGo's HTML endpoint and scrapes the rendered DOM. Free, and
+   the reason `web_search` works with no key at all. `SMITH_CHROMIUM_PATH`
+   (or `CHROME_PATH`) overrides binary discovery. Every launch gets a
+   throwaway `--user-data-dir` so it never touches the user's real profile.
+3. **DuckDuckGo lite over plain HTTP** — no browser needed, weakest results.
+
+The Chromium tier is best effort by design: no browser, a failed launch, or
+markup that changed shape all return `Err` and hand off to tier 3. Its parsing
+is a class-name scanner rather than an HTML parser, so drift costs results,
+never correctness. Only the pure halves are unit-tested; one `#[ignore]`d test
+(`chromium::tests::live_search_returns_three_usable_results`) exercises the
+real browser and network.
+
+### The JSON action envelope
+
+Models with no usable structured tool channel (small local ones especially)
+can call a tool by replying with nothing but
+`{"action": "web_search", "query": "..."}`. `Agent::recover_text_tool_call`
+(`smith-core/src/agent.rs`) rebuilds any such object into a real `ToolUse`
+before the turn ends, so it flows through the ordinary permission/execution
+path. Two envelopes are accepted — that flat one, where the remaining
+top-level fields *are* the arguments, and the nested
+`{"name": ..., "arguments": {...}}` form. Both only fire when the named tool
+is actually registered: an `action` field is common enough in ordinary JSON
+that dispatching on it blindly would turn quoted data into tool calls.

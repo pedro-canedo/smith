@@ -380,13 +380,14 @@ impl Agent {
         &self.tool_ctx
     }
 
-    /// If `message` is a single, otherwise-final text reply that's actually
-    /// a `{"name": ..., "arguments": {...}}` tool call in disguise (a known
-    /// tool name, specifically — not just JSON-shaped text), rebuild it as a
-    /// real `ToolUse` so the normal tool-execution path picks it up. `None`
-    /// for anything that doesn't match, which is the overwhelming majority
-    /// of replies — this only exists for providers/models that fall back to
-    /// printing the call instead of using the structured channel.
+    /// If `message` is a single, otherwise-final text reply that's actually a
+    /// tool call in disguise — `{"name": ..., "arguments": {...}}` or the flat
+    /// `{"action": "<tool>", ...}` form, naming a *known* tool specifically,
+    /// not just JSON-shaped text — rebuild it as a real `ToolUse` so the
+    /// normal tool-execution path picks it up. `None` for anything that
+    /// doesn't match, which is the overwhelming majority of replies — this
+    /// only exists for providers/models that fall back to printing the call
+    /// instead of using the structured channel.
     fn recover_text_tool_call(&self, message: &Message) -> Option<Message> {
         let [ContentBlock::Text { text }] = message.content.as_slice() else {
             return None;
@@ -1022,11 +1023,11 @@ pub fn parse_tasks(input: &serde_json::Value) -> Result<Vec<Task>, String> {
         .collect()
 }
 
-/// Scans `text` left to right for the first `{...}` JSON object shaped like
-/// `{"name": "<a known tool>", "arguments": {...}}`, returning its name,
-/// arguments, and the (trimmed) text before/after it. Uses a streaming
-/// JSON parser to find the object's end rather than hand-rolled brace
-/// counting, so it doesn't get confused by braces inside string values.
+/// Scans `text` left to right for the first `{...}` JSON object that is a tool
+/// call in disguise, returning its name, arguments, and the (trimmed) text
+/// before/after it. Uses a streaming JSON parser to find the object's end
+/// rather than hand-rolled brace counting, so it doesn't get confused by
+/// braces inside string values.
 fn find_fallback_tool_call(
     text: &str,
     known_tools: &HashSet<String>,
@@ -1040,21 +1041,61 @@ fn find_fallback_tool_call(
         let Some(Ok(value)) = de.next() else {
             continue;
         };
-        let name = value.get("name").and_then(|v| v.as_str());
-        let arguments = value.get("arguments").filter(|v| v.is_object());
-        if let (Some(name), Some(arguments)) = (name, arguments) {
-            if known_tools.contains(name) {
-                let end = i + de.byte_offset();
-                return Some((
-                    name.to_string(),
-                    arguments.clone(),
-                    text[..i].trim().to_string(),
-                    text[end..].trim().to_string(),
-                ));
-            }
+        if let Some((name, arguments)) = parse_tool_call_envelope(&value, known_tools) {
+            let end = i + de.byte_offset();
+            return Some((
+                name,
+                arguments,
+                text[..i].trim().to_string(),
+                text[end..].trim().to_string(),
+            ));
         }
     }
     None
+}
+
+/// The two envelopes a model may use to ask for a tool in plain text, both
+/// gated on naming a *registered* tool — JSON-shaped prose that happens to
+/// have a `name` or an `action` field must never dispatch anything.
+///
+/// 1. `{"name": "<tool>", "arguments": {...}}` — what a model trained on the
+///    function-calling wire format falls back to printing.
+/// 2. `{"action": "<tool>", ...}` — the flatter form, where the remaining
+///    top-level fields *are* the arguments, e.g.
+///    `{"action": "web_search", "query": "terms"}`. Small local models follow
+///    a single flat object far more reliably than a nested one, and it is the
+///    shape the system prompt asks for by name.
+fn parse_tool_call_envelope(
+    value: &serde_json::Value,
+    known_tools: &HashSet<String>,
+) -> Option<(String, serde_json::Value)> {
+    let named = value.get("name").and_then(|v| v.as_str());
+    let arguments = value.get("arguments").filter(|v| v.is_object());
+    if let (Some(name), Some(arguments)) = (named, arguments) {
+        if known_tools.contains(name) {
+            return Some((name.to_string(), arguments.clone()));
+        }
+    }
+
+    let name = value.get("action").and_then(|v| v.as_str())?;
+    if !known_tools.contains(name) {
+        return None;
+    }
+    let fields = value.as_object()?;
+    // `{"action": "x", "arguments": {...}}` is the two envelopes crossed, and
+    // a model that emits it means the inner object — not a lone `arguments`
+    // key as the argument itself.
+    if fields.len() == 2 {
+        if let Some(arguments) = fields.get("arguments").filter(|v| v.is_object()) {
+            return Some((name.to_string(), arguments.clone()));
+        }
+    }
+    let arguments = fields
+        .iter()
+        .filter(|(key, _)| key.as_str() != "action")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    Some((name.to_string(), serde_json::Value::Object(arguments)))
 }
 
 /// Drains a provider's StreamEvent stream, forwarding text deltas as AgentEvents
@@ -1440,6 +1481,118 @@ mod tests {
     fn ignores_plain_text_with_no_json() {
         let known: HashSet<String> = ["write_file".to_string()].into_iter().collect();
         assert!(find_fallback_tool_call("just a normal reply", &known).is_none());
+    }
+
+    /// The flat envelope the system prompt asks for when a model has no
+    /// structured tool channel: the remaining top-level fields are the
+    /// arguments.
+    #[test]
+    fn finds_the_flat_action_envelope() {
+        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let text = r#"{"action": "web_search", "query": "rust 2024 edition"}"#;
+        let (name, args, before, after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(name, "web_search");
+        assert_eq!(args, serde_json::json!({"query": "rust 2024 edition"}));
+        assert!(before.is_empty());
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn action_envelope_keeps_every_field_but_the_action_itself() {
+        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let text = r#"{"action": "web_search", "query": "rust", "num_results": 5}"#;
+        let (_name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(args, serde_json::json!({"query": "rust", "num_results": 5}));
+    }
+
+    /// The two envelopes crossed. A model writing this means the inner object,
+    /// not a literal `arguments` argument.
+    #[test]
+    fn action_envelope_unwraps_a_nested_arguments_object() {
+        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let text = r#"{"action": "web_search", "arguments": {"query": "rust"}}"#;
+        let (_name, args, _before, _after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(args, serde_json::json!({"query": "rust"}));
+    }
+
+    /// The registered-tool check is the whole safety property: an `action`
+    /// field is common enough in ordinary JSON that dispatching on it blindly
+    /// would turn quoted data into tool calls.
+    #[test]
+    fn ignores_an_action_naming_an_unregistered_tool() {
+        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let text = r#"{"action": "delete_everything", "path": "/"}"#;
+        assert!(find_fallback_tool_call(text, &known).is_none());
+    }
+
+    #[test]
+    fn finds_the_action_envelope_after_prose() {
+        let known: HashSet<String> = ["web_search".to_string()].into_iter().collect();
+        let text = "I need to look this up.\n\n{\"action\": \"web_search\", \"query\": \"rust\"}";
+        let (name, _args, before, after) = find_fallback_tool_call(text, &known).unwrap();
+        assert_eq!(name, "web_search");
+        assert_eq!(before, "I need to look this up.");
+        assert!(after.is_empty());
+    }
+
+    /// End to end through a real turn: the model replies with nothing but the
+    /// JSON envelope, and the search actually runs instead of being left on
+    /// screen as dead text.
+    #[tokio::test]
+    async fn action_envelope_is_recovered_and_actually_executed() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(ScriptedProvider::streams([
+            text_reply(r#"{"action": "web_search", "query": "rust 2024 edition"}"#),
+            text_reply("Here's what I found."),
+        ]));
+        let tools = Arc::new(RecordingToolsNamed {
+            name: "web_search".to_string(),
+            executed: executed.clone(),
+        });
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
+            .with_permission_policy(PermissionPolicy::Skip);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        agent
+            .run_turn(
+                "who won yesterday?".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the JSON action envelope should have dispatched a real search"
+        );
+
+        let mut dispatched_query = None;
+        while let Ok(event) = events_rx.try_recv() {
+            if let AgentEvent::ToolCallStarted {
+                tool_name, input, ..
+            } = event
+            {
+                assert_eq!(tool_name, "web_search");
+                dispatched_query = input
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+        }
+        assert_eq!(dispatched_query.as_deref(), Some("rust 2024 edition"));
+
+        // And the results come back into context as a tool result, which is
+        // what the model then synthesises its answer from.
+        assert_eq!(
+            agent.history().last().unwrap().text(),
+            "Here's what I found."
+        );
     }
 
     /// The tool call arrives as plain text content (no `ToolUseStart` at all)
