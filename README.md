@@ -1,4 +1,4 @@
-# smith
+<div align="center">
 
 ```
 ███████╗███╗   ███╗██╗████████╗██╗  ██╗
@@ -9,199 +9,255 @@
 ╚══════╝╚═╝     ╚═╝╚═╝   ╚═╝   ╚═╝  ╚═╝
 ```
 
-A terminal-based AI coding agent, in the spirit of Claude Code: a fast, richly
-styled TUI where you chat with an LLM and it can read/write files, run shell
-commands, and call out to MCP servers to get things done — all built in Rust
-for performance and terminal-rendering control.
+**A terminal AI coding agent, written in Rust.**
 
-**Status: early development.** The core chat loop (streaming, tool use,
-multi-provider support) works; persistence, MCP, and polish are still to come.
-See [Roadmap](#roadmap) below.
+Chat with an LLM in a fast, richly styled TUI while it reads and writes your
+files, runs shell commands, searches the web, and calls MCP servers — with a
+permission prompt before anything touches your machine.
 
-## Requirements
+[![CI](https://github.com/pedro-canedo/smith/actions/workflows/ci.yml/badge.svg)](https://github.com/pedro-canedo/smith/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
-- Rust (stable toolchain — see `rust-toolchain.toml`), install via [rustup](https://rustup.rs)
-- A configured provider — see [Provider setup](#provider-setup) below
+</div>
 
-## Building
+---
 
-```sh
-cargo build --workspace
-```
+> **Status: early development.** The agent loop, tools, providers, persistence,
+> and MCP all work day to day, but interfaces still change between commits.
+> See the [Roadmap](#roadmap).
 
-## Provider setup
+## Features
 
-The easiest way to configure a provider is the interactive wizard:
+- **Bring your own model** — Anthropic, OpenAI, or anything local through
+  [Ollama](https://ollama.com). Switch provider or model mid-conversation with
+  `/model`; history carries over.
+- **Real tools** — read, write, and edit files, list directories, glob, run
+  shell commands, search the web, and keep a live task checklist.
+- **Permission model you control** — every tool is classified read-only,
+  mutating, or dangerous. Nothing above read-only runs without your `y`/`a`/`n`.
+- **Plan before you build** — `/plan <task>` makes the agent propose steps,
+  risks, and affected files. Until you approve, *every* mutating tool is
+  blocked outright.
+- **MCP support** — bridge any stdio-transport MCP server's tools in as
+  first-class tools.
+- **Persistent sessions** — conversations are saved per project; resume with
+  `--resume`. `/goal` keeps a long-lived objective in the system prompt.
+- **Built for the terminal** — live markdown rendering while streaming,
+  wrap-aware scrollback, a per-step activity widget, and a sidebar with token
+  usage plus live CPU/RAM/VRAM stats (local models) or a cost estimate
+  (token-billed providers).
 
-```sh
-cargo run -p smith-cli -- setup
-```
+## Installation
 
-It walks you through: picking a provider (Anthropic, OpenAI, or a local model
-via Ollama), entering an API key (for Anthropic/OpenAI) or picking a model
-from a list of popular ones — or typing any model name yourself — and, for
-Ollama, making sure the `ollama serve` daemon is running and pulling the model
-for you. The result is saved to `~/.smith/config.toml` (permissions locked to
-your user only). Run `smith setup model` later to jump straight to picking a
-different model for the provider you already configured.
+### Prebuilt binaries
 
-You can skip the wizard and configure things by hand instead:
+Grab the archive for your platform from the
+[latest release](https://github.com/pedro-canedo/smith/releases/latest) and put
+`smith` somewhere on your `PATH`.
 
-- Anthropic/OpenAI: export `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` — these take
-  priority over whatever is saved in the config file.
-- Ollama: install it from [ollama.com](https://ollama.com/download), run
-  `ollama serve`, and either run the wizard or hand-edit
-  `~/.smith/config.toml`.
-
-## Running (development)
-
-```sh
-cargo run -p smith-cli
-```
-
-By default `smith` uses whatever provider/model you saved with `smith setup`
-(falling back to Anthropic's `claude-sonnet-5` if nothing is configured).
-Override either per-run with flags:
+<details>
+<summary><strong>Linux</strong> (x86_64 / arm64)</summary>
 
 ```sh
-cargo run -p smith-cli -- --provider ollama --model qwen2.5
+# pick one: x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu
+TARGET=x86_64-unknown-linux-gnu
+VERSION=$(curl -fsSL https://api.github.com/repos/pedro-canedo/smith/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+
+curl -fsSL "https://github.com/pedro-canedo/smith/releases/download/${VERSION}/smith-${VERSION#v}-${TARGET}.tar.gz" | tar xz
+sudo install "smith-${VERSION#v}-${TARGET}/smith" /usr/local/bin/
 ```
 
-Inside the TUI: type a message and press `Enter` to send it, `↑`/`↓`/`PageUp`/`PageDown`
-scroll the transcript (it snaps back to following the latest message once you
-scroll to the bottom), `Esc` cancels an in-flight response, and `Ctrl+C` quits.
-`/clear` clears the visible transcript, `/help` lists commands, `/model` shows
-or switches the active model/provider without restarting (see below), and
-`/goal` sets a persistent session objective. Your messages
-show in a bordered bubble; the model's replies flow freely (rendered live as
-markdown while streaming — code blocks and inline code are styled). While the
-agent is thinking or running tools, an animated widget shows a short summary
-of each step (e.g. "Reading src/main.rs", "Running `cargo test`"). When the
-agent wants to write a file or run a shell command, a permission modal asks
-`[y]` allow once, `[a]` allow for the rest of the session, or `[n]` deny.
+</details>
 
-The sidebar (shown on wide enough terminals) tracks token usage for the
-session, plus either: live CPU/RAM/VRAM/GPU stats when running a local Ollama
-model (VRAM via `nvidia-smi` if present, falling back to Ollama's own
-`/api/ps`), or a rough cost estimate (`~$0.0123 (est.)`) for token-billed
-providers we have pricing for.
-
-### `/model` — switch model or provider mid-session
-
-```
-/model                          show the current provider/model + known models
-/model claude-haiku-4-5         switch model, same provider
-/model ollama/qwen2.5           switch provider and model
-/model gpt-4.1 --save           switch and persist as the new default
-```
-
-Conversation history carries over to the new model. Switching provider
-resolves the API key the same way startup does (env var, then
-`~/.smith/config.toml`) — if that provider isn't configured yet, the switch
-fails with an error and the old model keeps running.
-
-### `/permission` — control how often tools ask for confirmation
-
-```
-/permission                show the current mode
-/permission ask            always prompt (default)
-/permission session        auto-allow file writes/edits; still prompts for shell/MCP tools
-/permission skip           auto-allow everything, including shell commands — no prompts at all
-/permission skip --save    same, persisted as the default for future sessions
-```
-
-`skip` (alias `yolo`) removes the one safety net between the model and your
-shell — smith prints an explicit warning the moment you enable it. Per-tool
-"allow for this session" grants from the confirmation modal still work
-independently of whichever mode you're in.
-
-### `/usage` — session token/cost/tool-call summary
-
-```
-/usage
-```
-
-Prints requests sent, tools invoked, input/output token counts, and either an
-estimated cost (token-billed providers we have pricing for) or `n/a` if we
-don't — same honesty rule as the sidebar's cost estimate: no pricing data
-means no number, not a guess.
-
-### `/plan` — propose, then confirm & build
-
-```
-/plan <task description>   ask the model for a plan (steps, risks, affected files); no mutations yet
-/plan                       show whether a plan is pending approval
-/plan approve               approve & start building (same as [y] in the plan modal)
-/plan reject                discard the plan (same as [n] / Esc)
-```
-
-While planning or awaiting approval, the input chrome switches to **plan mode**
-(magenta border / `PLAN MODE` in the sidebar). When the plan turn finishes, a
-**plan ready** modal shows the plan — `[y]`/`Enter` builds it, `[n]`/`Esc`
-rejects. Type `/` for slash-command hints; `Tab` autocompletes.
-
-While a plan is pending, **every** Mutating or Dangerous tool call is blocked
-outright — including under `/permission skip` — until you approve or reject
-it. Read-only investigation (`read_file`, `glob`, ...) is still allowed during
-planning so the model can look before it proposes.
-
-### `/goal` — persistent session objective
-
-```
-/goal                          show the current goal (if any)
-/goal <description>            set the session goal
-/goal clear                    remove it
-```
-
-The goal is written to `.smith/goal.md` in the project directory, so it
-survives restarts. On every request it's folded into the system prompt so the
-model keeps working toward it unless you direct otherwise.
-
-Conversations are saved per-project to `.smith/sessions.db`. If a project has
-prior history, the idle screen shows a "Continue" hint — resume it with:
+<details>
+<summary><strong>macOS</strong> (Apple Silicon / Intel)</summary>
 
 ```sh
+# pick one: aarch64-apple-darwin (M1+) | x86_64-apple-darwin (Intel)
+TARGET=aarch64-apple-darwin
+VERSION=$(curl -fsSL https://api.github.com/repos/pedro-canedo/smith/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+
+curl -fsSL "https://github.com/pedro-canedo/smith/releases/download/${VERSION}/smith-${VERSION#v}-${TARGET}.tar.gz" | tar xz
+sudo install "smith-${VERSION#v}-${TARGET}/smith" /usr/local/bin/
+```
+
+The binaries are unsigned, so Gatekeeper will quarantine them on first run:
+
+```sh
+xattr -d com.apple.quarantine /usr/local/bin/smith
+```
+
+</details>
+
+<details>
+<summary><strong>Windows</strong> (x86_64)</summary>
+
+```powershell
+$version = (Invoke-RestMethod https://api.github.com/repos/pedro-canedo/smith/releases/latest).tag_name
+$name    = "smith-$($version.TrimStart('v'))-x86_64-pc-windows-msvc"
+
+Invoke-WebRequest "https://github.com/pedro-canedo/smith/releases/download/$version/$name.zip" -OutFile "$name.zip"
+Expand-Archive "$name.zip" -DestinationPath .
+# then move $name\smith.exe somewhere on your PATH
+```
+
+Use Windows Terminal — the legacy console host doesn't render the TUI correctly.
+
+</details>
+
+Each archive ships with a `.sha256` file next to it if you want to verify the
+download.
+
+### With cargo (any OS)
+
+Requires a [stable Rust toolchain](https://rustup.rs):
+
+```sh
+cargo install --git https://github.com/pedro-canedo/smith smith-cli
+```
+
+### From source
+
+```sh
+git clone https://github.com/pedro-canedo/smith
+cd smith
+cargo build --release --workspace
+# binary at ./target/release/smith
+```
+
+## Quick start
+
+```sh
+smith setup     # interactive provider + model wizard
+smith           # start the TUI in the current project
+```
+
+The wizard walks you through picking a provider (Anthropic, OpenAI, or a local
+model via Ollama), entering an API key or choosing a model, and — for Ollama —
+making sure `ollama serve` is running and pulling the model for you. It saves
+to `~/.smith/config.toml`, locked to your user.
+
+Override per run without touching the config:
+
+```sh
+smith --provider ollama --model qwen2.5
 smith --resume <session-id>
 ```
 
-## MCP servers
+## Usage
 
-Add stdio-transport MCP servers to `~/.smith/config.toml`:
+### Keys
+
+| Key | Action |
+| --- | --- |
+| `Enter` | send the message |
+| `Esc` | cancel the in-flight response |
+| `↑` `↓` `PageUp` `PageDown` | scroll the transcript (snaps back to follow-latest at the bottom) |
+| `Tab` | autocomplete a slash command |
+| `Ctrl+C` | quit |
+
+When the agent wants to write a file or run a shell command, a modal asks:
+`[y]` allow once, `[a]` allow for the rest of the session, `[n]` deny.
+
+### Slash commands
+
+| Command | What it does |
+| --- | --- |
+| `/help` | list available commands |
+| `/model` | show or switch provider/model — `/model ollama/qwen2.5`, `--save` to persist |
+| `/permission` | tool permission policy: `ask` (default), `session`, `skip` |
+| `/plan <task>` | propose a plan first; `approve`/`reject` to unblock tools |
+| `/goal <text>` | persistent session objective, stored in `.smith/goal.md` |
+| `/loop [N] <task>` | repeat a task until done, N iterations, or `Esc` (`/loop goal` reuses the goal) |
+| `/usage` | session requests, tool calls, tokens, and estimated cost |
+| `/clear` | clear the visible transcript |
+
+### Built-in tools
+
+| Tool | Permission |
+| --- | --- |
+| `read_file`, `list_dir`, `glob`, `web_search`, `write_tasks`, `ask_user` | read-only — never prompts |
+| `write_file`, `edit_file` | mutating — prompts unless session-allowed |
+| `run_bash`, all MCP-bridged tools | dangerous — always prompts unless session-allowed |
+
+`/permission skip` (alias `yolo`) auto-allows everything, including shell
+commands — smith prints an explicit warning the moment you enable it. A pending
+`/plan` blocks every mutating and dangerous tool regardless of policy, even
+under `skip`.
+
+## Configuration
+
+Global config and secrets live in `~/.smith/config.toml`. Per-project state —
+session history (`sessions.db`), the current goal, and staged edits — lives in
+`.smith/` inside the project (add it to your `.gitignore`).
 
 ```toml
+[general]
+provider = "anthropic"          # anthropic | openai | ollama
+model = "claude-sonnet-5"
+permission_policy = "ask"       # ask | session | skip
+
+[anthropic]
+api_key = "sk-ant-..."
+
+[openai]
+api_key = "sk-..."
+
+[ollama]
+base_url = "http://127.0.0.1:11434/v1"
+
+# Optional: primary web_search backend. Without a key, web_search falls back
+# to Exa's keyless endpoint and then to DuckDuckGo Lite.
+[exa]
+api_key = "..."
+
+# Any stdio-transport MCP server. Its tools are pulled in at startup and, like
+# run_bash, always require a permission prompt.
 [[mcp_servers]]
 name = "filesystem"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allow"]
 ```
 
-Their tools are pulled in automatically at startup and, like `run_bash`,
-always require a permission prompt — an arbitrary server's tool semantics
-can't be assumed safe.
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` take priority over whatever is saved
+in the config file.
 
-## Project layout
+## Architecture
 
-A Cargo workspace, split so the network/DB-heavy layers stay out of pure logic
-crates and each layer has an independent test surface:
+A Cargo workspace of 7 crates, with dependencies flowing one way toward
+`smith-core` — which is pure traits and types and knows nothing about HTTP,
+SQLite, or `ratatui`.
 
-| Crate               | Responsibility                                                                                                                                    |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `smith-core`      | Domain types (`Message`, `ContentBlock`, `StreamEvent`), the `LlmProvider`/`Tool` traits, and the agent orchestration loop              |
-| `smith-providers` | LLM provider adapters (Anthropic, OpenAI, and Ollama via the OpenAI-compatible adapter) implementing`LlmProvider`, including SSE stream parsing |
-| `smith-tools`     | Built-in tools (`read_file`, `write_file`, `edit_file`, `list_dir`, `glob`) and the `ToolRegistry`                                    |
-| `smith-mcp`       | MCP client (hand-rolled JSON-RPC over stdio) — bridges remote MCP server tools into the same`Tool` trait as built-ins                          |
-| `smith-persist`   | Global config (`~/.smith/config.toml`) loading/saving, and per-project session history (`.smith/sessions.db`, SQLite)                            |
-| `smith-tui`       | The`ratatui`/`crossterm` terminal UI — chat pane, input box, permission modal                                                                |
-| `smith-cli`       | Binary entry point: CLI flags, wires every crate together                                                                                         |
+| Crate | Responsibility |
+| --- | --- |
+| `smith-core` | Domain types, the `LlmProvider`/`Tool` traits, and the agent loop (`agent.rs`) |
+| `smith-providers` | Provider adapters (Anthropic, OpenAI, Ollama) including SSE stream parsing |
+| `smith-tools` | Built-in tools and the `ToolRegistry` |
+| `smith-mcp` | Hand-rolled JSON-RPC-over-stdio MCP client |
+| `smith-persist` | Global config and per-project SQLite session history |
+| `smith-tui` | The `ratatui`/`crossterm` UI — chat pane, input box, modals, sidebar |
+| `smith-cli` | Binary entry point: CLI flags, system prompt, orchestrator loop |
 
-Dependencies flow one way: `smith-core` defines the traits and knows nothing
-about HTTP, SQLite, or `ratatui`; every other crate implements against those
-traits. `smith-tui` never talks to `smith-providers` directly — only through
-the `Action`/`AgentEvent` channels.
+The TUI never talks to providers or tools directly — only through `Action` and
+`AgentEvent` channels. [`CLAUDE.md`](CLAUDE.md) has the long-form narrative;
+[`AGENTS.md`](AGENTS.md) is the short version.
 
-## Development workflow
+## Contributing
 
-Before committing, all three must pass:
+Issues and pull requests are welcome — especially bug reports with a
+reproduction, and small, focused PRs.
+
+**Setup**
+
+```sh
+git clone https://github.com/pedro-canedo/smith
+cd smith
+cargo build --workspace
+cargo run -p smith-cli          # run the TUI in dev
+```
+
+**Before you open a PR**, all three must pass — CI runs exactly these:
 
 ```sh
 cargo fmt --all -- --check
@@ -209,42 +265,33 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+**Conventions**
+
+- Tests are inline `#[cfg(test)] mod tests { ... }` at the bottom of the file
+  they cover. There are no separate test files.
+- Run a single crate or test with `cargo test -p smith-tui` /
+  `cargo test -p smith-tui app::tests::some_test`.
+- Keep changes scoped. This is early-stage; architectural changes are much
+  easier to review in small pieces — open an issue to discuss first.
+- Adding a capability that reaches the UI means three edits: a new `AgentEvent`
+  variant in `smith-core/src/event.rs`, an emitter in `agent.rs` or `main.rs`,
+  and a handler arm in `smith-tui/src/app.rs::on_agent_event`.
+
 ## Roadmap
 
-- [X] M0 — Workspace skeleton
-- [X] M1 — Static TUI shell (banner, input box, panic-safe terminal restore)
-- [X] M2 — Anthropic chat
-- [X] M3 — Streaming responses + Esc-to-cancel
-- [X] M4 — Provider abstraction + OpenAI
-- [X] M5 — Built-in file tools + permission modal
-- [X] M6 — Shell tool (`run_bash`) + full allow-once/allow-session/deny model
-- [X] M7 — SQLite session persistence (per-project `.smith/sessions.db`, `--resume <id>`, idle-screen "Continue session" hint)
-- [X] M8 — MCP client (stdio transport, tools bridged with default `Dangerous` permission)
-- [X] M9 — Polish: markdown code-block/inline-code rendering, scrollback with auto-follow, `/clear` and `/help` slash commands
+Done: multi-provider streaming chat, built-in file + shell + web tools,
+permission model, SQLite session persistence, MCP client, markdown rendering,
+and the `/model`, `/permission`, `/usage`, `/plan`, `/goal`, `/loop` commands.
 
-Also done ahead of schedule: a `smith setup` wizard for configuring providers/models (including pulling and running local Ollama models); a visual rework of the TUI (idle screen, chat sidebar, footer status bar) inspired by OpenCode's layout; user messages in a bubble with the model's replies flowing freely, live markdown rendering during streaming (via `tui-markdown`, including tables/headings/emphasis), wrap-aware auto-scroll, an animated per-step activity widget for tool calls; and a sidebar with live tok/s plus a resource panel (CPU/RAM/VRAM/GPU for local Ollama models, an estimated cost for token-billed providers).
+Next up:
 
-### Slash commands
-
-Incremental delivery, one command per package:
-
-- [X] `/model` — runtime provider/model switching (see above)
-- [X] `/permission` — runtime tool permission policy (see above)
-- [X] `/usage` — session token/cost/tool-call summary
-- [X] `/plan` — planning mode with a confirm-before-executing gate
-- [X] `/goal` — persistent session objective (`.smith/goal.md`)
-- [ ] `/loop` — run a prompt/goal repeatedly with a stop condition
-- [ ] `/kanban` — simple todo/doing/done board tied to `/goal` and `/plan`
+- [ ] `/kanban` — todo/doing/done board tied to `/goal` and `/plan`
 - [ ] `/ultraplan` — deep multi-step planning producing a persistent artifact
 
-Known gaps worth knowing about if you're picking this up: MCP server tools use a fixed 30s call timeout with no cancellation of the underlying server process on repeated timeouts. Markdown is rendered via `tui-markdown` (headings, emphasis, tables, code); LaTeX math stays as literal delimiters in the terminal.
-
-## Contributing
-
-Issues and PRs are welcome. Please run the development workflow checks above
-before opening a PR, and keep changes scoped — this is an early-stage project
-and architectural changes are easier to review in small pieces.
+Known gaps: MCP tool calls use a fixed 30s timeout with no cancellation of the
+underlying server process on repeated timeouts; LaTeX math renders as literal
+delimiters in the terminal.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © Pedro Canedo
