@@ -197,8 +197,11 @@ pub fn truncate_tail(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
+    // Only the `sh`-driven tests need a context, and those are all `cfg(unix)`.
+    #[cfg(unix)]
     fn ctx() -> ToolContext {
         ToolContext {
             cwd: PathBuf::from("."),
@@ -206,6 +209,21 @@ mod tests {
         }
     }
 
+    // --- POSIX shell behaviour --------------------------------------------
+    //
+    // `RunBashTool` spawns `sh -c` by design, and these tests drive it with
+    // `sh` builtins (`echo`, `exit`) and coreutils (`sleep`). Neither `sh` nor
+    // `sleep` exists on a stock Windows runner, so on Windows the spawn fails
+    // and every assertion below is about a POSIX shell rather than about the
+    // tool's own logic. They are gated rather than rewritten: what they cover
+    // — signalling a process group, killing a real child on timeout — is
+    // genuinely Unix-shaped. Windows would need a Job Object and its own
+    // tests (see the `cfg(not(unix))` `kill_process_tree` fallback, which is
+    // currently untested).
+    //
+    // The `truncate_tail` tests further down are pure and stay cross-platform.
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn runs_command_and_captures_stdout() {
         let result = RunBashTool
@@ -219,6 +237,7 @@ mod tests {
         assert!(result.content.contains("hello"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn non_zero_exit_is_an_error() {
         let result = RunBashTool
@@ -232,6 +251,7 @@ mod tests {
         assert!(result.content.contains("exit code 3"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_a_long_running_command() {
         let cancel = CancellationToken::new();
@@ -285,6 +305,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_the_command() {
         let result = RunBashTool
