@@ -1,0 +1,27 @@
+[package]
+name = "smith-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "smith"
+path = "src/main.rs"
+
+[dependencies]
+smith-core = { workspace = true }
+smith-providers = { workspace = true }
+smith-tools = { workspace = true }
+smith-mcp = { workspace = true }
+smith-persist = { workspace = true }
+smith-tui = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+color-eyre = "0.6"
+clap = { workspace = true }
+dialoguer = { workspace = true }
+reqwest = { workspace = true }
+directories = { workspace = true }
+sysinfo = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

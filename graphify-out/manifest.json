@@ -1,0 +1,207 @@
+{
+  "crates/smith-cli/src/main.rs": {
+    "mtime": 1785901445.3324869,
+    "ast_hash": "14fbb218ad72754b1c27515040998c46",
+    "semantic_hash": "14fbb218ad72754b1c27515040998c46"
+  },
+  "crates/smith-cli/src/resources.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "8a7a341b6582b8c6d840c1d824423349",
+    "semantic_hash": "8a7a341b6582b8c6d840c1d824423349"
+  },
+  "crates/smith-cli/src/setup.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "9f86276b68f7320019caf8857cb233c5",
+    "semantic_hash": "9f86276b68f7320019caf8857cb233c5"
+  },
+  "crates/smith-core/src/agent.rs": {
+    "mtime": 1785901484.0963328,
+    "ast_hash": "7f3c44083fa0923f6cc8f40022d8c0cd",
+    "semantic_hash": "7f3c44083fa0923f6cc8f40022d8c0cd"
+  },
+  "crates/smith-core/src/event.rs": {
+    "mtime": 1785901212.9036064,
+    "ast_hash": "f1f50488f8c0ed5d6926288373530687",
+    "semantic_hash": "f1f50488f8c0ed5d6926288373530687"
+  },
+  "crates/smith-core/src/lib.rs": {
+    "mtime": 1785901425.6512642,
+    "ast_hash": "554c6a551fc71ed5fc5cb47f26fbfdd6",
+    "semantic_hash": "554c6a551fc71ed5fc5cb47f26fbfdd6"
+  },
+  "crates/smith-core/src/message.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "0d416cc74f2a8d992a4aa7e458911ea4",
+    "semantic_hash": "0d416cc74f2a8d992a4aa7e458911ea4"
+  },
+  "crates/smith-core/src/permission_detail.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "8fa5190bc1fac4994aded1ac00dd7140",
+    "semantic_hash": "8fa5190bc1fac4994aded1ac00dd7140"
+  },
+  "crates/smith-core/src/provider.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "87383795ebb5ea267495e278c9e56a93",
+    "semantic_hash": "87383795ebb5ea267495e278c9e56a93"
+  },
+  "crates/smith-core/src/tool.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "862d56f4eb5d5b79b3da6b5c3b96fbd8",
+    "semantic_hash": "862d56f4eb5d5b79b3da6b5c3b96fbd8"
+  },
+  "crates/smith-mcp/src/bridge.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "a980512443ca2a47efa619312f49ac0d",
+    "semantic_hash": "a980512443ca2a47efa619312f49ac0d"
+  },
+  "crates/smith-mcp/src/client.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "cd7713d32b34c756c495de71afc841fd",
+    "semantic_hash": "cd7713d32b34c756c495de71afc841fd"
+  },
+  "crates/smith-mcp/src/lib.rs": {
+    "mtime": 1785900040.7013097,
+    "ast_hash": "af5052e5e848976c44b81be68fb320ec",
+    "semantic_hash": "af5052e5e848976c44b81be68fb320ec"
+  },
+  "crates/smith-mcp/src/transport.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "cad0101649ac3f77a822ee9d02a34bb7",
+    "semantic_hash": "cad0101649ac3f77a822ee9d02a34bb7"
+  },
+  "crates/smith-persist/src/config.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "2974af29271e0fe02444bfa3e6da9b87",
+    "semantic_hash": "2974af29271e0fe02444bfa3e6da9b87"
+  },
+  "crates/smith-persist/src/lib.rs": {
+    "mtime": 1785901793.4225457,
+    "ast_hash": "81720c8b64c5773464d1c5acb515c9f2",
+    "semantic_hash": "81720c8b64c5773464d1c5acb515c9f2"
+  },
+  "crates/smith-persist/src/models.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "38dee16bff8a0c7882953f83320be5c4",
+    "semantic_hash": "38dee16bff8a0c7882953f83320be5c4"
+  },
+  "crates/smith-persist/src/session.rs": {
+    "mtime": 1785901781.2578728,
+    "ast_hash": "ce04e21108e6ef66665c7eab8795868b",
+    "semantic_hash": "ce04e21108e6ef66665c7eab8795868b"
+  },
+  "crates/smith-providers/src/anthropic.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "47b7d17327eb02cad065a0e7b29158a2",
+    "semantic_hash": "47b7d17327eb02cad065a0e7b29158a2"
+  },
+  "crates/smith-providers/src/lib.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "f60e9f2b5ea23287494417e355ee2bd6",
+    "semantic_hash": "f60e9f2b5ea23287494417e355ee2bd6"
+  },
+  "crates/smith-providers/src/openai.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "de1ebf322ce4bf47bf5c93c462536327",
+    "semantic_hash": "de1ebf322ce4bf47bf5c93c462536327"
+  },
+  "crates/smith-tools/src/ask_user.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "278755c6cd0431c13d2855dd3809d1d7",
+    "semantic_hash": "278755c6cd0431c13d2855dd3809d1d7"
+  },
+  "crates/smith-tools/src/fs_tools.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "b2238e241b7b5be9deb0b6c5a573ae51",
+    "semantic_hash": "b2238e241b7b5be9deb0b6c5a573ae51"
+  },
+  "crates/smith-tools/src/lib.rs": {
+    "mtime": 1785901279.2660148,
+    "ast_hash": "cfaf78fc077f36065de879eab4753c7a",
+    "semantic_hash": "cfaf78fc077f36065de879eab4753c7a"
+  },
+  "crates/smith-tools/src/registry.rs": {
+    "mtime": 1785901282.4354618,
+    "ast_hash": "ef84afd4b77961c4df728be9de233a7c",
+    "semantic_hash": "ef84afd4b77961c4df728be9de233a7c"
+  },
+  "crates/smith-tools/src/shell_tool.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "8eb13ad7df2b0284ad70b9e34ff14740",
+    "semantic_hash": "8eb13ad7df2b0284ad70b9e34ff14740"
+  },
+  "crates/smith-tools/src/staging.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "5f74ee8da1e7e9e18b1a3e1896fbb41e",
+    "semantic_hash": "5f74ee8da1e7e9e18b1a3e1896fbb41e"
+  },
+  "crates/smith-tools/src/write_tasks.rs": {
+    "mtime": 1785901276.0911279,
+    "ast_hash": "f7f40b0251f34429d61cd3c9d2adc0d9",
+    "semantic_hash": "f7f40b0251f34429d61cd3c9d2adc0d9"
+  },
+  "crates/smith-tui/src/app.rs": {
+    "mtime": 1785901504.9515598,
+    "ast_hash": "e6b8cd2b70665b580e7e2cc6e24981ea",
+    "semantic_hash": "e6b8cd2b70665b580e7e2cc6e24981ea"
+  },
+  "crates/smith-tui/src/banner.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "5d7d9b6f91a46b05a9265d54c8a8a0a4",
+    "semantic_hash": "5d7d9b6f91a46b05a9265d54c8a8a0a4"
+  },
+  "crates/smith-tui/src/lib.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "e52ded4b4683b52154ef34d4177c5cd7",
+    "semantic_hash": "e52ded4b4683b52154ef34d4177c5cd7"
+  },
+  "crates/smith-tui/src/markdown.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "5c25735befc8a8bbe8045742139a138b",
+    "semantic_hash": "5c25735befc8a8bbe8045742139a138b"
+  },
+  "crates/smith-tui/src/pricing.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "9318a423cb1147221afb94f8ad9b2a74",
+    "semantic_hash": "9318a423cb1147221afb94f8ad9b2a74"
+  },
+  "crates/smith-tui/src/slash.rs": {
+    "mtime": 1785900916.4065664,
+    "ast_hash": "77ae8fefb7ae6aa295784195d5910fa6",
+    "semantic_hash": "77ae8fefb7ae6aa295784195d5910fa6"
+  },
+  "crates/smith-tui/src/terminal.rs": {
+    "mtime": 1785900040.7053819,
+    "ast_hash": "4be17a699d7db9004806f42a53973971",
+    "semantic_hash": "4be17a699d7db9004806f42a53973971"
+  },
+  "crates/smith-tui/src/ui.rs": {
+    "mtime": 1785901383.4084096,
+    "ast_hash": "05344778c46006e6cafdb48c635dcc37",
+    "semantic_hash": "05344778c46006e6cafdb48c635dcc37"
+  },
+  "ASCII - smith.md": {
+    "mtime": 1785892637.317726,
+    "ast_hash": "499097324efa218894b417d03de81768",
+    "semantic_hash": "499097324efa218894b417d03de81768"
+  },
+  "CLAUDE.md": {
+    "mtime": 1785901271.678202,
+    "ast_hash": "896b5cbbb154d49108db6a314c660049",
+    "semantic_hash": "896b5cbbb154d49108db6a314c660049"
+  },
+  "README.md": {
+    "mtime": 1785897690.5230067,
+    "ast_hash": "b4e9556bac5ce1f9fd60be06dffcfb53",
+    "semantic_hash": "b4e9556bac5ce1f9fd60be06dffcfb53"
+  },
+  "docs/bugs1.md": {
+    "mtime": 1785893899.6706142,
+    "ast_hash": "298b7655ce8d419adb665d7259c60d73",
+    "semantic_hash": "298b7655ce8d419adb665d7259c60d73"
+  },
+  "docs/goal1.md": {
+    "mtime": 1785893668.6198065,
+    "ast_hash": "01c0f64efe60a5c8a3e91367b559519b",
+    "semantic_hash": "01c0f64efe60a5c8a3e91367b559519b"
+  }
+}

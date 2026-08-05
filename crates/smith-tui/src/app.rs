@@ -1,0 +1,2473 @@
+use std::time::Instant;
+
+use smith_core::{
+    Action, AgentEvent, AgentPhase, PermissionDecision, PermissionPolicy, PermissionRequest,
+    ResourceStats, StopReason, Task, Usage, UserQuestion,
+};
+
+use crate::components::input::TextInput;
+use crate::theme::Theme;
+
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", ""];
+const MAX_LABEL_CHARS: usize = 64;
+/// Minimum gap (seconds) between events before we emit a `Thought` row —
+/// anything shorter is just provider latency, not a real thinking pause.
+const THOUGHT_THRESHOLD_SECS: f32 = 0.5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    User,
+    Assistant,
+    System,
+    /// A tool call, kept as a permanent transcript entry so scrolling back
+    /// shows what actually ran during a turn — see `ChatLine::tool_status`.
+    Tool,
+    /// A quiet gap between tool calls / turns, e.g. `+ Thought: 1.1s`.
+    Thought,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatLine {
+    pub role: ChatRole,
+    pub text: String,
+    /// Small dim caption under an assistant reply, e.g. "ollama · qwen3.5 · 4.2s".
+    pub meta: Option<String>,
+    /// Set only for `ChatRole::Tool` lines — the tool call id, used to find
+    /// and update this same line in place when its result arrives.
+    pub tool_id: Option<String>,
+    /// Set only for `ChatRole::Tool` lines — live while the call is running,
+    /// then flipped to its final state so the icon reflects outcome.
+    pub tool_status: Option<ActivityStatus>,
+    /// Tool name (e.g. `run_bash`, `read_file`) — for the card header.
+    pub tool_name: Option<String>,
+    /// Raw JSON input from the provider — used to derive the target summary
+    /// and, in verbose mode, to render the full input and a diff for edits.
+    pub tool_input: Option<serde_json::Value>,
+    /// Tool output text, populated on `ToolCallResult`.
+    pub tool_output: Option<String>,
+    /// Wall-clock seconds the call took, populated on `ToolCallResult`.
+    pub tool_secs: Option<f32>,
+    /// When the call started — for the live elapsed counter in the header
+    /// while the card is still `Running`.
+    pub started_at: Option<Instant>,
+}
+
+impl ChatLine {
+    pub fn new(role: ChatRole, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            text: text.into(),
+            meta: None,
+            tool_id: None,
+            tool_status: None,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            tool_secs: None,
+            started_at: None,
+        }
+    }
+
+    /// A permanent transcript entry for a tool call, starting in the
+    /// `Running` state; updated in place once its result lands.
+    fn tool(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        label: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            text: label.into(),
+            meta: None,
+            tool_id: Some(id.into()),
+            tool_status: Some(ActivityStatus::Running),
+            tool_name: Some(name.into()),
+            tool_input: Some(input),
+            tool_output: None,
+            tool_secs: None,
+            started_at: Some(Instant::now()),
+        }
+    }
+
+    /// A thought-row entry: `+ Thought: 959ms` or `+ Thought: 1.1s`.
+    fn thought(secs: f32) -> Self {
+        Self {
+            role: ChatRole::Thought,
+            text: format_thought(secs),
+            meta: None,
+            tool_id: None,
+            tool_status: None,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            tool_secs: None,
+            started_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityStatus {
+    Running,
+    Done,
+    Error,
+}
+
+/// Format a duration as `959ms` or `1.1s` for thought rows.
+pub fn format_thought(secs: f32) -> String {
+    if secs < 1.0 {
+        format!("{}ms", (secs * 1000.0) as u32)
+    } else {
+        format!("{:.1}s", secs)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionModal {
+    pub request: PermissionRequest,
+    /// Vertical scroll into the permission preview body.
+    pub scroll: u16,
+}
+
+/// Shown after a `/plan` turn finishes — review the plan, then build or reject.
+#[derive(Debug, Clone)]
+pub struct PlanModal {
+    pub text: String,
+    pub scroll: u16,
+}
+
+/// Clarifying question from `ask_user`: three suggestions + free-text (index 3).
+#[derive(Debug, Clone)]
+pub struct QuestionModal {
+    pub question: UserQuestion,
+    /// 0..=2 = suggestions, 3 = custom text.
+    pub selected: usize,
+    pub custom: String,
+}
+
+/// The one overlay that can be on screen at a time. Only one interactive
+/// wait is ever in flight per turn (the agent loop blocks on a single
+/// `oneshot` at once), so this is a true sum type rather than three
+/// independent `Option`s that happened to always be mutually exclusive in
+/// practice — a state combination like "plan modal AND question modal both
+/// open" is no longer representable at all, instead of just avoided by
+/// convention.
+#[derive(Debug, Clone, Default)]
+pub enum Modal {
+    #[default]
+    None,
+    Permission(PermissionModal),
+    Plan(PlanModal),
+    Question(QuestionModal),
+}
+
+impl Modal {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Modal::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn is_plan(&self) -> bool {
+        matches!(self, Modal::Plan(_))
+    }
+
+    pub fn is_question(&self) -> bool {
+        matches!(self, Modal::Question(_))
+    }
+
+    pub fn permission(&self) -> Option<&PermissionModal> {
+        match self {
+            Modal::Permission(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn permission_mut(&mut self) -> Option<&mut PermissionModal> {
+        match self {
+            Modal::Permission(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn plan(&self) -> Option<&PlanModal> {
+        match self {
+            Modal::Plan(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn plan_mut(&mut self) -> Option<&mut PlanModal> {
+        match self {
+            Modal::Plan(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn question(&self) -> Option<&QuestionModal> {
+        match self {
+            Modal::Question(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn question_mut(&mut self) -> Option<&mut QuestionModal> {
+        match self {
+            Modal::Question(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+/// What the idle screen shows below the hint line: either a generic tip, or —
+/// once a project has prior history — a pointer to resume it.
+#[derive(Debug, Clone)]
+pub enum IdleHint {
+    Tip(String),
+    ContinueSession { title: String, resume_cmd: String },
+}
+
+/// Everything the TUI needs to know that isn't part of the live event stream:
+/// display labels, environment info, and (when resuming) prior transcript.
+pub struct TuiConfig {
+    pub banner: String,
+    pub provider_label: String,
+    pub model_label: String,
+    pub cwd_display: String,
+    pub git_branch: Option<String>,
+    pub idle_hint: IdleHint,
+    pub initial_lines: Vec<ChatLine>,
+    pub permission_policy: PermissionPolicy,
+    /// Loaded from `.smith/goal.md` at startup (if any).
+    pub goal: Option<String>,
+    /// Restored from a resumed session's last `write_tasks` call, if any.
+    pub tasks: Vec<Task>,
+}
+
+pub struct App {
+    pub input: TextInput,
+    pub lines: Vec<ChatLine>,
+    pub should_quit: bool,
+    pub banner: String,
+    pub waiting_on_assistant: bool,
+    /// The one overlay on screen right now, if any — permission prompt,
+    /// plan review, or clarifying question (see `Modal`).
+    pub modal: Modal,
+    /// Coarse agent status for chrome (thinking / building / asking / …).
+    pub phase: AgentPhase,
+    /// Current render offset into the message pane, kept in sync by
+    /// `ui::draw_messages` (which knows the actual content/viewport height).
+    pub scroll: u16,
+    /// True unless the user has manually scrolled up; when true the pane
+    /// pins to the latest content on every redraw.
+    pub follow_bottom: bool,
+    /// Streaming text for the assistant reply currently in flight, if any.
+    pub in_flight_text: Option<String>,
+    /// Advanced on a timer while something is animating (thinking/running).
+    pub spinner_frame: usize,
+    /// Ember design tokens — the single source of truth for every color.
+    pub theme: Theme,
+    /// When true, tool cards expand to show full input + output + diffs.
+    pub verbose_tools: bool,
+    /// Start of the current "thinking" gap — when the next activity arrives
+    /// we emit a `Thought` row if the gap exceeds `THOUGHT_THRESHOLD_SECS`.
+    thinking_since: Option<Instant>,
+    pub provider_label: String,
+    pub model_label: String,
+    pub cwd_display: String,
+    pub git_branch: Option<String>,
+    pub idle_hint: IdleHint,
+    pub usage: Usage,
+    /// Latest local-machine resource snapshot (Ollama only; `None` for
+    /// token-billed providers, which show a cost estimate instead).
+    pub resources: Option<ResourceStats>,
+    pub permission_policy: PermissionPolicy,
+    /// User messages submitted this session — for `/usage`.
+    pub request_count: u32,
+    /// Tool calls started this session — for `/usage`.
+    pub tool_call_count: u32,
+    /// True while a `/plan` proposal awaits approval (modal or `/plan approve`).
+    pub plan_gated: bool,
+    /// True between `/plan <task>` submit and the planning turn's final reply.
+    pub plan_turn_active: bool,
+    /// Highlighted row in the slash-command suggestion list.
+    pub slash_selected: usize,
+    /// Session objective set via `/goal`, persisted to `.smith/goal.md`.
+    pub goal: Option<String>,
+    /// Live checklist maintained by the agent via `write_tasks` — the full
+    /// list is replaced wholesale on every update, no client-side diffing.
+    pub tasks: Vec<Task>,
+    /// True for the whole span of a `/loop` run (all iterations), so a turn
+    /// finishing mid-loop doesn't drop the UI back to idle between rounds.
+    pub loop_active: bool,
+    /// `(iteration, max_iterations)` of the loop round in flight, if any.
+    pub loop_progress: Option<(u32, u32)>,
+    turn_started_at: Option<Instant>,
+    /// First assistant text delta of the current provider stream (per round).
+    stream_started_at: Option<Instant>,
+    /// Characters received in the current stream — for live tok/s estimate.
+    stream_output_chars: u32,
+    /// Live estimate while streaming (`chars/4 / elapsed`).
+    live_tokens_per_sec: Option<f32>,
+    /// Last measured rate from provider `output_tokens / elapsed`.
+    tokens_per_sec: Option<f32>,
+}
+
+impl App {
+    pub fn new(config: TuiConfig) -> Self {
+        let theme = Theme::detect();
+        Self {
+            input: TextInput::new(&theme),
+            lines: config.initial_lines,
+            should_quit: false,
+            banner: config.banner,
+            waiting_on_assistant: false,
+            modal: Modal::None,
+            phase: AgentPhase::Idle,
+            scroll: 0,
+            follow_bottom: true,
+            in_flight_text: None,
+            spinner_frame: 0,
+            theme,
+            verbose_tools: false,
+            thinking_since: None,
+            provider_label: config.provider_label,
+            model_label: config.model_label,
+            cwd_display: config.cwd_display,
+            git_branch: config.git_branch,
+            idle_hint: config.idle_hint,
+            usage: Usage::default(),
+            resources: None,
+            permission_policy: config.permission_policy,
+            request_count: 0,
+            tool_call_count: 0,
+            plan_gated: false,
+            plan_turn_active: false,
+            slash_selected: 0,
+            goal: config.goal,
+            tasks: config.tasks,
+            loop_active: false,
+            loop_progress: None,
+            turn_started_at: None,
+            stream_started_at: None,
+            stream_output_chars: 0,
+            live_tokens_per_sec: None,
+            tokens_per_sec: None,
+        }
+    }
+
+    /// Slash-command suggestions for the current input (empty when not typing `/cmd`).
+    pub fn slash_suggestions(&self) -> Vec<crate::slash::SlashSuggestion> {
+        crate::slash::suggestions_for(&self.input.text())
+    }
+
+    /// Bracketed paste: text arrives as one event, so embedded newlines land
+    /// in the buffer instead of submitting the prompt at the first one.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.waiting_on_assistant {
+            return;
+        }
+        if let Some(modal) = self.modal.question_mut() {
+            modal.custom.push_str(text);
+            return;
+        }
+        self.input.insert_str(text);
+        self.slash_selected = 0;
+    }
+
+    /// Whether the chrome should use plan-mode styling (gated or planning in flight).
+    pub fn in_plan_mode(&self) -> bool {
+        self.plan_gated || self.plan_turn_active || self.modal.is_plan()
+    }
+
+    /// Rate shown in the sidebar: live estimate while streaming, else last measured.
+    pub fn display_tokens_per_sec(&self) -> Option<f32> {
+        if self.waiting_on_assistant {
+            self.live_tokens_per_sec.or(self.tokens_per_sec)
+        } else {
+            self.tokens_per_sec
+        }
+    }
+
+    /// Seconds since the current turn started, for the "thinking… 12s" style
+    /// status line — `None` when idle.
+    pub fn turn_elapsed_secs(&self) -> Option<f32> {
+        self.turn_started_at.map(|t| t.elapsed().as_secs_f32())
+    }
+
+    /// Rough output-token estimate for the round currently streaming in
+    /// (~4 chars/token), for the same status line — `None` before any text
+    /// has arrived this round.
+    pub fn live_output_tokens_estimate(&self) -> Option<u32> {
+        self.stream_started_at.map(|_| self.stream_output_chars / 4)
+    }
+
+    /// Advances the spinner animation; call on a timer while `is_animating()`.
+    pub fn tick(&mut self) {
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.waiting_on_assistant || self.modal.is_some() || !matches!(self.phase, AgentPhase::Idle)
+    }
+
+    pub fn phase_label(&self) -> &'static str {
+        match self.phase {
+            AgentPhase::Idle => "idle",
+            AgentPhase::Thinking => "thinking…",
+            AgentPhase::Planning => "planning…",
+            AgentPhase::Building => "building…",
+            AgentPhase::Asking => "asking…",
+            AgentPhase::WaitingPermission => "waiting for permission…",
+            AgentPhase::Working => "working…",
+            AgentPhase::Looping => "looping…",
+        }
+    }
+
+    /// Start tracking a thinking gap — called when the model finishes a
+    /// response and is about to call tools, or after a tool result arrives.
+    fn begin_thinking(&mut self) {
+        if self.thinking_since.is_none() {
+            self.thinking_since = Some(Instant::now());
+        }
+    }
+
+    /// End the thinking gap — called when the first text delta arrives or
+    /// a tool call starts. If the gap exceeded the threshold, emit a
+    /// `Thought` row.
+    fn end_thinking(&mut self) {
+        if let Some(started) = self.thinking_since.take() {
+            let secs = started.elapsed().as_secs_f32();
+            if secs >= THOUGHT_THRESHOLD_SECS {
+                self.lines.push(ChatLine::thought(secs));
+            }
+        }
+    }
+
+    /// Handles a raw key event, returning an Action to forward to the
+    /// orchestrator if this keystroke produced one.
+    pub fn on_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Option<Action> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        if self.modal.is_question() {
+            return match code {
+                KeyCode::Char('1') => self.submit_question_choice(0),
+                KeyCode::Char('2') => self.submit_question_choice(1),
+                KeyCode::Char('3') => self.submit_question_choice(2),
+                KeyCode::Char('4') => {
+                    if let Some(m) = self.modal.question_mut() {
+                        m.selected = 3;
+                    }
+                    None
+                }
+                KeyCode::Up => {
+                    if let Some(m) = self.modal.question_mut() {
+                        m.selected = m.selected.saturating_sub(1);
+                    }
+                    None
+                }
+                KeyCode::Down => {
+                    if let Some(m) = self.modal.question_mut() {
+                        m.selected = (m.selected + 1).min(3);
+                    }
+                    None
+                }
+                KeyCode::Enter => {
+                    let selected = self.modal.question().map(|m| m.selected).unwrap_or(0);
+                    if selected == 3 {
+                        let custom = self
+                            .modal
+                            .question()
+                            .map(|m| m.custom.trim().to_string())
+                            .unwrap_or_default();
+                        if custom.is_empty() {
+                            None
+                        } else {
+                            self.record_question_answer(&custom);
+                            self.modal = Modal::None;
+                            Some(Action::QuestionResponse(custom))
+                        }
+                    } else {
+                        self.submit_question_choice(selected)
+                    }
+                }
+                KeyCode::Esc => {
+                    self.record_question_answer("dismissed without answering");
+                    self.modal = Modal::None;
+                    Some(Action::QuestionResponse(
+                        "User dismissed the question without answering.".into(),
+                    ))
+                }
+                KeyCode::Backspace => {
+                    if let Some(m) = self.modal.question_mut() {
+                        m.selected = 3;
+                        m.custom.pop();
+                    }
+                    None
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    if let Some(m) = self.modal.question_mut() {
+                        m.selected = 3;
+                        m.custom.push(c);
+                    }
+                    None
+                }
+                _ => None,
+            };
+        }
+
+        if self.modal.is_plan() {
+            return match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.modal = Modal::None;
+                    self.plan_gated = false;
+                    self.waiting_on_assistant = true;
+                    self.phase = AgentPhase::Building;
+                    self.in_flight_text = None;
+
+                    self.turn_started_at = Some(Instant::now());
+                    self.request_count += 1;
+                    self.lines
+                        .push(ChatLine::new(ChatRole::System, "plan approved — building…"));
+                    Some(Action::ApprovePlan)
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.modal = Modal::None;
+                    self.plan_gated = false;
+                    self.lines
+                        .push(ChatLine::new(ChatRole::System, "plan rejected"));
+                    Some(Action::RejectPlan)
+                }
+                KeyCode::Up => {
+                    if let Some(m) = self.modal.plan_mut() {
+                        m.scroll = m.scroll.saturating_sub(1);
+                    }
+                    None
+                }
+                KeyCode::Down => {
+                    if let Some(m) = self.modal.plan_mut() {
+                        m.scroll = m.scroll.saturating_add(1);
+                    }
+                    None
+                }
+                KeyCode::PageUp => {
+                    if let Some(m) = self.modal.plan_mut() {
+                        m.scroll = m.scroll.saturating_sub(10);
+                    }
+                    None
+                }
+                KeyCode::PageDown => {
+                    if let Some(m) = self.modal.plan_mut() {
+                        m.scroll = m.scroll.saturating_add(10);
+                    }
+                    None
+                }
+                _ => None,
+            };
+        }
+
+        if self.modal.permission().is_some() {
+            return match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.modal = Modal::None;
+                    Some(Action::PermissionResponse(PermissionDecision::AllowOnce))
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.modal = Modal::None;
+                    Some(Action::PermissionResponse(PermissionDecision::AllowSession))
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.modal = Modal::None;
+                    Some(Action::PermissionResponse(PermissionDecision::Deny))
+                }
+                KeyCode::Up => {
+                    if let Some(m) = self.modal.permission_mut() {
+                        m.scroll = m.scroll.saturating_sub(1);
+                    }
+                    None
+                }
+                KeyCode::Down => {
+                    if let Some(m) = self.modal.permission_mut() {
+                        m.scroll = m.scroll.saturating_add(1);
+                    }
+                    None
+                }
+                KeyCode::PageUp => {
+                    if let Some(m) = self.modal.permission_mut() {
+                        m.scroll = m.scroll.saturating_sub(10);
+                    }
+                    None
+                }
+                KeyCode::PageDown => {
+                    if let Some(m) = self.modal.permission_mut() {
+                        m.scroll = m.scroll.saturating_add(10);
+                    }
+                    None
+                }
+                _ => None,
+            };
+        }
+
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return Some(Action::Quit);
+        }
+
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('o') {
+            self.verbose_tools = !self.verbose_tools;
+            return None;
+        }
+
+        let slash_hints = self.slash_suggestions();
+        let slash_nav = !slash_hints.is_empty();
+
+        match code {
+            KeyCode::Esc if self.waiting_on_assistant => Some(Action::CancelGeneration),
+            KeyCode::Tab if slash_nav => {
+                if let Some(completed) =
+                    crate::slash::complete(&self.input.text(), Some(self.slash_selected))
+                {
+                    self.input.set(&completed);
+                    self.slash_selected = 0;
+                }
+                None
+            }
+            KeyCode::Up if slash_nav => {
+                self.slash_selected = self.slash_selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Down if slash_nav => {
+                let max = slash_hints.len().saturating_sub(1);
+                self.slash_selected = (self.slash_selected + 1).min(max);
+                None
+            }
+            // A newline in the prompt, not a submission. `Alt+Enter` and
+            // `Ctrl+J` work everywhere; `Shift+Enter` only reaches us on
+            // terminals that support the kitty keyboard protocol, since
+            // otherwise it arrives indistinguishable from a bare Enter.
+            KeyCode::Enter
+                if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                    && !self.waiting_on_assistant =>
+            {
+                self.input.insert_newline();
+                None
+            }
+            KeyCode::Char('j')
+                if modifiers.contains(KeyModifiers::CONTROL) && !self.waiting_on_assistant =>
+            {
+                self.input.insert_newline();
+                None
+            }
+            // Arrows walk the caret through a multi-line prompt first; they
+            // only fall through to scrolling the transcript once the caret is
+            // already at the top/bottom of the input — which is always the
+            // case for the single-row prompt this used to be.
+            KeyCode::Up if self.input.move_up() => None,
+            KeyCode::Down if self.input.move_down() => None,
+            KeyCode::Up => {
+                self.follow_bottom = false;
+                self.scroll = self.scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::Down => {
+                self.scroll = self.scroll.saturating_add(1);
+                None
+            }
+            KeyCode::PageUp => {
+                self.follow_bottom = false;
+                self.scroll = self.scroll.saturating_sub(10);
+                None
+            }
+            KeyCode::PageDown => {
+                self.scroll = self.scroll.saturating_add(10);
+                None
+            }
+            KeyCode::Enter => {
+                if self.input.text().trim().is_empty() || self.waiting_on_assistant {
+                    return None;
+                }
+                // If a slash suggestion is highlighted and input is still only
+                // a partial command, Tab-complete first instead of submitting.
+                if slash_nav && !self.input.text().contains(char::is_whitespace) {
+                    if let Some(completed) =
+                        crate::slash::complete(&self.input.text(), Some(self.slash_selected))
+                    {
+                        self.input.set(&completed);
+                        self.slash_selected = 0;
+                        return None;
+                    }
+                }
+                let text = self.input.take();
+                self.slash_selected = 0;
+
+                if let Some(command) = text.strip_prefix('/') {
+                    return self.run_slash_command(command.trim());
+                }
+
+                self.lines.push(ChatLine::new(ChatRole::User, text.clone()));
+                self.waiting_on_assistant = true;
+                self.phase = AgentPhase::Thinking;
+                self.in_flight_text = None;
+                self.turn_started_at = Some(Instant::now());
+                self.stream_started_at = None;
+                self.stream_output_chars = 0;
+                self.live_tokens_per_sec = None;
+                self.request_count += 1;
+                Some(Action::SubmitMessage(text))
+            }
+            // Everything else the transcript didn't claim is text editing:
+            // typing, Backspace/Delete, caret movement, word jumps,
+            // Ctrl+A/E/W/U. The editor reports whether it consumed the key.
+            other => {
+                if self.input.handle(other, modifiers) {
+                    self.slash_selected = 0;
+                }
+                None
+            }
+        }
+    }
+
+    fn submit_question_choice(&mut self, index: usize) -> Option<Action> {
+        let answer = self
+            .modal
+            .question()
+            .and_then(|m| m.question.options.get(index).cloned())?;
+        self.record_question_answer(&answer);
+        self.modal = Modal::None;
+        Some(Action::QuestionResponse(answer))
+    }
+
+    /// Leaves a permanent record of an `ask_user` exchange in the transcript
+    /// before the modal (which is otherwise the only place it's visible)
+    /// closes.
+    fn record_question_answer(&mut self, answer: &str) {
+        if let Some(modal) = self.modal.question() {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                format!("asked: {} — answered: {answer}", modal.question.prompt),
+            ));
+        }
+    }
+
+    fn run_slash_command(&mut self, command: &str) -> Option<Action> {
+        let mut parts = command.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("");
+        let args = parts.next().unwrap_or("").trim();
+
+        match name {
+            "clear" => {
+                self.lines.clear();
+                None
+            }
+            "help" | "" => {
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /help (this message)",
+                ));
+                None
+            }
+            "model" => self.run_model_command(args),
+            "permission" => self.run_permission_command(args),
+            "usage" => {
+                self.show_usage();
+                None
+            }
+            "plan" => self.run_plan_command(args),
+            "goal" => self.run_goal_command(args),
+            "loop" => self.run_loop_command(args),
+            other => {
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("unknown command: /{other}"),
+                ));
+                None
+            }
+        }
+    }
+
+    fn run_model_command(&mut self, args: &str) -> Option<Action> {
+        if args.is_empty() || args.eq_ignore_ascii_case("list") {
+            self.show_model_info();
+            return None;
+        }
+
+        let mut save = false;
+        let mut spec_tokens = Vec::new();
+        for token in args.split_whitespace() {
+            if token == "--save" {
+                save = true;
+            } else {
+                spec_tokens.push(token);
+            }
+        }
+
+        let Some(spec) = spec_tokens.first() else {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                "usage: /model <name> [--save]  or  /model <provider>/<name> [--save]",
+            ));
+            return None;
+        };
+
+        let (provider, model) = match spec.split_once('/') {
+            Some((p, m)) => {
+                if !smith_persist::is_known_provider(p) {
+                    self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        format!("unknown provider: {p} (expected anthropic, openai, or ollama)"),
+                    ));
+                    return None;
+                }
+                (Some(p.to_string()), m.to_string())
+            }
+            None => (None, spec.to_string()),
+        };
+
+        if model.is_empty() {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                "usage: /model <name> [--save]  or  /model <provider>/<name> [--save]",
+            ));
+            return None;
+        }
+
+        Some(Action::SwitchModel {
+            provider,
+            model,
+            save,
+        })
+    }
+
+    fn show_model_info(&mut self) {
+        self.lines.push(ChatLine::new(
+            ChatRole::System,
+            format!("current: {}/{}", self.provider_label, self.model_label),
+        ));
+        let known = smith_persist::known_models(&self.provider_label);
+        if !known.is_empty() {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                format!("known {} models: {}", self.provider_label, known.join(", ")),
+            ));
+        }
+        self.lines.push(ChatLine::new(
+            ChatRole::System,
+            "switch with /model <name>, or /model <provider>/<name>; add --save to persist",
+        ));
+    }
+
+    fn run_permission_command(&mut self, args: &str) -> Option<Action> {
+        if args.is_empty() {
+            self.show_permission_info();
+            return None;
+        }
+
+        let mut save = false;
+        let mut mode_tokens = Vec::new();
+        for token in args.split_whitespace() {
+            if token == "--save" {
+                save = true;
+            } else {
+                mode_tokens.push(token);
+            }
+        }
+
+        let Some(mode) = mode_tokens.first() else {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                "usage: /permission <ask|session|skip> [--save]",
+            ));
+            return None;
+        };
+
+        let Some(policy) = PermissionPolicy::parse(mode) else {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                format!("unknown mode: {mode} (expected ask, session, or skip)"),
+            ));
+            return None;
+        };
+
+        if policy == PermissionPolicy::Skip {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                "⚠ skip mode auto-allows every tool call, including shell commands, with no confirmation of any kind.",
+            ));
+        }
+
+        Some(Action::SetPermissionPolicy { policy, save })
+    }
+
+    fn show_permission_info(&mut self) {
+        self.lines.push(ChatLine::new(
+            ChatRole::System,
+            format!("current: {}", self.permission_policy.as_str()),
+        ));
+        self.lines.push(ChatLine::new(
+            ChatRole::System,
+            "modes: ask (always prompt, default), session (auto-allow file writes/edits, still prompts for shell/MCP tools), skip/yolo (auto-allow everything, no prompts)",
+        ));
+        self.lines.push(ChatLine::new(
+            ChatRole::System,
+            "switch with /permission <mode>; add --save to persist",
+        ));
+    }
+
+    fn show_usage(&mut self) {
+        let total_tokens = self.usage.input_tokens + self.usage.output_tokens;
+        self.lines.push(ChatLine::new(
+            ChatRole::System,
+            format!(
+                "requests: {}   tools invoked: {}",
+                self.request_count, self.tool_call_count
+            ),
+        ));
+        self.lines.push(ChatLine::new(
+            ChatRole::System,
+            format!(
+                "tokens: {} in / {} out ({total_tokens} total)",
+                self.usage.input_tokens, self.usage.output_tokens
+            ),
+        ));
+        match crate::pricing::estimate_cost_usd(
+            &self.provider_label,
+            &self.model_label,
+            &self.usage,
+        ) {
+            Some(cost) => {
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("estimated cost: ~${cost:.4} (est.)"),
+                ));
+            }
+            None => {
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!(
+                        "estimated cost: n/a (no pricing data for {}/{})",
+                        self.provider_label, self.model_label
+                    ),
+                ));
+            }
+        }
+    }
+
+    fn run_plan_command(&mut self, args: &str) -> Option<Action> {
+        match args {
+            "" => {
+                let status = if self.plan_gated {
+                    "awaiting approval — run /plan approve or /plan reject"
+                } else {
+                    "no plan pending"
+                };
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("plan status: {status}"),
+                ));
+                None
+            }
+            "approve" => {
+                if !self.plan_gated && !self.modal.is_plan() {
+                    self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        "no plan pending to approve",
+                    ));
+                    return None;
+                }
+                self.modal = Modal::None;
+                self.plan_gated = false;
+                self.waiting_on_assistant = true;
+                self.phase = AgentPhase::Building;
+                self.in_flight_text = None;
+                self.turn_started_at = Some(Instant::now());
+                self.request_count += 1;
+                self.lines
+                    .push(ChatLine::new(ChatRole::System, "plan approved — building…"));
+                Some(Action::ApprovePlan)
+            }
+            "reject" => {
+                if !self.plan_gated && !self.modal.is_plan() {
+                    self.lines
+                        .push(ChatLine::new(ChatRole::System, "no plan pending to reject"));
+                    return None;
+                }
+                self.modal = Modal::None;
+                self.plan_gated = false;
+                self.lines
+                    .push(ChatLine::new(ChatRole::System, "plan rejected"));
+                Some(Action::RejectPlan)
+            }
+            description => {
+                if self.waiting_on_assistant {
+                    self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        "still working on the previous request — wait for it to finish first",
+                    ));
+                    return None;
+                }
+                self.lines.push(ChatLine::new(
+                    ChatRole::User,
+                    format!("[plan] {description}"),
+                ));
+                self.waiting_on_assistant = true;
+                self.plan_turn_active = true;
+                self.phase = AgentPhase::Planning;
+                self.in_flight_text = None;
+                self.turn_started_at = Some(Instant::now());
+                self.request_count += 1;
+                Some(Action::StartPlan(description.to_string()))
+            }
+        }
+    }
+
+    fn run_goal_command(&mut self, args: &str) -> Option<Action> {
+        match args {
+            "" => {
+                match &self.goal {
+                    Some(goal) => self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        format!("current goal: {goal}"),
+                    )),
+                    None => self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        "no goal set — /goal <description> to set one, /goal clear to remove",
+                    )),
+                }
+                None
+            }
+            "clear" => {
+                if self.goal.is_none() {
+                    self.lines
+                        .push(ChatLine::new(ChatRole::System, "no goal set"));
+                    return None;
+                }
+                Some(Action::SetGoal(None))
+            }
+            description => Some(Action::SetGoal(Some(description.to_string()))),
+        }
+    }
+
+    fn run_loop_command(&mut self, args: &str) -> Option<Action> {
+        if args.is_empty() {
+            let status = match (self.loop_active, self.loop_progress) {
+                (true, Some((i, m))) => format!("loop running — iteration {i}/{m} (Esc to cancel)"),
+                (true, None) => "loop starting…".to_string(),
+                (false, _) => "no loop running — /loop [<N>] <task>|goal to start one".to_string(),
+            };
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                format!("loop status: {status}"),
+            ));
+            return None;
+        }
+
+        if self.waiting_on_assistant {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                "still working on the previous request — wait for it to finish first",
+            ));
+            return None;
+        }
+
+        let mut tokens = args.splitn(2, char::is_whitespace);
+        let first = tokens.next().unwrap_or("");
+        let (max_iterations, rest) = match first.parse::<u32>() {
+            Ok(n) => (Some(n), tokens.next().unwrap_or("").trim()),
+            Err(_) => (None, args),
+        };
+
+        if max_iterations == Some(0) {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                "iteration count must be at least 1",
+            ));
+            return None;
+        }
+
+        let prompt = if rest.eq_ignore_ascii_case("goal") {
+            match &self.goal {
+                Some(goal) => goal.clone(),
+                None => {
+                    self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        "no goal set — /goal <description> first, or give /loop an explicit task",
+                    ));
+                    return None;
+                }
+            }
+        } else if rest.is_empty() {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                "usage: /loop [<N>] <task>|goal",
+            ));
+            return None;
+        } else {
+            rest.to_string()
+        };
+
+        self.lines
+            .push(ChatLine::new(ChatRole::User, format!("[loop] {prompt}")));
+        self.waiting_on_assistant = true;
+        self.loop_active = true;
+        self.loop_progress = None;
+        self.phase = AgentPhase::Looping;
+        self.in_flight_text = None;
+        self.turn_started_at = Some(Instant::now());
+        self.request_count += 1;
+        Some(Action::StartLoop {
+            prompt,
+            max_iterations,
+        })
+    }
+
+    pub fn on_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::AssistantTextDelta(delta) => {
+                // First delta of a stream — end any in-flight thinking gap.
+                if self.stream_started_at.is_none() {
+                    self.end_thinking();
+                    self.stream_started_at = Some(Instant::now());
+                    self.stream_output_chars = 0;
+                }
+                self.stream_output_chars = self
+                    .stream_output_chars
+                    .saturating_add(delta.chars().count() as u32);
+                if let Some(started) = self.stream_started_at {
+                    let elapsed = started.elapsed().as_secs_f32().max(0.05);
+                    // Providers rarely stream mid-turn usage; ~4 chars/token is a
+                    // rough live estimate until TokenUsage arrives.
+                    let est_tokens = self.stream_output_chars as f32 / 4.0;
+                    self.live_tokens_per_sec = Some(est_tokens / elapsed);
+                }
+                self.in_flight_text
+                    .get_or_insert_with(String::new)
+                    .push_str(&delta);
+            }
+            AgentEvent::AssistantTurnComplete {
+                message,
+                stop_reason,
+            } => {
+                self.in_flight_text = None;
+                let is_final = stop_reason != StopReason::ToolUse;
+                let text = message.text();
+
+                if !text.is_empty() {
+                    let meta = if is_final {
+                        self.turn_started_at.map(|t| {
+                            let secs = t.elapsed().as_secs_f32();
+                            match self.tokens_per_sec {
+                                Some(rate) => format!(
+                                    "{} · {} · {:.1}s · {:.0} tok/s",
+                                    self.provider_label, self.model_label, secs, rate
+                                ),
+                                None => format!(
+                                    "{} · {} · {:.1}s",
+                                    self.provider_label, self.model_label, secs
+                                ),
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    let plan_text = text.clone();
+                    self.lines.push(ChatLine {
+                        role: ChatRole::Assistant,
+                        text: text.clone(),
+                        meta,
+                        tool_id: None,
+                        tool_status: None,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        tool_secs: None,
+                        started_at: None,
+                    });
+
+                    if is_final && self.plan_turn_active {
+                        self.plan_turn_active = false;
+                        self.phase = AgentPhase::Planning;
+                        self.modal = Modal::Plan(PlanModal {
+                            text: plan_text,
+                            scroll: 0,
+                        });
+                    } else if is_final
+                        && matches!(self.phase, AgentPhase::Building)
+                        && looks_like_approval_request(&text)
+                    {
+                        self.lines.push(ChatLine::new(
+                            ChatRole::System,
+                            "hint: the plan is already approved — call tools to implement it (do not ask for approval in chat)",
+                        ));
+                    }
+                } else if is_final {
+                    // The model replied with neither text nor a tool call —
+                    // without this, the turn just silently drops back to
+                    // idle and it looks like the app hung.
+                    self.plan_turn_active = false;
+                    let hint = if self.plan_gated {
+                        "model returned no output for this turn — plan mode is still active; run /plan reject to exit, or try again"
+                    } else {
+                        "model returned no output for this turn"
+                    };
+                    self.lines.push(ChatLine::new(ChatRole::System, hint));
+                }
+
+                if is_final {
+                    self.stream_started_at = None;
+                    self.stream_output_chars = 0;
+                    self.live_tokens_per_sec = None;
+                    if self.loop_active {
+                        // Stay busy across iterations — LoopFinished resets
+                        // waiting_on_assistant/phase once the whole run ends,
+                        // so Esc keeps working in the gap between rounds.
+                    } else {
+                        self.waiting_on_assistant = false;
+                        self.turn_started_at = None;
+                        if self.modal.is_none() {
+                            self.phase = AgentPhase::Idle;
+                        }
+                    }
+                } else {
+                    // Next provider round starts a fresh stream clock.
+                    self.stream_started_at = None;
+                    self.stream_output_chars = 0;
+                    self.live_tokens_per_sec = None;
+                    // Model is about to call tools — start thinking timer.
+                    self.begin_thinking();
+                }
+            }
+            AgentEvent::ToolCallStarted {
+                id,
+                tool_name,
+                input,
+            } => {
+                let label = activity_label(&tool_name, &input);
+                // ask_user gets its own modal + transcript record (see
+                // record_question_answer); write_tasks gets the dedicated
+                // checklist panel — neither needs the generic tool-call line.
+                if tool_name != "ask_user" && tool_name != "write_tasks" {
+                    self.phase = AgentPhase::Working;
+                    // Permanent transcript record — the tool card replaces
+                    // the old activity strip, so this line is all we need.
+                    self.lines
+                        .push(ChatLine::tool(id.clone(), tool_name.clone(), label, input));
+                }
+                // End any in-flight thinking gap — the model is acting now.
+                self.end_thinking();
+                self.tool_call_count += 1;
+            }
+            AgentEvent::ToolCallResult {
+                id,
+                output,
+                is_error,
+            } => {
+                if let Some(line) = self
+                    .lines
+                    .iter_mut()
+                    .find(|l| l.tool_id.as_deref() == Some(id.as_str()))
+                {
+                    line.tool_status = Some(if is_error {
+                        ActivityStatus::Error
+                    } else {
+                        ActivityStatus::Done
+                    });
+                    line.tool_output = Some(output.clone());
+                    if let Some(started) = line.started_at {
+                        line.tool_secs = Some(started.elapsed().as_secs_f32());
+                    }
+                    // Drop the started_at now that the call is done — nothing
+                    // reads it after this point.
+                    line.started_at = None;
+                }
+                // Model starts thinking again after a result.
+                self.begin_thinking();
+            }
+            AgentEvent::PermissionPromptNeeded(request) => {
+                self.phase = AgentPhase::WaitingPermission;
+                self.modal = Modal::Permission(PermissionModal { request, scroll: 0 });
+            }
+            AgentEvent::UserQuestionNeeded(question) => {
+                self.phase = AgentPhase::Asking;
+                self.modal = Modal::Question(QuestionModal {
+                    question,
+                    selected: 0,
+                    custom: String::new(),
+                });
+            }
+            AgentEvent::PhaseChanged(phase) => {
+                // Don't clobber Asking/WaitingPermission while a modal is open.
+                if self.modal.is_question() && phase != AgentPhase::Asking {
+                    // keep Asking
+                } else if self.modal.permission().is_some()
+                    && phase != AgentPhase::WaitingPermission
+                {
+                    // keep WaitingPermission
+                } else if self.modal.is_plan() && phase == AgentPhase::Idle {
+                    self.phase = AgentPhase::Planning;
+                } else if matches!(self.phase, AgentPhase::Building)
+                    && matches!(phase, AgentPhase::Thinking)
+                {
+                    // Keep "building…" chrome during the post-approve model round.
+                } else if matches!(self.phase, AgentPhase::Planning)
+                    && matches!(phase, AgentPhase::Thinking)
+                    && (self.plan_turn_active || self.plan_gated)
+                {
+                    // Keep "planning…" during a /plan turn.
+                } else if self.loop_active
+                    && matches!(phase, AgentPhase::Thinking | AgentPhase::Idle)
+                {
+                    // Keep "looping…" chrome between/within iterations; Working
+                    // (tool calls) and permission/question phases still show
+                    // through normally.
+                } else {
+                    self.phase = phase;
+                }
+            }
+            AgentEvent::TokenUsage(usage) => {
+                self.usage.input_tokens += usage.input_tokens;
+                self.usage.output_tokens += usage.output_tokens;
+                if usage.output_tokens > 0 {
+                    let started = self.stream_started_at.or(self.turn_started_at);
+                    if let Some(started) = started {
+                        let elapsed = started.elapsed().as_secs_f32().max(0.05);
+                        self.tokens_per_sec = Some(usage.output_tokens as f32 / elapsed);
+                    }
+                }
+            }
+            AgentEvent::ResourceUsage(stats) => {
+                self.resources = Some(stats);
+            }
+            AgentEvent::PlanGateChanged { gated } => {
+                // The command that triggered this (`/plan <task>` sets it,
+                // `/plan approve`/`/plan reject` clear it) already pushed its
+                // own confirmation line locally — this just keeps state in
+                // sync with the orchestrator's authoritative Agent.
+                self.plan_gated = gated;
+            }
+            AgentEvent::GoalChanged(goal) => {
+                self.goal = goal.clone();
+                match goal {
+                    Some(text) => self
+                        .lines
+                        .push(ChatLine::new(ChatRole::System, format!("goal set: {text}"))),
+                    None => self
+                        .lines
+                        .push(ChatLine::new(ChatRole::System, "goal cleared")),
+                }
+            }
+            AgentEvent::LoopIterationStarted {
+                iteration,
+                max_iterations,
+            } => {
+                self.loop_progress = Some((iteration, max_iterations));
+                self.phase = AgentPhase::Looping;
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("— loop iteration {iteration}/{max_iterations} —"),
+                ));
+            }
+            AgentEvent::LoopFinished { reason, iterations } => {
+                self.loop_active = false;
+                self.loop_progress = None;
+                self.waiting_on_assistant = false;
+                self.turn_started_at = None;
+                self.stream_started_at = None;
+                self.stream_output_chars = 0;
+                self.live_tokens_per_sec = None;
+                if self.modal.is_none() {
+                    self.phase = AgentPhase::Idle;
+                }
+                let summary = match reason {
+                    smith_core::LoopStopReason::Done => {
+                        format!(
+                            "loop finished — agent declared done after {iterations} iteration(s)"
+                        )
+                    }
+                    smith_core::LoopStopReason::MaxIterations => {
+                        format!("loop stopped — reached the iteration limit ({iterations})")
+                    }
+                    smith_core::LoopStopReason::Cancelled => {
+                        format!("loop cancelled after {iterations} iteration(s)")
+                    }
+                    smith_core::LoopStopReason::Failed => {
+                        format!("loop stopped — a turn failed after {iterations} iteration(s) (see the error above)")
+                    }
+                };
+                self.lines.push(ChatLine::new(ChatRole::System, summary));
+            }
+            AgentEvent::TasksUpdated(tasks) => {
+                self.tasks = tasks;
+            }
+            AgentEvent::ModelChanged {
+                provider,
+                model,
+                saved,
+            } => {
+                if provider != self.provider_label {
+                    // Stale local-machine stats from the old provider would
+                    // otherwise linger in the sidebar after switching away
+                    // from Ollama.
+                    self.resources = None;
+                }
+                self.provider_label = provider.clone();
+                self.model_label = model.clone();
+                let suffix = if saved { " (saved as default)" } else { "" };
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("switched to {provider}/{model}{suffix}"),
+                ));
+            }
+            AgentEvent::PermissionPolicyChanged { policy, saved } => {
+                self.permission_policy = policy;
+                let suffix = if saved { " (saved as default)" } else { "" };
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("permission mode: {}{suffix}", policy.as_str()),
+                ));
+            }
+            AgentEvent::Error(err) => {
+                self.waiting_on_assistant = false;
+                self.in_flight_text = None;
+                self.turn_started_at = None;
+                self.stream_started_at = None;
+                self.stream_output_chars = 0;
+                self.live_tokens_per_sec = None;
+                self.plan_turn_active = false;
+                self.phase = AgentPhase::Idle;
+                // Don't leave any in-flight tool line spinning forever in
+                // the transcript if the turn errored out mid-call.
+                for line in self.lines.iter_mut() {
+                    if line.tool_status == Some(ActivityStatus::Running) {
+                        line.tool_status = Some(ActivityStatus::Error);
+                    }
+                }
+                self.lines
+                    .push(ChatLine::new(ChatRole::System, format!("error: {err}")));
+            }
+        }
+    }
+}
+
+/// Short, human-readable summary of what a tool call is doing, for the
+/// activity widget — e.g. "Reading src/main.rs" rather than a raw JSON blob.
+fn activity_label(tool_name: &str, input: &serde_json::Value) -> String {
+    let field = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or_default();
+    let label = match tool_name {
+        "read_file" => format!("Reading {}", field("path")),
+        "write_file" => format!("Writing {}", field("path")),
+        "edit_file" => format!("Editing {}", field("path")),
+        "list_dir" => format!("Listing {}", field("path")),
+        "glob" => format!("Searching {}", field("pattern")),
+        "run_bash" => format!("Running {}", field("command")),
+        "write_tasks" => "Updating task list".to_string(),
+        "web_search" => format!("Searching \"{}\"", field("query")),
+        other => format!("Calling {other}"),
+    };
+    truncate(&label, MAX_LABEL_CHARS)
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn looks_like_approval_request(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("aprovar")
+        || lower.contains("approve the plan")
+        || lower.contains("approval")
+        || lower.contains("/plan approve")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smith_core::TaskStatus;
+
+    fn test_app() -> App {
+        App::new(TuiConfig {
+            banner: String::new(),
+            provider_label: "anthropic".to_string(),
+            model_label: "claude-sonnet-5".to_string(),
+            cwd_display: "~/proj".to_string(),
+            git_branch: None,
+            idle_hint: IdleHint::Tip("test".to_string()),
+            initial_lines: Vec::new(),
+            permission_policy: PermissionPolicy::default(),
+            goal: None,
+            tasks: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn model_with_no_args_shows_info_and_emits_no_action() {
+        let mut app = test_app();
+        let action = app.run_slash_command("model");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("current: anthropic/claude-sonnet-5")));
+    }
+
+    #[test]
+    fn model_with_name_switches_within_current_provider() {
+        let mut app = test_app();
+        let action = app.run_slash_command("model claude-haiku-4-5");
+        match action {
+            Some(Action::SwitchModel {
+                provider,
+                model,
+                save,
+            }) => {
+                assert_eq!(provider, None);
+                assert_eq!(model, "claude-haiku-4-5");
+                assert!(!save);
+            }
+            other => panic!("expected SwitchModel action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_with_provider_prefix_switches_provider_too() {
+        let mut app = test_app();
+        let action = app.run_slash_command("model ollama/qwen2.5");
+        match action {
+            Some(Action::SwitchModel {
+                provider,
+                model,
+                save,
+            }) => {
+                assert_eq!(provider.as_deref(), Some("ollama"));
+                assert_eq!(model, "qwen2.5");
+                assert!(!save);
+            }
+            other => panic!("expected SwitchModel action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_save_flag_is_parsed_regardless_of_position() {
+        let mut app = test_app();
+        let action = app.run_slash_command("model --save claude-opus-5");
+        match action {
+            Some(Action::SwitchModel { save, .. }) => assert!(save),
+            other => panic!("expected SwitchModel action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_with_unknown_provider_is_rejected_locally() {
+        let mut app = test_app();
+        let action = app.run_slash_command("model made-up-provider/x");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("unknown provider")));
+    }
+
+    #[test]
+    fn unknown_slash_command_reports_itself() {
+        let mut app = test_app();
+        let action = app.run_slash_command("bogus");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("unknown command: /bogus")));
+    }
+
+    #[test]
+    fn model_changed_event_updates_labels_and_clears_stale_resources() {
+        let mut app = test_app();
+        app.resources = Some(ResourceStats::default());
+        app.on_agent_event(AgentEvent::ModelChanged {
+            provider: "ollama".to_string(),
+            model: "qwen2.5".to_string(),
+            saved: true,
+        });
+        assert_eq!(app.provider_label, "ollama");
+        assert_eq!(app.model_label, "qwen2.5");
+        assert!(app.resources.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("switched to ollama/qwen2.5")
+                && l.text.contains("saved as default")));
+    }
+
+    #[test]
+    fn token_usage_sets_tokens_per_sec_and_meta_includes_it() {
+        let mut app = test_app();
+        app.waiting_on_assistant = true;
+        app.turn_started_at = Some(Instant::now() - std::time::Duration::from_secs(2));
+        app.stream_started_at = Some(Instant::now() - std::time::Duration::from_secs(2));
+
+        app.on_agent_event(AgentEvent::AssistantTextDelta("hello ".into()));
+        assert!(app.live_tokens_per_sec.is_some());
+        assert!(app.display_tokens_per_sec().is_some());
+
+        app.on_agent_event(AgentEvent::TokenUsage(Usage {
+            input_tokens: 10,
+            output_tokens: 100,
+        }));
+        let rate = app.tokens_per_sec.expect("measured rate");
+        assert!(rate > 0.0);
+
+        app.on_agent_event(AgentEvent::AssistantTurnComplete {
+            message: smith_core::Message::assistant(vec![smith_core::ContentBlock::Text {
+                text: "hello world".into(),
+            }]),
+            stop_reason: StopReason::EndTurn,
+        });
+        assert!(app.live_tokens_per_sec.is_none());
+        assert_eq!(app.display_tokens_per_sec(), Some(rate));
+        let meta = app
+            .lines
+            .last()
+            .and_then(|l| l.meta.as_deref())
+            .unwrap_or("");
+        assert!(meta.contains("tok/s"), "meta was: {meta}");
+    }
+
+    #[test]
+    fn permission_with_no_args_shows_current_mode() {
+        let mut app = test_app();
+        let action = app.run_slash_command("permission");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("current: ask")));
+    }
+
+    #[test]
+    fn permission_session_switches_without_warning() {
+        let mut app = test_app();
+        let action = app.run_slash_command("permission session");
+        match action {
+            Some(Action::SetPermissionPolicy { policy, save }) => {
+                assert_eq!(policy, PermissionPolicy::Session);
+                assert!(!save);
+            }
+            other => panic!("expected SetPermissionPolicy action, got {other:?}"),
+        }
+        assert!(!app.lines.iter().any(|l| l.text.contains("⚠")));
+    }
+
+    #[test]
+    fn permission_skip_switches_with_risk_warning() {
+        let mut app = test_app();
+        let action = app.run_slash_command("permission skip --save");
+        match action {
+            Some(Action::SetPermissionPolicy { policy, save }) => {
+                assert_eq!(policy, PermissionPolicy::Skip);
+                assert!(save);
+            }
+            other => panic!("expected SetPermissionPolicy action, got {other:?}"),
+        }
+        assert!(app.lines.iter().any(|l| l.text.contains("⚠")));
+    }
+
+    #[test]
+    fn permission_yolo_is_an_alias_for_skip() {
+        let mut app = test_app();
+        let action = app.run_slash_command("permission yolo");
+        assert!(matches!(
+            action,
+            Some(Action::SetPermissionPolicy {
+                policy: PermissionPolicy::Skip,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn permission_with_unknown_mode_is_rejected_locally() {
+        let mut app = test_app();
+        let action = app.run_slash_command("permission chaos");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("unknown mode")));
+    }
+
+    #[test]
+    fn permission_policy_changed_event_updates_state() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::PermissionPolicyChanged {
+            policy: PermissionPolicy::Skip,
+            saved: false,
+        });
+        assert_eq!(app.permission_policy, PermissionPolicy::Skip);
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("permission mode: skip")));
+    }
+
+    #[test]
+    fn usage_reports_requests_tools_and_tokens() {
+        let mut app = test_app();
+        app.request_count = 2;
+        app.tool_call_count = 3;
+        app.usage.input_tokens = 1000;
+        app.usage.output_tokens = 500;
+
+        let action = app.run_slash_command("usage");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("requests: 2") && l.text.contains("tools invoked: 3")));
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("1000 in / 500 out (1500 total)")));
+    }
+
+    #[test]
+    fn usage_shows_cost_estimate_for_known_model() {
+        let mut app = test_app(); // anthropic/claude-sonnet-5, has pricing data
+        app.usage.input_tokens = 1_000_000;
+        app.usage.output_tokens = 1_000_000;
+        app.run_slash_command("usage");
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.starts_with("estimated cost: ~$")));
+    }
+
+    #[test]
+    fn usage_shows_na_for_unknown_pricing() {
+        let mut app = test_app();
+        app.provider_label = "ollama".to_string();
+        app.model_label = "qwen2.5".to_string();
+        app.run_slash_command("usage");
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("estimated cost: n/a")));
+    }
+
+    #[test]
+    fn submitting_a_message_increments_request_count() {
+        let mut app = test_app();
+        for c in "hi".chars() {
+            app.on_key(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            );
+        }
+        app.on_key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(app.request_count, 1);
+    }
+
+    #[test]
+    fn plan_with_description_starts_plan_and_sets_waiting() {
+        let mut app = test_app();
+        let action = app.run_slash_command("plan add a login page");
+        assert!(matches!(action, Some(Action::StartPlan(ref d)) if d == "add a login page"));
+        assert!(app.waiting_on_assistant);
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("[plan] add a login page")));
+    }
+
+    #[test]
+    fn plan_with_no_args_reports_status() {
+        let mut app = test_app();
+        let action = app.run_slash_command("plan");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("no plan pending")));
+    }
+
+    #[test]
+    fn plan_approve_without_pending_plan_is_a_no_op() {
+        let mut app = test_app();
+        let action = app.run_slash_command("plan approve");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("no plan pending to approve")));
+    }
+
+    #[test]
+    fn plan_approve_with_pending_plan_emits_action_and_clears_locally() {
+        let mut app = test_app();
+        app.plan_gated = true;
+        let action = app.run_slash_command("plan approve");
+        assert!(matches!(action, Some(Action::ApprovePlan)));
+        assert!(app.lines.iter().any(|l| l.text.contains("plan approved")));
+        assert!(app.waiting_on_assistant);
+        assert!(!app.plan_gated);
+    }
+
+    #[test]
+    fn plan_turn_complete_opens_confirm_modal() {
+        let mut app = test_app();
+        app.plan_turn_active = true;
+        app.plan_gated = true;
+        app.waiting_on_assistant = true;
+        app.on_agent_event(AgentEvent::AssistantTurnComplete {
+            message: smith_core::Message::assistant(vec![smith_core::ContentBlock::Text {
+                text: "1. Do the thing\n2. Ship it".into(),
+            }]),
+            stop_reason: StopReason::EndTurn,
+        });
+        let modal = app.modal.plan().expect("plan modal");
+        assert!(modal.text.contains("Do the thing"));
+        assert!(!app.plan_turn_active);
+        assert!(!app.waiting_on_assistant);
+    }
+
+    #[test]
+    fn empty_turn_reports_no_output_instead_of_going_silent() {
+        let mut app = test_app();
+        app.waiting_on_assistant = true;
+        app.on_agent_event(AgentEvent::AssistantTurnComplete {
+            message: smith_core::Message::assistant(vec![]),
+            stop_reason: StopReason::EndTurn,
+        });
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("no output for this turn")));
+        assert!(!app.waiting_on_assistant);
+    }
+
+    #[test]
+    fn empty_turn_while_plan_gated_hints_at_plan_reject() {
+        let mut app = test_app();
+        app.plan_turn_active = true;
+        app.plan_gated = true;
+        app.waiting_on_assistant = true;
+        app.on_agent_event(AgentEvent::AssistantTurnComplete {
+            message: smith_core::Message::assistant(vec![]),
+            stop_reason: StopReason::EndTurn,
+        });
+        assert!(!app.plan_turn_active);
+        assert!(app.lines.iter().any(|l| l.text.contains("/plan reject")));
+    }
+
+    #[test]
+    fn tool_call_leaves_a_permanent_transcript_line_that_updates_on_result() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "read_file".into(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+        });
+        let line = app
+            .lines
+            .iter()
+            .find(|l| l.tool_id.as_deref() == Some("call_1"))
+            .expect("tool line pushed to transcript");
+        assert_eq!(line.tool_status, Some(ActivityStatus::Running));
+        assert!(line.text.contains("src/main.rs"));
+
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: "call_1".into(),
+            output: "ok".into(),
+            is_error: false,
+        });
+        let line = app
+            .lines
+            .iter()
+            .find(|l| l.tool_id.as_deref() == Some("call_1"))
+            .unwrap();
+        assert_eq!(line.tool_status, Some(ActivityStatus::Done));
+        assert_eq!(line.tool_output.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn failed_tool_call_appends_error_snippet_to_its_transcript_line() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "run_bash".into(),
+            input: serde_json::json!({"command": "cargo test"}),
+        });
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: "call_1".into(),
+            output: "permission denied".into(),
+            is_error: true,
+        });
+        let line = app
+            .lines
+            .iter()
+            .find(|l| l.tool_id.as_deref() == Some("call_1"))
+            .unwrap();
+        assert_eq!(line.tool_status, Some(ActivityStatus::Error));
+        assert!(line
+            .tool_output
+            .as_deref()
+            .unwrap()
+            .contains("permission denied"));
+    }
+
+    #[test]
+    fn thought_row_emitted_when_gap_exceeds_threshold() {
+        let mut app = test_app();
+        app.thinking_since = Some(Instant::now() - std::time::Duration::from_secs(2));
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "read_file".into(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+        });
+        assert!(app.lines.iter().any(|l| l.role == ChatRole::Thought));
+    }
+
+    #[test]
+    fn short_gap_does_not_emit_thought_row() {
+        let mut app = test_app();
+        app.thinking_since = Some(Instant::now());
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "read_file".into(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+        });
+        assert!(app.lines.iter().all(|l| l.role != ChatRole::Thought));
+        // The gap timer is consumed and restarted so the next activity
+        // measures a fresh window.
+        assert!(app.thinking_since.is_none());
+    }
+
+    #[test]
+    fn tool_result_restarts_the_thinking_gap() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "read_file".into(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+        });
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: "call_1".into(),
+            output: "ok".into(),
+            is_error: false,
+        });
+        assert!(app.thinking_since.is_some());
+    }
+
+    #[test]
+    fn ctrl_o_toggles_verbose_tools() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = test_app();
+        assert!(!app.verbose_tools);
+        let action = app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(action.is_none());
+        assert!(app.verbose_tools);
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(!app.verbose_tools);
+    }
+
+    #[test]
+    fn format_thought_uses_ms_below_one_second() {
+        assert_eq!(format_thought(0.959), "959ms");
+        assert_eq!(format_thought(1.234), "1.2s");
+    }
+
+    #[test]
+    fn ask_user_does_not_get_a_transcript_tool_line() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "ask_user".into(),
+            input: serde_json::json!({}),
+        });
+        assert!(app.lines.iter().all(|l| l.role != ChatRole::Tool));
+    }
+
+    #[test]
+    fn write_tasks_does_not_get_a_transcript_tool_line() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "write_tasks".into(),
+            input: serde_json::json!({"tasks": []}),
+        });
+        assert!(app.lines.iter().all(|l| l.role != ChatRole::Tool));
+    }
+
+    #[test]
+    fn tasks_updated_event_replaces_the_checklist() {
+        let mut app = test_app();
+        assert!(app.tasks.is_empty());
+        app.on_agent_event(AgentEvent::TasksUpdated(vec![
+            Task {
+                content: "one".into(),
+                status: TaskStatus::Completed,
+            },
+            Task {
+                content: "two".into(),
+                status: TaskStatus::InProgress,
+            },
+        ]));
+        assert_eq!(app.tasks.len(), 2);
+        assert_eq!(app.tasks[1].content, "two");
+
+        app.on_agent_event(AgentEvent::TasksUpdated(vec![]));
+        assert!(app.tasks.is_empty());
+    }
+
+    #[test]
+    fn plan_modal_y_approves_and_starts_build() {
+        let mut app = test_app();
+        app.modal = Modal::Plan(crate::app::PlanModal {
+            text: "step 1".into(),
+            scroll: 0,
+        });
+        app.plan_gated = true;
+        let action = app.on_key(
+            crossterm::event::KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(matches!(action, Some(Action::ApprovePlan)));
+        assert!(app.modal.is_none());
+        assert!(app.waiting_on_assistant);
+    }
+
+    #[test]
+    fn slash_tab_completes_partial_command() {
+        let mut app = test_app();
+        app.input.set("/pl");
+        let action = app.on_key(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(action.is_none());
+        assert_eq!(app.input.text(), "/plan ");
+    }
+
+    #[test]
+    fn typing_past_the_box_width_keeps_every_character() {
+        // The old `Paragraph` had no wrap and no scroll, so anything past the
+        // box width was silently clipped and looked lost.
+        let mut app = test_app();
+        for c in "a".repeat(300).chars() {
+            app.on_key(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::NONE,
+            );
+        }
+        assert_eq!(app.input.text().chars().count(), 300);
+    }
+
+    #[test]
+    fn caret_keys_edit_the_prompt_instead_of_scrolling_the_transcript() {
+        let mut app = test_app();
+        app.input.set("helo");
+        app.scroll = 5;
+        app.on_key(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.on_key(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(app.input.text(), "hello");
+        assert_eq!(app.scroll, 5, "Left must not touch the message pane");
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_instead_of_submitting() {
+        let mut app = test_app();
+        app.input.set("first");
+        let action = app.on_key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::ALT,
+        );
+        assert!(action.is_none(), "Alt+Enter must not submit");
+        assert!(!app.waiting_on_assistant);
+        assert_eq!(app.input.text(), "first\n");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_a_newline_for_terminals_without_shift_enter() {
+        let mut app = test_app();
+        app.input.set("first");
+        let action = app.on_key(
+            crossterm::event::KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert!(action.is_none());
+        assert_eq!(app.input.text(), "first\n");
+    }
+
+    #[test]
+    fn bare_enter_still_submits_a_multi_line_prompt() {
+        let mut app = test_app();
+        app.input.set("first");
+        app.on_key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::ALT,
+        );
+        app.input.insert_str("second");
+        let action = app.on_key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(matches!(action, Some(Action::SubmitMessage(t)) if t == "first\nsecond"));
+    }
+
+    #[test]
+    fn arrows_still_scroll_the_transcript_when_the_prompt_is_one_row() {
+        // Regression guard: Up/Down are shared between the caret and the
+        // message pane, and the pane must keep them for the common case.
+        let mut app = test_app();
+        app.scroll = 5;
+        app.on_key(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(app.scroll, 4);
+        assert!(!app.follow_bottom);
+        app.on_key(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(app.scroll, 5);
+    }
+
+    #[test]
+    fn arrows_walk_a_multi_line_prompt_before_reaching_the_transcript() {
+        let mut app = test_app();
+        app.input.set("one");
+        app.input.insert_newline();
+        app.input.insert_str("two");
+        app.scroll = 5;
+
+        app.on_key(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(app.scroll, 5, "caret moved, pane untouched");
+
+        // Caret is on the first row now, so the next Up belongs to the pane.
+        app.on_key(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(app.scroll, 4);
+    }
+
+    #[test]
+    fn paste_keeps_newlines_instead_of_submitting_at_the_first_one() {
+        let mut app = test_app();
+        app.on_paste("line one\nline two");
+        assert_eq!(app.input.text(), "line one\nline two");
+        assert!(!app.waiting_on_assistant, "paste must never submit");
+    }
+
+    #[test]
+    fn plan_reject_with_pending_plan_emits_action() {
+        let mut app = test_app();
+        app.plan_gated = true;
+        let action = app.run_slash_command("plan reject");
+        assert!(matches!(action, Some(Action::RejectPlan)));
+        assert!(app.lines.iter().any(|l| l.text.contains("plan rejected")));
+    }
+
+    #[test]
+    fn plan_gate_changed_event_syncs_state() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::PlanGateChanged { gated: true });
+        assert!(app.plan_gated);
+        app.on_agent_event(AgentEvent::PlanGateChanged { gated: false });
+        assert!(!app.plan_gated);
+    }
+
+    #[test]
+    fn cannot_start_a_new_plan_while_a_turn_is_in_flight() {
+        let mut app = test_app();
+        app.waiting_on_assistant = true;
+        let action = app.run_slash_command("plan add a login page");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("still working on the previous request")));
+    }
+
+    #[test]
+    fn goal_with_no_args_reports_none_when_unset() {
+        let mut app = test_app();
+        let action = app.run_slash_command("goal");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("no goal set")));
+    }
+
+    #[test]
+    fn goal_with_no_args_shows_current_when_set() {
+        let mut app = test_app();
+        app.goal = Some("ship the login page".to_string());
+        let action = app.run_slash_command("goal");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("current goal: ship the login page")));
+    }
+
+    #[test]
+    fn goal_with_description_emits_set_action() {
+        let mut app = test_app();
+        let action = app.run_slash_command("goal ship the login page");
+        assert!(matches!(
+            action,
+            Some(Action::SetGoal(Some(ref g))) if g == "ship the login page"
+        ));
+    }
+
+    #[test]
+    fn goal_clear_without_goal_is_a_no_op() {
+        let mut app = test_app();
+        let action = app.run_slash_command("goal clear");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("no goal set")));
+    }
+
+    #[test]
+    fn goal_clear_with_goal_emits_clear_action() {
+        let mut app = test_app();
+        app.goal = Some("ship the login page".to_string());
+        let action = app.run_slash_command("goal clear");
+        assert!(matches!(action, Some(Action::SetGoal(None))));
+    }
+
+    #[test]
+    fn goal_changed_event_syncs_state_and_transcript() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::GoalChanged(Some(
+            "ship the login page".to_string(),
+        )));
+        assert_eq!(app.goal.as_deref(), Some("ship the login page"));
+        assert!(app.lines.iter().any(|l| l.text.contains("goal set:")));
+
+        app.on_agent_event(AgentEvent::GoalChanged(None));
+        assert!(app.goal.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("goal cleared")));
+    }
+
+    #[test]
+    fn loop_with_no_args_reports_not_running() {
+        let mut app = test_app();
+        let action = app.run_slash_command("loop");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("no loop running")));
+    }
+
+    #[test]
+    fn loop_with_no_args_shows_progress_when_active() {
+        let mut app = test_app();
+        app.loop_active = true;
+        app.loop_progress = Some((3, 25));
+        let action = app.run_slash_command("loop");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("iteration 3/25")));
+    }
+
+    #[test]
+    fn loop_with_task_emits_start_loop_with_default_cap() {
+        let mut app = test_app();
+        let action = app.run_slash_command("loop fix the flaky test");
+        match action {
+            Some(Action::StartLoop {
+                prompt,
+                max_iterations,
+            }) => {
+                assert_eq!(prompt, "fix the flaky test");
+                assert_eq!(max_iterations, None);
+            }
+            other => panic!("expected StartLoop action, got {other:?}"),
+        }
+        assert!(app.waiting_on_assistant);
+        assert!(app.loop_active);
+        assert!(matches!(app.phase, AgentPhase::Looping));
+    }
+
+    #[test]
+    fn loop_with_iteration_count_parses_n_and_task() {
+        let mut app = test_app();
+        let action = app.run_slash_command("loop 5 fix the flaky test");
+        match action {
+            Some(Action::StartLoop {
+                prompt,
+                max_iterations,
+            }) => {
+                assert_eq!(prompt, "fix the flaky test");
+                assert_eq!(max_iterations, Some(5));
+            }
+            other => panic!("expected StartLoop action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_goal_keyword_resolves_active_goal() {
+        let mut app = test_app();
+        app.goal = Some("ship the login page".to_string());
+        let action = app.run_slash_command("loop goal");
+        match action {
+            Some(Action::StartLoop { prompt, .. }) => {
+                assert_eq!(prompt, "ship the login page");
+            }
+            other => panic!("expected StartLoop action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_goal_keyword_without_goal_set_is_rejected_locally() {
+        let mut app = test_app();
+        let action = app.run_slash_command("loop goal");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("no goal set")));
+    }
+
+    #[test]
+    fn loop_zero_iterations_is_rejected_locally() {
+        let mut app = test_app();
+        let action = app.run_slash_command("loop 0 do something");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("must be at least 1")));
+    }
+
+    #[test]
+    fn loop_with_no_task_after_count_is_rejected_locally() {
+        let mut app = test_app();
+        let action = app.run_slash_command("loop 5");
+        assert!(action.is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("usage: /loop")));
+    }
+
+    #[test]
+    fn cannot_start_a_loop_while_a_turn_is_in_flight() {
+        let mut app = test_app();
+        app.waiting_on_assistant = true;
+        let action = app.run_slash_command("loop do something");
+        assert!(action.is_none());
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("still working on the previous request")));
+    }
+
+    #[test]
+    fn loop_iteration_started_updates_progress_and_transcript() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::LoopIterationStarted {
+            iteration: 2,
+            max_iterations: 25,
+        });
+        assert_eq!(app.loop_progress, Some((2, 25)));
+        assert!(matches!(app.phase, AgentPhase::Looping));
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("loop iteration 2/25")));
+    }
+
+    #[test]
+    fn assistant_turn_complete_mid_loop_does_not_reset_waiting_flag() {
+        let mut app = test_app();
+        app.loop_active = true;
+        app.waiting_on_assistant = true;
+        app.phase = AgentPhase::Looping;
+        app.on_agent_event(AgentEvent::AssistantTurnComplete {
+            message: smith_core::Message::assistant(vec![smith_core::ContentBlock::Text {
+                text: "iteration one done".to_string(),
+            }]),
+            stop_reason: StopReason::EndTurn,
+        });
+        assert!(app.waiting_on_assistant);
+        assert!(matches!(app.phase, AgentPhase::Looping));
+    }
+
+    #[test]
+    fn loop_finished_done_resets_state_and_reports_iterations() {
+        let mut app = test_app();
+        app.loop_active = true;
+        app.waiting_on_assistant = true;
+        app.loop_progress = Some((3, 25));
+        app.phase = AgentPhase::Looping;
+        app.on_agent_event(AgentEvent::LoopFinished {
+            reason: smith_core::LoopStopReason::Done,
+            iterations: 3,
+        });
+        assert!(!app.loop_active);
+        assert!(app.loop_progress.is_none());
+        assert!(!app.waiting_on_assistant);
+        assert!(matches!(app.phase, AgentPhase::Idle));
+        assert!(app
+            .lines
+            .iter()
+            .any(|l| l.text.contains("loop finished") && l.text.contains("3")));
+    }
+
+    #[test]
+    fn loop_finished_cancelled_reports_cancellation() {
+        let mut app = test_app();
+        app.loop_active = true;
+        app.on_agent_event(AgentEvent::LoopFinished {
+            reason: smith_core::LoopStopReason::Cancelled,
+            iterations: 1,
+        });
+        assert!(app.lines.iter().any(|l| l.text.contains("loop cancelled")));
+    }
+
+    #[test]
+    fn question_modal_digit_one_submits_option_a() {
+        let mut app = test_app();
+        app.modal = Modal::Question(QuestionModal {
+            question: UserQuestion {
+                id: "q1".into(),
+                prompt: "Which approach?".into(),
+                options: ["Alpha".into(), "Beta".into(), "Gamma".into()],
+            },
+            selected: 0,
+            custom: String::new(),
+        });
+        let action = app.on_key(
+            crossterm::event::KeyCode::Char('1'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(matches!(
+            action,
+            Some(Action::QuestionResponse(ref s)) if s == "Alpha"
+        ));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn phase_changed_updates_label() {
+        let mut app = test_app();
+        assert_eq!(app.phase_label(), "idle");
+        app.on_agent_event(AgentEvent::PhaseChanged(AgentPhase::Thinking));
+        assert_eq!(app.phase_label(), "thinking…");
+        app.on_agent_event(AgentEvent::PhaseChanged(AgentPhase::Building));
+        assert_eq!(app.phase_label(), "building…");
+        assert!(app.is_animating());
+    }
+
+    #[test]
+    fn building_phase_survives_thinking_event() {
+        let mut app = test_app();
+        app.phase = AgentPhase::Building;
+        app.on_agent_event(AgentEvent::PhaseChanged(AgentPhase::Thinking));
+        assert_eq!(app.phase, AgentPhase::Building);
+    }
+}
