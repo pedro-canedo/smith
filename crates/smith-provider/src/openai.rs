@@ -4,13 +4,85 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use smith_core::provider::ProviderCapabilities;
 use smith_core::{
     CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role, StopReason,
     StreamEvent, ToolDefinition, Usage,
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::{api_error, http_client};
+
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Which catalogue `capabilities()` should consult. The wire format is shared,
+/// but the models behind it are not: an Ollama server hosts arbitrary local
+/// weights whose window has nothing to do with OpenAI's hosted models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    OpenAi,
+    Ollama,
+}
+
+/// Context window and max-output tokens per model, matched by prefix so dated
+/// or suffixed ids resolve to their base model.
+const OPENAI_MODEL_LIMITS: &[(&str, u32, u32)] = &[
+    ("gpt-4.1-mini", 1_047_576, 32_768),
+    ("gpt-4.1", 1_047_576, 32_768),
+    ("gpt-4o", 128_000, 16_384),
+    ("o3", 200_000, 100_000),
+];
+
+/// Ollama's own default `num_ctx`.
+///
+/// The real window is whatever the *local* server allocates, which depends on
+/// the Modelfile, the `num_ctx` override, and how much VRAM the box has — none
+/// of which is discoverable from this side of the OpenAI-compatible endpoint.
+/// So we report what Ollama allocates by default rather than the theoretical
+/// maximum of the underlying weights: llama3.3 and qwen2.5 advertise 128K, but
+/// an unconfigured `ollama serve` silently truncates the prompt to 4096 and the
+/// model answers as if the rest of the conversation never happened. Guessing
+/// 128K here would let compaction sail past a limit that is really 4096 —
+/// exactly the failure this default exists to prevent.
+const OLLAMA_CONTEXT_WINDOW: u32 = 4096;
+
+fn openai_capabilities(model: &str) -> ProviderCapabilities {
+    let Some(&(id, context_window, max_output)) = OPENAI_MODEL_LIMITS
+        .iter()
+        .find(|(id, _, _)| model.starts_with(id))
+    else {
+        return ProviderCapabilities::default();
+    };
+
+    ProviderCapabilities {
+        context_window,
+        max_output,
+        supports_tools: true,
+        // OpenAI caches prefixes automatically, but there is no `cache_control`
+        // equivalent for the caller to place — this flag means "caller can
+        // address the cache", which here is false.
+        supports_cache: false,
+        // Only the o-series reasons; the GPT models have no thinking channel.
+        supports_thinking: id == "o3",
+        // No token-counting endpoint; any gauge would be a local estimate.
+        supports_token_count: false,
+    }
+}
+
+fn ollama_capabilities(_model: &str) -> ProviderCapabilities {
+    ProviderCapabilities {
+        context_window: OLLAMA_CONTEXT_WINDOW,
+        // Output is carved out of the same `num_ctx` budget, so leave half the
+        // window for the prompt rather than claiming the whole thing.
+        max_output: OLLAMA_CONTEXT_WINDOW / 2,
+        // Tool support is per-model on Ollama and not advertised over this
+        // endpoint; smith already sends tools and lets the server ignore them.
+        supports_tools: true,
+        supports_cache: false,
+        supports_thinking: false,
+        supports_token_count: false,
+    }
+}
 
 /// Implements LlmProvider against OpenAI's Chat Completions API. Also reused
 /// for Ollama's OpenAI-compatible endpoint by pointing `base_url` elsewhere.
@@ -18,14 +90,16 @@ pub struct OpenAiProvider {
     api_key: String,
     client: reqwest::Client,
     base_url: String,
+    flavor: Flavor,
 }
 
 impl OpenAiProvider {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            client: reqwest::Client::new(),
+            client: http_client(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            flavor: Flavor::OpenAi,
         }
     }
 
@@ -37,7 +111,9 @@ impl OpenAiProvider {
     /// Ollama serves an OpenAI-compatible endpoint and ignores the bearer
     /// token, so a placeholder key is enough.
     pub fn ollama(base_url: impl Into<String>) -> Self {
-        Self::new("ollama".to_string()).with_base_url(base_url)
+        let mut provider = Self::new("ollama".to_string()).with_base_url(base_url);
+        provider.flavor = Flavor::Ollama;
+        provider
     }
 }
 
@@ -45,6 +121,13 @@ impl OpenAiProvider {
 impl LlmProvider for OpenAiProvider {
     fn id(&self) -> &'static str {
         "openai"
+    }
+
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        match self.flavor {
+            Flavor::OpenAi => openai_capabilities(model),
+            Flavor::Ollama => ollama_capabilities(model),
+        }
     }
 
     async fn stream_completion(
@@ -64,9 +147,7 @@ impl LlmProvider for OpenAiProvider {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api(format!("{status}: {text}")));
+            return Err(api_error(resp).await);
         }
 
         let mut events = resp.bytes_stream().eventsource();
@@ -361,5 +442,63 @@ mod tests {
         let finished = parse_chunk(&finish, &mut state);
         assert!(matches!(&finished[0], StreamEvent::ToolUseComplete { id } if id == "call_1"));
         assert_eq!(state.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn known_openai_models_report_their_real_window() {
+        let gpt41 = openai_capabilities("gpt-4.1");
+        assert_eq!(gpt41.context_window, 1_047_576);
+        assert_eq!(gpt41.max_output, 32_768);
+        assert!(!gpt41.supports_thinking);
+
+        let gpt4o = openai_capabilities("gpt-4o");
+        assert_eq!(gpt4o.context_window, 128_000);
+        assert_eq!(gpt4o.max_output, 16_384);
+
+        let o3 = openai_capabilities("o3");
+        assert_eq!(o3.context_window, 200_000);
+        assert!(o3.supports_thinking, "the o-series reasons");
+    }
+
+    #[test]
+    fn longest_matching_prefix_wins() {
+        // "gpt-4.1-mini" must not be shadowed by the "gpt-4.1" entry into a
+        // different row; both happen to share limits, so assert the row itself.
+        assert_eq!(
+            openai_capabilities("gpt-4.1-mini"),
+            openai_capabilities("gpt-4.1")
+        );
+    }
+
+    #[test]
+    fn unknown_openai_model_falls_back_to_the_conservative_default() {
+        let caps = openai_capabilities("gpt-6-ultra");
+        assert_eq!(caps, ProviderCapabilities::default());
+        assert!(
+            caps.context_window <= 8192,
+            "unknown models must not be assumed roomy: {}",
+            caps.context_window
+        );
+    }
+
+    #[test]
+    fn ollama_reports_the_conservative_local_default_for_every_model() {
+        for model in ["llama3.3", "qwen2.5", "something-nobody-has-heard-of"] {
+            let caps = ollama_capabilities(model);
+            assert_eq!(caps.context_window, 4096);
+            assert!(caps.max_output <= caps.context_window);
+            assert!(!caps.supports_cache && !caps.supports_token_count);
+        }
+    }
+
+    #[test]
+    fn flavor_selects_the_catalogue() {
+        let openai = OpenAiProvider::new("k".into());
+        assert_eq!(openai.capabilities("gpt-4o").context_window, 128_000);
+
+        // The same model name against an Ollama server is a *local* model, so
+        // it must not inherit the hosted model's window.
+        let ollama = OpenAiProvider::ollama("http://localhost:11434/v1");
+        assert_eq!(ollama.capabilities("gpt-4o").context_window, 4096);
     }
 }

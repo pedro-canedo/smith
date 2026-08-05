@@ -4,14 +4,52 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use smith_core::provider::ProviderCapabilities;
 use smith_core::{
     CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role, StopReason,
     StreamEvent, ToolDefinition, Usage,
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::{api_error, http_client};
+
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Context window and max-output tokens per model, matched by prefix so dated
+/// snapshots (`claude-haiku-4-5-20251001`) resolve to their base model instead
+/// of silently falling through to the conservative default.
+const MODEL_LIMITS: &[(&str, u32, u32)] = &[
+    ("claude-opus-5", 1_000_000, 128_000),
+    ("claude-sonnet-5", 1_000_000, 128_000),
+    ("claude-haiku-4-5", 200_000, 64_000),
+];
+
+/// Capabilities for an Anthropic model.
+///
+/// Unknown models get `ProviderCapabilities::default()` — deliberately a small
+/// window, since the compaction trigger downstream keys off this number and
+/// over-estimating it means blowing the context mid-turn.
+fn capabilities_for(model: &str) -> ProviderCapabilities {
+    let Some(&(_, context_window, max_output)) =
+        MODEL_LIMITS.iter().find(|(id, _, _)| model.starts_with(id))
+    else {
+        return ProviderCapabilities::default();
+    };
+
+    ProviderCapabilities {
+        context_window,
+        max_output,
+        supports_tools: true,
+        // `cache_control` breakpoints are caller-controlled on every current
+        // Claude model.
+        supports_cache: true,
+        supports_thinking: true,
+        // POST /v1/messages/count_tokens — the only provider here that offers
+        // exact counts rather than an estimate.
+        supports_token_count: true,
+    }
+}
 
 pub struct AnthropicProvider {
     api_key: String,
@@ -23,7 +61,7 @@ impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            client: reqwest::Client::new(),
+            client: http_client(),
             base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
@@ -38,6 +76,10 @@ impl AnthropicProvider {
 impl LlmProvider for AnthropicProvider {
     fn id(&self) -> &'static str {
         "anthropic"
+    }
+
+    fn capabilities(&self, model: &str) -> ProviderCapabilities {
+        capabilities_for(model)
     }
 
     async fn stream_completion(
@@ -58,9 +100,7 @@ impl LlmProvider for AnthropicProvider {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api(format!("{status}: {text}")));
+            return Err(api_error(resp).await);
         }
 
         let mut events = resp.bytes_stream().eventsource();
@@ -336,5 +376,45 @@ mod tests {
 
         let completed = parse_sse_payload(&stop, &mut state);
         assert!(matches!(&completed[0], StreamEvent::ToolUseComplete { id } if id == "toolu_1"));
+    }
+
+    #[test]
+    fn known_models_report_their_real_window() {
+        let opus = capabilities_for("claude-opus-5");
+        assert_eq!(opus.context_window, 1_000_000);
+        assert_eq!(opus.max_output, 128_000);
+        assert!(opus.supports_cache && opus.supports_thinking && opus.supports_token_count);
+
+        let haiku = capabilities_for("claude-haiku-4-5");
+        assert_eq!(haiku.context_window, 200_000);
+        assert_eq!(haiku.max_output, 64_000);
+    }
+
+    #[test]
+    fn dated_snapshots_resolve_to_their_base_model() {
+        assert_eq!(
+            capabilities_for("claude-haiku-4-5-20251001"),
+            capabilities_for("claude-haiku-4-5")
+        );
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_the_conservative_default() {
+        let caps = capabilities_for("claude-from-the-future");
+        assert_eq!(caps, ProviderCapabilities::default());
+        assert!(
+            caps.context_window <= 8192,
+            "unknown models must not be assumed roomy: {}",
+            caps.context_window
+        );
+    }
+
+    #[test]
+    fn capabilities_are_reachable_through_the_trait() {
+        let provider = AnthropicProvider::new("k".into());
+        assert_eq!(
+            provider.capabilities("claude-sonnet-5").context_window,
+            1_000_000
+        );
     }
 }

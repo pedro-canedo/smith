@@ -17,6 +17,6 @@ pub use message::{
     CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition, Usage,
 };
 pub use permission_detail::format_permission_detail;
-pub use provider::{LlmProvider, ProviderError};
+pub use provider::{LlmProvider, ProviderCapabilities, ProviderError};
 pub use redact::Redactor;
 pub use tool::{PermissionClass, PermissionPolicy, Tool, ToolContext, ToolResult};
