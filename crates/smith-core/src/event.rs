@@ -141,6 +141,19 @@ pub enum Action {
     /// for and dies with it; a memory outlives the session and every later
     /// one in this project inherits it.
     Remember(String),
+    /// `/rewind [<turn>] [confirm] [--force]`: undo the file writes of a turn.
+    ///
+    /// `apply: false` — the default — plans and reports without touching
+    /// anything, because restoring files destroys whatever is on disk now.
+    /// `force` overrides the refusal to overwrite files that changed since the
+    /// turn; it exists only because a user who has read the conflict list may
+    /// genuinely want the old bytes back.
+    Rewind {
+        /// `None` means the most recent checkpointed turn.
+        turn: Option<u64>,
+        apply: bool,
+        force: bool,
+    },
     /// `/loop [<N>] <task>`: runs `task` repeatedly — each iteration after the
     /// first is a "continue" turn — until the model's reply contains the
     /// completion sentinel, `max_iterations` is reached (defaults to a safety
@@ -247,6 +260,11 @@ pub enum AgentEvent {
         reason: LoopStopReason,
         iterations: u32,
     },
+    /// The plan for, or the result of, an `Action::Rewind`. One variant for
+    /// both: `RewindReport::status` says which, and a frontend that rendered
+    /// them differently would be inviting the user to mistake one for the
+    /// other.
+    Rewind(crate::checkpoint::RewindReport),
     /// The agent replaced its task checklist via `write_tasks` — the full
     /// list, not a diff; the frontend just swaps its copy wholesale.
     TasksUpdated(Vec<Task>),

@@ -102,6 +102,41 @@ regardless of `PermissionPolicy` — even `Skip` doesn't bypass an unapproved
 plan. Both checks happen in `Agent::run_one_tool`
 (`crates/smith-core/src/agent.rs`).
 
+### Turn checkpoints and `/rewind`
+
+Before any tool above `ReadOnly` is dispatched, `Agent::run_one_tool` asks the
+`ToolExecutor` which paths that call is about to write
+(`Tool::snapshot_paths`, defaulting to empty) and snapshots them through the
+`smith_core::checkpoint::Checkpointer` trait. One central hook rather than one
+per tool: it is the same choke point the plan gate and permission prompt use,
+so a refused call never leaves an object behind, and a future mutating tool is
+covered the day it declares its paths.
+
+The implementation is `smith_tools::CheckpointStore` — content-addressed blobs
+in `.smith/checkpoints/objects/`, one JSON manifest per turn in
+`.smith/checkpoints/turns/<session>/<seq>.json`. Deliberately no git and
+deliberately not in `sessions.db`: the store has to work with no session row at
+all (headless), and a manifest that lives beside the objects it indexes cannot
+disagree with them.
+
+Two rules that are load-bearing, not incidental:
+
+- **Checkpointing never fails a turn.** Every `Checkpointer` call is
+  best-effort; a failure becomes an advisory `ToolProgress` line and the tool
+  runs anyway.
+- **`run_bash` cannot be snapshotted.** Any Mutating/Dangerous tool that
+  declares no paths — `run_bash`, every MCP tool — is recorded as *uncovered*,
+  and `/rewind` says so in the report rather than implying the turn was fully
+  undone.
+
+`/rewind` restores files only; it never truncates the conversation. Instead the
+orchestrator queues `Agent::note_to_model`, which rides the *next* user message
+(not a message of its own — that would leave two user messages in a row).
+
+Don't confuse `smith-tools/src/checkpoint.rs` with `staging.rs`: staging holds
+the *new* bytes of a write for the moment before it is applied and deletes
+itself immediately; checkpoints hold the *old* bytes and persist.
+
 ### Session/goal persistence
 
 Conversations persist per-project to `.smith/sessions.db` (SQLite, via

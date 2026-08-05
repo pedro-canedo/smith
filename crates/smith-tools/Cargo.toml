@@ -8,7 +8,12 @@ rust-version.workspace = true
 [dependencies]
 smith-core = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# Content addressing for turn checkpoints. Both are already in the dependency
+# graph via reqwest's TLS stack, so neither adds a compilation unit.
+sha2 = "0.10"
+hex = "0.4"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 glob = { workspace = true }

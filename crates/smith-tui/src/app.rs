@@ -931,7 +931,7 @@ impl App {
             "help" | "" => {
                 self.lines.push(ChatLine::new(
                     ChatRole::System,
-                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /compact (summarise old history to reclaim context), /remember <note> (append a standing note to this project's SMITH.md), /help (this message)",
+                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /compact (summarise old history to reclaim context), /remember <note> (append a standing note to this project's SMITH.md), /rewind [<turn>] [confirm] [--force] (undo a turn's file writes — shows the plan first; does NOT undo anything run_bash did), /help (this message)",
                 ));
                 None
             }
@@ -942,6 +942,7 @@ impl App {
                 None
             }
             "plan" => self.run_plan_command(args),
+            "rewind" => self.run_rewind_command(args),
             "goal" => self.run_goal_command(args),
             "loop" => self.run_loop_command(args),
             "compact" => {
@@ -983,6 +984,48 @@ impl App {
                 None
             }
         }
+    }
+
+    /// `/rewind [<turn>] [confirm] [--force]`.
+    ///
+    /// Two steps on purpose. Restoring files overwrites whatever is on disk
+    /// now, which is the one thing in smith that can destroy work the user did
+    /// themselves — so the bare command only ever *describes* what it would
+    /// do, and `confirm` is a separate keystroke the user makes after reading
+    /// it.
+    fn run_rewind_command(&mut self, args: &str) -> Option<Action> {
+        let mut turn = None;
+        let mut apply = false;
+        let mut force = false;
+        for token in args.split_whitespace() {
+            match token {
+                "confirm" | "--confirm" => apply = true,
+                "--force" | "-f" => force = true,
+                other => match other.parse::<u64>() {
+                    Ok(n) => turn = Some(n),
+                    Err(_) => {
+                        self.lines.push(ChatLine::new(
+                            ChatRole::System,
+                            "usage: /rewind [<turn>] [confirm] [--force] — with no `confirm` it \
+                             only shows what it would restore",
+                        ));
+                        return None;
+                    }
+                },
+            }
+        }
+
+        // The checkpoint of a turn still in flight is incomplete, and undoing
+        // half of it would be worse than not offering to.
+        if self.waiting_on_assistant {
+            self.lines.push(ChatLine::new(
+                ChatRole::System,
+                "can't rewind mid-turn — press Esc to stop the current turn first",
+            ));
+            return None;
+        }
+
+        Some(Action::Rewind { turn, apply, force })
     }
 
     fn run_model_command(&mut self, args: &str) -> Option<Action> {
@@ -1593,6 +1636,15 @@ impl App {
                     }
                 };
                 self.lines.push(ChatLine::new(ChatRole::System, summary));
+            }
+            AgentEvent::Rewind(report) => {
+                // Rendered by `RewindReport::lines`, not here: the wording of
+                // the run_bash caveat and the conflict list is a safety
+                // property, and a second copy in the TUI would drift from the
+                // one `stream-json` consumers see.
+                for line in report.lines() {
+                    self.lines.push(ChatLine::new(ChatRole::System, line));
+                }
             }
             AgentEvent::TasksUpdated(tasks) => {
                 self.tasks = tasks;
@@ -2822,5 +2874,80 @@ mod tests {
         assert!(!app.expire_pending_quit(), "only once");
         assert!(ctrl_c(&mut app).is_none());
         assert!(!app.should_quit);
+    }
+
+    // ---- /rewind -------------------------------------------------------------
+
+    /// The safety property of the command surface: typing `/rewind` on its own
+    /// must never be able to overwrite a file.
+    #[test]
+    fn a_bare_rewind_asks_for_a_plan_and_never_applies_one() {
+        let mut app = test_app();
+        match app.run_slash_command("rewind") {
+            Some(Action::Rewind { turn, apply, force }) => {
+                assert_eq!(turn, None);
+                assert!(!apply, "a bare /rewind must not apply anything");
+                assert!(!force);
+            }
+            other => panic!("expected a Rewind action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewind_parses_a_turn_number_confirm_and_force_in_any_order() {
+        let mut app = test_app();
+        match app.run_slash_command("rewind --force 7 confirm") {
+            Some(Action::Rewind { turn, apply, force }) => {
+                assert_eq!(turn, Some(7));
+                assert!(apply);
+                assert!(force);
+            }
+            other => panic!("expected a Rewind action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewind_with_an_unparseable_argument_explains_itself_instead_of_guessing() {
+        let mut app = test_app();
+        assert!(app.run_slash_command("rewind yesterday").is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("usage: /rewind")));
+    }
+
+    /// A checkpoint for a turn still running is incomplete, so undoing half of
+    /// it would be worse than not offering.
+    #[test]
+    fn rewind_is_refused_mid_turn() {
+        let mut app = test_app();
+        app.waiting_on_assistant = true;
+        assert!(app.run_slash_command("rewind confirm").is_none());
+        assert!(app.lines.iter().any(|l| l.text.contains("can't rewind")));
+    }
+
+    /// The `run_bash` caveat has to survive the trip through the event channel
+    /// and land in the transcript — it is the one line that stops a user
+    /// believing the rewind was total.
+    #[test]
+    fn a_rewind_report_lands_in_the_transcript_caveats_and_all() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::Rewind(smith_core::RewindReport {
+            turn: Some(3),
+            status: smith_core::RewindStatus::Preview,
+            restore: vec!["src/main.rs".into()],
+            delete: Vec::new(),
+            conflicts: Vec::new(),
+            uncovered: vec![("run_bash".into(), 1)],
+            notes: Vec::new(),
+        }));
+
+        let text: String = app
+            .lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("rewind of turn 3 would"), "{text}");
+        assert!(text.contains("restore src/main.rs"), "{text}");
+        assert!(text.contains("NOT COVERED"), "{text}");
+        assert!(text.contains("/rewind 3 confirm"), "{text}");
     }
 }

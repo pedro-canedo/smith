@@ -144,6 +144,25 @@ pub trait Tool: Send + Sync {
     fn input_schema(&self) -> serde_json::Value;
     fn permission_class(&self) -> PermissionClass;
 
+    /// Absolute paths this call is about to write, so the turn can snapshot
+    /// them before it does — see `crate::checkpoint`.
+    ///
+    /// The tool answers this rather than the agent parsing the arguments,
+    /// because the argument shape belongs to the tool: `write_file` has
+    /// `path`, `edit_file` has `path`, and a future `move_file` will have two.
+    /// The agent owns only the *timing* (once, after the permission gate,
+    /// before dispatch).
+    ///
+    /// Returning empty is the honest answer for anything whose writes cannot
+    /// be predicted from its arguments — `run_bash` above all. A tool above
+    /// `PermissionClass::ReadOnly` that returns nothing here is recorded in
+    /// the checkpoint as an *uncovered* call, so `/rewind` can say out loud
+    /// that it did not undo whatever that call did. Silence is therefore never
+    /// mistaken for "it wrote nothing".
+    fn snapshot_paths(&self, _input: &serde_json::Value, _ctx: &ToolContext) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// `cancel` is fired if the user interrupts the turn mid-execution
     /// (e.g. Esc while a shell command is running) — long-running tools
     /// should race it and abort their work (killing any child process).

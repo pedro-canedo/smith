@@ -222,6 +222,17 @@ const SUMMARY_SYSTEM_PROMPT: &str =
 pub trait ToolExecutor: Send + Sync {
     fn tool_defs(&self) -> Vec<crate::message::ToolDefinition>;
     fn permission_class(&self, name: &str) -> Option<PermissionClass>;
+    /// Forwards `Tool::snapshot_paths` for the named tool. Defaulted so an
+    /// executor that has no filesystem tools at all (and every existing
+    /// implementation) compiles unchanged.
+    fn snapshot_paths(
+        &self,
+        _name: &str,
+        _input: &serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
     async fn execute(
         &self,
         name: &str,
@@ -328,6 +339,24 @@ pub struct Agent {
     session_cost_usd: f64,
     /// Accounting for the turn currently running (or the last one that did).
     last_turn: Option<TurnAccounting>,
+    /// Snapshots files before a mutating tool overwrites them, so `/rewind`
+    /// has something to restore. `None` disables checkpointing entirely —
+    /// which is the correct behaviour, not a degraded one, for a caller that
+    /// has nowhere to put the objects.
+    checkpointer: Option<Arc<dyn crate::checkpoint::Checkpointer>>,
+    /// Sequence number of the turn in flight, allocated by the checkpointer at
+    /// the top of `run_turn`. `None` when there is no checkpointer.
+    turn_seq: Option<u64>,
+    /// Facts the agent must tell the model before its next turn, prepended to
+    /// that turn's user message.
+    ///
+    /// Not pushed into history as messages of their own: after a completed
+    /// turn the last message is the assistant's, so a lone user message would
+    /// be followed by the real one and leave two consecutive user messages —
+    /// a shape some providers reject and others silently merge. Riding the
+    /// next real message has none of that risk and reaches the model at
+    /// exactly the same moment.
+    pending_notes: Vec<String>,
 }
 
 impl Agent {
@@ -361,7 +390,34 @@ impl Agent {
             session_usage: Usage::default(),
             session_cost_usd: 0.0,
             last_turn: None,
+            checkpointer: None,
+            turn_seq: None,
+            pending_notes: Vec::new(),
         }
+    }
+
+    pub fn with_checkpointer(
+        mut self,
+        checkpointer: Arc<dyn crate::checkpoint::Checkpointer>,
+    ) -> Self {
+        self.checkpointer = Some(checkpointer);
+        self
+    }
+
+    /// Exposed so a `/model` switch — which rebuilds the whole `Agent` — keeps
+    /// checkpointing instead of silently dropping it for the rest of the
+    /// session.
+    pub fn checkpointer(&self) -> Option<Arc<dyn crate::checkpoint::Checkpointer>> {
+        self.checkpointer.clone()
+    }
+
+    /// Queues a fact for the model to read at the start of its next turn.
+    ///
+    /// The one caller today is `/rewind`: files the model believes it wrote
+    /// have been put back, and a model that does not know that will happily
+    /// build on edits that no longer exist.
+    pub fn note_to_model(&mut self, note: impl Into<String>) {
+        self.pending_notes.push(note.into());
     }
 
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
@@ -738,6 +794,20 @@ impl Agent {
         question_tx: mpsc::UnboundedSender<QuestionAsk>,
         cancel: CancellationToken,
     ) -> bool {
+        // Allocated before anything can run a tool, and held for the whole
+        // turn: every file this turn overwrites lands in the same checkpoint,
+        // which is what makes "undo that turn" a single operation.
+        self.turn_seq = match &self.checkpointer {
+            Some(checkpointer) => Some(checkpointer.begin_turn(&self.tool_ctx.session_id).await),
+            None => None,
+        };
+
+        let user_text = if self.pending_notes.is_empty() {
+            user_text
+        } else {
+            let notes = std::mem::take(&mut self.pending_notes).join("\n");
+            format!("{notes}\n\n{user_text}")
+        };
         self.messages.push(Message::user_text(user_text));
         let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Thinking));
         // Fresh accounting per turn — the caller persists exactly one `turns`
@@ -1306,7 +1376,18 @@ impl Agent {
         let ctx = self
             .tool_ctx
             .with_progress(ProgressReporter::new(id, events.clone()));
+
+        // Here and nowhere else. This is the single point every tool call
+        // funnels through, it is *after* the plan gate and the permission
+        // prompt (a denied call returns above, so it never leaves an object
+        // behind), and it is immediately before dispatch — the last instant
+        // the old bytes still exist. Putting the hook inside `write_file` and
+        // `edit_file` instead would have duplicated that timing decision in
+        // every mutating tool and quietly skipped whichever one is added next.
+        let snapshotted = self.checkpoint_before(name, &input, class, &ctx).await;
+
         let mut result = self.tools.execute(name, input, &ctx, cancel).await;
+        self.checkpoint_after(&snapshotted).await;
 
         // The only place raw tool output exists before it fans out to the
         // transcript, the session database and the next provider request.
@@ -1324,6 +1405,63 @@ impl Agent {
             is_error: result.is_error,
         });
         result
+    }
+
+    /// Snapshots whatever this call is about to overwrite, and returns the
+    /// paths captured so `checkpoint_after` can revisit them.
+    ///
+    /// **Nothing in here can fail the tool call.** Every error is reported as
+    /// an advisory progress line and swallowed: a user who cannot undo a write
+    /// is worse off than before, but a user whose write was *refused* because
+    /// we could not prepare to undo it is worse off still — and would have no
+    /// way to make progress at all on a read-only `.smith` directory.
+    async fn checkpoint_before(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        class: PermissionClass,
+        ctx: &ToolContext,
+    ) -> Vec<std::path::PathBuf> {
+        let (Some(checkpointer), Some(turn)) = (&self.checkpointer, self.turn_seq) else {
+            return Vec::new();
+        };
+        let session = &self.tool_ctx.session_id;
+        let paths = self.tools.snapshot_paths(name, input, ctx);
+
+        // A tool that can change things but won't say what: `run_bash`, and
+        // every MCP tool. Recorded so `/rewind` reports the hole rather than
+        // implying the turn is fully covered.
+        if paths.is_empty() {
+            if class != PermissionClass::ReadOnly {
+                let _ = checkpointer.note_uncovered(session, turn, name).await;
+            }
+            return Vec::new();
+        }
+
+        let mut captured = Vec::with_capacity(paths.len());
+        for path in paths {
+            match checkpointer.snapshot_before(session, turn, &path).await {
+                Ok(()) => captured.push(path),
+                Err(e) => ctx.report_progress(format!(
+                    "checkpoint: could not snapshot {} — this write will not be undoable by /rewind ({e})",
+                    path.display()
+                )),
+            }
+        }
+        captured
+    }
+
+    /// Records what the tool left behind, which is the only way `/rewind` can
+    /// later tell a hand edit from its own handiwork. Same best-effort rules.
+    async fn checkpoint_after(&self, paths: &[std::path::PathBuf]) {
+        let (Some(checkpointer), Some(turn)) = (&self.checkpointer, self.turn_seq) else {
+            return;
+        };
+        for path in paths {
+            let _ = checkpointer
+                .snapshot_after(&self.tool_ctx.session_id, turn, path)
+                .await;
+        }
     }
 
     async fn run_ask_user(
@@ -3561,5 +3699,290 @@ mod tests {
 
         assert!((agent.session_cost_usd() - 44.5).abs() < 1e-9);
         assert_eq!(agent.session_usage().input_tokens, 1_000_500);
+    }
+
+    // ---- checkpointing ------------------------------------------------------
+    //
+    // The store itself is tested in `smith_tools::checkpoint`; what belongs
+    // here is the *hook* — that it fires at the right moment, that it never
+    // takes a turn down with it, and that a call the gate refuses leaves no
+    // trace behind.
+
+    /// Records what the agent asked it to do, and can be told to fail every
+    /// request — the interesting case, because a checkpoint failure has to be
+    /// invisible to the tool call.
+    #[derive(Default)]
+    struct SpyCheckpointer {
+        failing: bool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SpyCheckpointer {
+        fn failing() -> Self {
+            Self {
+                failing: true,
+                ..Self::default()
+            }
+        }
+
+        fn log(&self, entry: String) -> Result<(), String> {
+            self.calls.lock().unwrap().push(entry);
+            if self.failing {
+                Err("the .smith directory is read-only".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::checkpoint::Checkpointer for SpyCheckpointer {
+        async fn begin_turn(&self, _session_id: &str) -> u64 {
+            self.calls.lock().unwrap().push("begin_turn".into());
+            1
+        }
+        async fn snapshot_before(
+            &self,
+            _session_id: &str,
+            _turn: u64,
+            path: &std::path::Path,
+        ) -> Result<(), String> {
+            self.log(format!("before:{}", path.display()))
+        }
+        async fn snapshot_after(
+            &self,
+            _session_id: &str,
+            _turn: u64,
+            path: &std::path::Path,
+        ) -> Result<(), String> {
+            self.log(format!("after:{}", path.display()))
+        }
+        async fn note_uncovered(
+            &self,
+            _session_id: &str,
+            _turn: u64,
+            tool: &str,
+        ) -> Result<(), String> {
+            self.log(format!("uncovered:{tool}"))
+        }
+    }
+
+    /// Stands in for `write_file` (declares its path) or `run_bash` (does
+    /// not), at whichever permission class the test needs.
+    struct PathDeclaringTools {
+        class: PermissionClass,
+        declares: bool,
+        executed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for PathDeclaringTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            Vec::new()
+        }
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(self.class)
+        }
+        fn snapshot_paths(
+            &self,
+            _name: &str,
+            _input: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Vec<std::path::PathBuf> {
+            if self.declares {
+                vec![std::path::PathBuf::from("/proj/src/main.rs")]
+            } else {
+                Vec::new()
+            }
+        }
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ToolResult::ok("wrote")
+        }
+    }
+
+    fn checkpointed_agent(
+        checkpointer: Arc<SpyCheckpointer>,
+        tools: Arc<PathDeclaringTools>,
+    ) -> Agent {
+        Agent::new(
+            Arc::new(write_file_then_done()),
+            tools,
+            "fake-model".to_string(),
+            ToolContext::new("/proj", "test-session"),
+        )
+        .with_permission_policy(PermissionPolicy::Skip)
+        .with_checkpointer(checkpointer)
+    }
+
+    /// The requirement that outranks the feature: losing the ability to undo a
+    /// write is bad; refusing to do the work because we could not prepare to
+    /// undo it is worse.
+    #[tokio::test]
+    async fn a_snapshot_failure_does_not_fail_the_tool_call() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checkpointer = Arc::new(SpyCheckpointer::failing());
+        let mut agent = checkpointed_agent(
+            checkpointer.clone(),
+            Arc::new(PathDeclaringTools {
+                class: PermissionClass::Mutating,
+                declares: true,
+                executed: executed.clone(),
+            }),
+        );
+
+        let (completed, events) =
+            run_collect(&mut agent, "write it", CancellationToken::new()).await;
+
+        assert!(completed, "the turn should have run to a normal completion");
+        assert!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the tool was skipped because its checkpoint could not be written"
+        );
+        let failed = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCallResult { is_error: true, .. }));
+        assert!(!failed, "the tool call was reported as an error");
+        // Not silent either — the warning rides the advisory progress channel,
+        // which cannot fail a turn the way an `Error` event would.
+        let warned = events.iter().any(
+            |e| matches!(e, AgentEvent::ToolProgress { line, .. } if line.contains("/rewind")),
+        );
+        assert!(warned, "the user was never told the write is not undoable");
+    }
+
+    /// The hook sits after the gates, so a refused call never leaves an object
+    /// behind and never snapshots a file that was not written.
+    #[tokio::test]
+    async fn a_tool_the_plan_gate_refuses_is_never_snapshotted() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checkpointer = Arc::new(SpyCheckpointer::default());
+        let mut agent = checkpointed_agent(
+            checkpointer.clone(),
+            Arc::new(PathDeclaringTools {
+                class: PermissionClass::Mutating,
+                declares: true,
+                executed: executed.clone(),
+            }),
+        );
+        agent.set_plan_gated(true);
+
+        run_collect(&mut agent, "write it", CancellationToken::new()).await;
+
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(checkpointer.calls(), vec!["begin_turn".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_declared_path_is_snapshotted_on_both_sides_of_the_call() {
+        let checkpointer = Arc::new(SpyCheckpointer::default());
+        let mut agent = checkpointed_agent(
+            checkpointer.clone(),
+            Arc::new(PathDeclaringTools {
+                class: PermissionClass::Mutating,
+                declares: true,
+                executed: Default::default(),
+            }),
+        );
+
+        run_collect(&mut agent, "write it", CancellationToken::new()).await;
+
+        assert_eq!(
+            checkpointer.calls(),
+            vec![
+                "begin_turn".to_string(),
+                "before:/proj/src/main.rs".to_string(),
+                "after:/proj/src/main.rs".to_string(),
+            ]
+        );
+    }
+
+    /// `run_bash` and every MCP tool land here: they can change anything and
+    /// will not say what. Recording the call is the only reason `/rewind` can
+    /// admit the gap instead of implying it covered the whole turn.
+    #[tokio::test]
+    async fn a_mutating_tool_that_declares_no_paths_is_recorded_as_uncovered() {
+        let checkpointer = Arc::new(SpyCheckpointer::default());
+        let mut agent = checkpointed_agent(
+            checkpointer.clone(),
+            Arc::new(PathDeclaringTools {
+                class: PermissionClass::Dangerous,
+                declares: false,
+                executed: Default::default(),
+            }),
+        );
+
+        run_collect(&mut agent, "run it", CancellationToken::new()).await;
+
+        assert!(checkpointer
+            .calls()
+            .contains(&"uncovered:write_file".to_string()));
+    }
+
+    /// A read-only tool declaring no paths is not a gap — it is a tool that
+    /// wrote nothing, and reporting it would drown the real warning.
+    #[tokio::test]
+    async fn a_read_only_tool_is_not_recorded_as_uncovered() {
+        let checkpointer = Arc::new(SpyCheckpointer::default());
+        let mut agent = checkpointed_agent(
+            checkpointer.clone(),
+            Arc::new(PathDeclaringTools {
+                class: PermissionClass::ReadOnly,
+                declares: false,
+                executed: Default::default(),
+            }),
+        );
+
+        run_collect(&mut agent, "read it", CancellationToken::new()).await;
+
+        assert_eq!(checkpointer.calls(), vec!["begin_turn".to_string()]);
+    }
+
+    /// After a rewind the model still believes it wrote those files. The note
+    /// rides the next user message rather than becoming a message of its own,
+    /// which would leave two user messages in a row.
+    #[tokio::test]
+    async fn a_queued_note_rides_the_next_user_message_instead_of_becoming_one() {
+        let provider = Arc::new(ScriptedProvider::streams([
+            text_reply("ok"),
+            text_reply("ok again"),
+        ]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        );
+        agent.note_to_model("[smith] src/main.rs was restored.");
+
+        run_collect(&mut agent, "carry on", CancellationToken::new()).await;
+
+        let sent = provider.last_request().unwrap();
+        let first = sent.messages[0].text();
+        assert!(first.contains("src/main.rs was restored"), "{first}");
+        assert!(first.contains("carry on"), "{first}");
+        assert_eq!(
+            sent.messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .count(),
+            1,
+            "the note became a message of its own"
+        );
+
+        // Delivered once, not re-sent on every later turn.
+        run_collect(&mut agent, "again", CancellationToken::new()).await;
+        assert!(!agent.history()[2].text().contains("restored"));
     }
 }

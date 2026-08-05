@@ -15,7 +15,7 @@ use smith_core::{
 };
 use smith_provider::{AnthropicProvider, OpenAiProvider};
 use smith_store::{SessionStore, TurnRecord, TurnTotals};
-use smith_tools::ToolRegistry;
+use smith_tools::{CheckpointStore, ToolRegistry};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -275,6 +275,11 @@ struct OrchestratorState {
     /// every SMITH.md on the next request for no reason, and would drop the
     /// warm state a long session has built up.
     memory: MemoryCache,
+    /// The undo buffer `/rewind` reads. Held here as the concrete type rather
+    /// than the `Checkpointer` trait the agent uses, because planning and
+    /// applying a rewind happen outside the turn loop and there is nothing
+    /// there for the agent to abstract over.
+    checkpoints: Arc<CheckpointStore>,
 }
 
 impl OrchestratorState {
@@ -319,6 +324,9 @@ impl OrchestratorState {
         // database.
         let session_usage = self.agent.session_usage();
         let session_cost = self.agent.session_cost_usd();
+        // Dropping this would silently disable `/rewind` for the rest of the
+        // session — the least visible way to lose an undo buffer.
+        let checkpointer = self.agent.checkpointer();
 
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
             .with_system(SYSTEM_PROMPT)
@@ -331,6 +339,9 @@ impl OrchestratorState {
             // disable redaction for the rest of the session.
             .with_redactor(secret_redactor(config))
             .with_permission_policy(permission_policy);
+        if let Some(checkpointer) = checkpointer {
+            agent = agent.with_checkpointer(checkpointer);
+        }
         agent.set_plan_gated(plan_gated);
         agent.set_goal(goal);
         agent.seed_history(history);
@@ -522,7 +533,24 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     // the memory chain, the tool sandbox and the session store all describe
     // the same project.
     let memory = MemoryCache::discover(&tool_ctx.cwd);
+
+    // Rooted at the same directory as the tool jail, so every path a tool can
+    // legally write is inside the checkpoint store's world.
+    let checkpoints = Arc::new(CheckpointStore::new(tool_ctx.cwd.clone()));
+    {
+        // Old objects are reclaimed once per process, off the critical path.
+        // A sweep that made startup wait — or that could fail startup — would
+        // be a worse bug than the disk it saves.
+        let checkpoints = checkpoints.clone();
+        tokio::spawn(async move {
+            checkpoints
+                .sweep(smith_tools::checkpoint::DEFAULT_TTL)
+                .await;
+        });
+    }
+
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
+        .with_checkpointer(checkpoints.clone())
         .with_system(SYSTEM_PROMPT)
         .with_context_provider(context_provider(memory.clone()))
         // Set explicitly (rather than left to `Agent`'s own default) so
@@ -554,6 +582,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         provider_kind,
         tools,
         memory,
+        checkpoints,
     }));
 
     let mut current_cancel: Option<CancellationToken> = None;
@@ -758,6 +787,48 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                                 .send(AgentEvent::Error(format!("compaction failed: {err}")));
                         }
                     }
+                });
+            }
+            Action::Rewind { turn, apply, force } => {
+                let state = state.clone();
+                let event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    // Takes the same lock a turn holds, so a rewind can never
+                    // interleave with the writes it is undoing.
+                    let mut guard = state.lock().await;
+                    let session = guard.agent.tool_ctx().session_id.clone();
+                    let checkpoints = guard.checkpoints.clone();
+
+                    let report = if apply {
+                        checkpoints.apply(&session, turn, force).await
+                    } else {
+                        checkpoints.plan(&session, turn).await
+                    };
+
+                    // The model believes it wrote those files. Left uncorrected
+                    // it will keep building on edits that no longer exist —
+                    // reading a file it "just changed" and finding the old
+                    // contents is exactly the kind of confusion that ends in it
+                    // rewriting them.
+                    if report.status == smith_core::RewindStatus::Applied && report.touches_files()
+                    {
+                        let files: Vec<&str> = report
+                            .restore
+                            .iter()
+                            .chain(report.delete.iter())
+                            .map(String::as_str)
+                            .collect();
+                        guard.agent.note_to_model(format!(
+                            "[smith] The user ran /rewind on turn {}. These files were put back to \
+                             the state they were in before that turn, undoing your edits to them: \
+                             {}. Do not assume any of your earlier changes to those files are \
+                             still present — re-read anything you need.",
+                            report.turn.unwrap_or_default(),
+                            files.join(", ")
+                        ));
+                    }
+
+                    let _ = event_tx.send(AgentEvent::Rewind(report));
                 });
             }
             Action::StartLoop {
@@ -1066,6 +1137,140 @@ mod tests {
         let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last["type"], "result");
         assert_eq!(last["data"]["exit_code"], 0);
+    }
+
+    /// The whole checkpoint chain with nothing stubbed but the model: the real
+    /// `write_file` declares the path it will touch, the real `Agent` snapshots
+    /// it around dispatch, and a real `Action::Rewind` puts the bytes back.
+    ///
+    /// It is deliberately end-to-end. Every piece is unit-tested on its own,
+    /// but the failure this guards against is a *wiring* one — a store nobody
+    /// handed to the agent, or a `snapshot_paths` nobody forwarded — and each
+    /// unit test would still pass with the wire cut.
+    #[tokio::test]
+    async fn a_write_is_checkpointed_and_rewind_puts_the_original_bytes_back() {
+        // Inside the crate directory: that is `ToolContext`'s sandbox root
+        // under `cargo test`, and therefore also the checkpoint store's root.
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let target = dir.path().join("poem.txt");
+        tokio::fs::write(&target, "the original\n").await.unwrap();
+
+        // A session id of its own, so a checkpoint written by a test running
+        // in parallel can never become this one's "latest turn".
+        let session_id = format!("test-rewind-{}", dir.path().display())
+            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-");
+        let db = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_call_reply(
+                "call_1",
+                "write_file",
+                serde_json::json!({ "path": target.to_string_lossy(), "content": "the rewrite\n" }),
+            ),
+            text_reply("rewritten"),
+        ]));
+
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        let mut opts = OrchestratorOptions::new(
+            ProviderKind::Anthropic,
+            "scripted-model".to_string(),
+            Config::default(),
+        );
+        opts.provider = Some(provider);
+        opts.permission_policy = smith_core::PermissionPolicy::Skip;
+        opts.persistence = Some(Persistence {
+            store: SessionStore::open(db.path()).unwrap(),
+            session_id: Some(session_id.clone()),
+            provider: "anthropic".into(),
+            model: "scripted-model".into(),
+            cwd: "/proj".into(),
+            persisted: 0,
+        });
+
+        let orchestrator = tokio::spawn(run_orchestrator(
+            opts,
+            OrchestratorChannels {
+                action_rx,
+                event_tx,
+                permission_tx,
+                question_tx,
+            },
+        ));
+
+        action_tx
+            .send(Action::SubmitMessage("rewrite the poem".into()))
+            .unwrap();
+        while let Some(event) = event_rx.recv().await {
+            if matches!(
+                event,
+                AgentEvent::AssistantTurnComplete {
+                    stop_reason: smith_core::StopReason::EndTurn,
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "the rewrite\n"
+        );
+
+        // The preview must change nothing — that is the entire contract of the
+        // bare command.
+        action_tx
+            .send(Action::Rewind {
+                turn: None,
+                apply: false,
+                force: false,
+            })
+            .unwrap();
+        let preview = next_rewind(&mut event_rx).await;
+        assert_eq!(
+            preview.status,
+            smith_core::RewindStatus::Preview,
+            "{preview:?}"
+        );
+        assert_eq!(preview.restore.len(), 1, "{preview:?}");
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "the rewrite\n",
+            "a preview modified the file"
+        );
+
+        action_tx
+            .send(Action::Rewind {
+                turn: None,
+                apply: true,
+                force: false,
+            })
+            .unwrap();
+        let applied = next_rewind(&mut event_rx).await;
+        assert_eq!(
+            applied.status,
+            smith_core::RewindStatus::Applied,
+            "{applied:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "the original\n"
+        );
+
+        orchestrator.abort();
+    }
+
+    async fn next_rewind(
+        events: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    ) -> smith_core::RewindReport {
+        while let Some(event) = events.recv().await {
+            if let AgentEvent::Rewind(report) = event {
+                return report;
+            }
+        }
+        panic!("the orchestrator never reported a rewind");
     }
 
     /// The wiring half of acceptance criterion #4: a turn run through the real

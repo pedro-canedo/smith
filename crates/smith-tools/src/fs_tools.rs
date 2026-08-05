@@ -90,6 +90,21 @@ fn field_str<'a>(input: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     input.get(key).and_then(|v| v.as_str())
 }
 
+/// The single file a `write_file`/`edit_file` call will change, resolved
+/// exactly the way `execute` will resolve it.
+///
+/// Resolving here (rather than handing the raw string to the checkpointer)
+/// keeps the snapshot keyed on the same absolute path the write lands on, so a
+/// call spelled `./src/a.rs` and one spelled `src/a.rs` share one entry. A
+/// path the jail refuses yields nothing, because that call is about to fail
+/// without touching anything.
+fn snapshot_target(input: &serde_json::Value, ctx: &ToolContext) -> Vec<PathBuf> {
+    field_str(input, "path")
+        .and_then(|path| resolve(ctx, path).ok())
+        .into_iter()
+        .collect()
+}
+
 pub struct ReadFileTool;
 
 #[async_trait]
@@ -313,6 +328,10 @@ impl Tool for WriteFileTool {
         PermissionClass::Mutating
     }
 
+    fn snapshot_paths(&self, input: &serde_json::Value, ctx: &ToolContext) -> Vec<PathBuf> {
+        snapshot_target(input, ctx)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -367,6 +386,10 @@ impl Tool for EditFileTool {
 
     fn permission_class(&self) -> PermissionClass {
         PermissionClass::Mutating
+    }
+
+    fn snapshot_paths(&self, input: &serde_json::Value, ctx: &ToolContext) -> Vec<PathBuf> {
+        snapshot_target(input, ctx)
     }
 
     async fn execute(

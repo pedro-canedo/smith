@@ -3,6 +3,14 @@
 //! Writes/edits materialize under `.smith/staging/<session_id>/…` first, then
 //! are copied to the real project path. Staging stays invisible to the user
 //! (permission modals only show the target path summary).
+//!
+//! **This is not the undo buffer — see [`crate::checkpoint`].** The two are
+//! easy to confuse and do opposite jobs. Staging holds the *new* content of a
+//! write for the moment between "composed" and "applied", and deletes itself
+//! the instant the copy succeeds; nothing here survives the tool call, so
+//! there is nothing here to rewind to. Checkpoints hold the *old* bytes,
+//! content-addressed, and persist for as long as undoing the turn is still
+//! plausible. A `/rewind` built on staging would find an empty directory.
 
 use std::path::{Component, Path, PathBuf};
 

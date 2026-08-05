@@ -43,6 +43,10 @@ permission prompt before anything touches your machine.
   first-class tools.
 - **Persistent sessions** — conversations are saved per project; resume with
   `--resume`. `/goal` keeps a long-lived objective in the system prompt.
+- **Undo what it wrote** — every turn's file writes are checkpointed before
+  they happen, and `/rewind` puts them back after showing you exactly what it
+  would change. Shell commands are the one thing it cannot cover, and it says
+  so rather than pretending otherwise.
 - **Built for the terminal** — live markdown rendering while streaming,
   wrap-aware scrollback, a per-step activity widget, and a sidebar with token
   usage plus live CPU/RAM/VRAM stats (local models) or a cost estimate
@@ -171,7 +175,34 @@ When the agent wants to write a file or run a shell command, a modal asks:
 | `/goal <text>` | persistent session objective, stored in `.smith/goal.md` |
 | `/loop [N] <task>` | repeat a task until done, N iterations, or `Esc` (`/loop goal` reuses the goal) |
 | `/usage` | session requests, tool calls, tokens, and estimated cost |
+| `/rewind [turn] [confirm] [--force]` | undo a turn's file writes — shows the plan first, and **does not cover `run_bash`** |
 | `/clear` | clear the visible transcript |
+
+#### `/rewind`, and what it cannot undo
+
+Before `write_file` or `edit_file` touches a file, smith copies the current
+bytes into `.smith/checkpoints/` (content-addressed, so an unchanged file costs
+nothing to re-snapshot). `/rewind` puts them back: files the turn modified are
+restored, files the turn *created* are deleted.
+
+It is deliberately two steps. `/rewind` on its own only prints what it would
+do; `/rewind confirm` applies it. If a file has changed since that turn —
+because you edited it by hand, or a later turn rewrote it — the rewind is
+refused outright, with the file named, and `--force` is the only way past it.
+Applying also checkpoints the current state first, so an unwanted rewind can
+itself be rewound.
+
+**It does not undo anything `run_bash` did.** A shell command can write, move
+or delete anything at all, and smith has no way to know what it touched, so
+none of it is snapshotted. `/rewind` names every `run_bash` call in the turn
+it is undoing and says so — but a turn that did its real work through the shell
+is not meaningfully undoable here. The same applies to MCP-bridged tools.
+
+Checkpoints are kept for 14 days and swept in the background at startup;
+deleting `.smith/checkpoints/` at any time is safe and loses only undo history.
+Nothing here goes near git: your index, stash, refs and worktree are never
+touched, which is also why it works in a submodule, a bare checkout, or a
+directory that is not a repository at all.
 
 ### Built-in tools
 

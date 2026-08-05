@@ -108,6 +108,21 @@ impl ToolExecutor for ToolRegistry {
         self.tools.get(name).map(|t| t.permission_class())
     }
 
+    /// An unknown tool answers "nothing", same as a tool that declines to
+    /// predict its writes — and the agent treats both as uncovered, so a
+    /// missing registration can never be mistaken for a covered call.
+    fn snapshot_paths(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Vec<std::path::PathBuf> {
+        self.tools
+            .get(name)
+            .map(|t| t.snapshot_paths(input, ctx))
+            .unwrap_or_default()
+    }
+
     async fn execute(
         &self,
         name: &str,
@@ -240,6 +255,61 @@ mod tests {
         // `register` panics on collision, so this just has to not panic.
         let registry = ToolRegistry::with_builtin_tools();
         assert_eq!(registry.tool_defs().len(), 9);
+    }
+
+    /// The real wiring behind checkpointing, checked against the real
+    /// built-ins rather than a stand-in: the two mutating file tools declare
+    /// the path they will write (resolved, so the agent snapshots the same
+    /// absolute path the write lands on), and `run_bash` declares nothing —
+    /// which is what makes the agent record it as an uncovered call and
+    /// `/rewind` admit it did not undo whatever the shell did.
+    #[test]
+    fn the_mutating_file_tools_declare_their_path_and_run_bash_declares_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::with_builtin_tools();
+        let ctx = ToolContext::new(dir.path(), "test");
+
+        for tool in ["write_file", "edit_file"] {
+            let paths = registry.snapshot_paths(
+                tool,
+                &serde_json::json!({"path": "src/main.rs", "content": "x"}),
+                &ctx,
+            );
+            assert_eq!(
+                paths,
+                vec![dir.path().canonicalize().unwrap().join("src/main.rs")],
+                "{tool} did not declare the file it is about to write"
+            );
+        }
+
+        assert!(registry
+            .snapshot_paths(
+                "run_bash",
+                &serde_json::json!({"command": "rm -rf src"}),
+                &ctx
+            )
+            .is_empty());
+        // Read-only tools declare nothing either, but the agent only treats
+        // that as a gap above `ReadOnly` — see its `checkpoint_before`.
+        assert!(registry
+            .snapshot_paths("read_file", &serde_json::json!({"path": "a.txt"}), &ctx)
+            .is_empty());
+    }
+
+    /// A path the jail refuses yields nothing to snapshot, because that call
+    /// is about to fail without touching anything.
+    #[test]
+    fn a_write_that_escapes_the_project_declares_nothing_to_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::with_builtin_tools();
+        let ctx = ToolContext::new(dir.path(), "test");
+        assert!(registry
+            .snapshot_paths(
+                "write_file",
+                &serde_json::json!({"path": "../escaped.txt", "content": "x"}),
+                &ctx
+            )
+            .is_empty());
     }
 
     /// Prompt caching keys on a stable prefix, and the tool array is in it.

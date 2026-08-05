@@ -11,6 +11,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("permission", "show or set tool permission policy"),
     ("plan", "propose a plan before executing"),
     ("remember", "append a standing note to the project SMITH.md"),
+    (
+        "rewind",
+        "undo a turn's file writes (shell writes not covered)",
+    ),
     ("usage", "session token/cost/tool summary"),
 ];
 
