@@ -44,6 +44,20 @@ package-manager metadata become the bottleneck.
    smith doctor
    ```
 
+7. Verify both supported one-line installers from a clean machine:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/pedro-canedo/smith/main/scripts/install.sh | sh
+   ```
+
+   ```powershell
+   irm https://raw.githubusercontent.com/pedro-canedo/smith/main/scripts/install.ps1 | iex
+   ```
+
+   The Unix installer targets Linux, macOS, and WSL2. The PowerShell
+   installer targets native 64-bit Windows, installs under `%LOCALAPPDATA%`,
+   updates the user `PATH`, and verifies the archive with `Get-FileHash`.
+
 ## Package-manager templates
 
 - Shell installer: [`scripts/install.sh`](../scripts/install.sh)
