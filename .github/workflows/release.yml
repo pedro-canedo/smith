@@ -18,25 +18,33 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - name: linux-x86_64
+            targets: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
+          - name: linux-aarch64
+            targets: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             linker: aarch64-linux-gnu-gcc
-          - target: x86_64-apple-darwin
-            # macos-13 was retired by GitHub; this label preserves the Intel
-            # architecture required by the x86_64 Apple artifact.
-            os: macos-15-intel
-          - target: aarch64-apple-darwin
+          # Both Apple artifacts come off one Arm runner. An Arm Mac carries the
+          # x86_64 slice of the Apple SDK, so the Intel target cross-compiles
+          # here for free — and macOS runners are the scarcest label in the
+          # hosted pool, where a second job is not a second machine but a second
+          # place in a queue that has cost this release 50 minutes before.
+          - name: macos
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
             os: macos-14
-          - target: x86_64-pc-windows-msvc
+          - name: windows-x86_64
+            targets: x86_64-pc-windows-msvc
             os: windows-latest
+
+    env:
+      TARGETS: ${{ matrix.targets }}
 
     steps:
       - uses: actions/checkout@v4
@@ -53,11 +61,11 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.targets }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.name }}
 
       # `rusqlite` is built with the `bundled` feature, so cross-compiling to
       # aarch64 needs a cross C toolchain as well as the Rust target.
@@ -69,34 +77,45 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
+      # A matrix entry may carry more than one target (the Apple pair). The
+      # artifact name still comes from the triple, so a two-target runner emits
+      # exactly the tarballs a one-target runner did.
       - name: Build
-        run: cargo build --release --locked -p smith-cli --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          for target in ${TARGETS//,/ }; do
+            cargo build --release --locked -p smith-cli --target "$target"
+          done
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          STAGE="$BIN_NAME-$VERSION-${{ matrix.target }}"
-          mkdir -p "dist/$STAGE"
-          cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/$STAGE/"
-          cp README.md LICENSE "dist/$STAGE/"
-          tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
-          (cd dist && shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256")
+          for target in ${TARGETS//,/ }; do
+            STAGE="$BIN_NAME-$VERSION-$target"
+            mkdir -p "dist/$STAGE"
+            cp "target/$target/release/$BIN_NAME" "dist/$STAGE/"
+            cp README.md LICENSE "dist/$STAGE/"
+            tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
+            (cd dist && shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256")
+          done
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          STAGE="$BIN_NAME-$VERSION-${{ matrix.target }}"
-          mkdir -p "dist/$STAGE"
-          cp "target/${{ matrix.target }}/release/$BIN_NAME.exe" "dist/$STAGE/"
-          cp README.md LICENSE "dist/$STAGE/"
-          (cd dist && 7z a "$STAGE.zip" "$STAGE" >/dev/null)
-          (cd dist && certutil -hashfile "$STAGE.zip" SHA256 | sed -n 2p | tr -d ' \r' > "$STAGE.zip.sha256")
+          for target in ${TARGETS//,/ }; do
+            STAGE="$BIN_NAME-$VERSION-$target"
+            mkdir -p "dist/$STAGE"
+            cp "target/$target/release/$BIN_NAME.exe" "dist/$STAGE/"
+            cp README.md LICENSE "dist/$STAGE/"
+            (cd dist && 7z a "$STAGE.zip" "$STAGE" >/dev/null)
+            (cd dist && certutil -hashfile "$STAGE.zip" SHA256 | sed -n 2p | tr -d ' \r' > "$STAGE.zip.sha256")
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.name }}
           path: |
             dist/*.tar.gz
             dist/*.zip
