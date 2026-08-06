@@ -116,6 +116,12 @@ fn vertical_layout(
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    // The base surface, painted before anything else: every region that does
+    // not declare its own background inherits the theme's page colour rather
+    // than whatever the terminal happens to be set to.
+    let whole_screen = frame.area();
+    frame.render_widget(Block::new().style(app.theme.base_bg()), whole_screen);
+
     let suggestions = app.slash_suggestions();
     let wanted_suggest = if suggestions.is_empty() {
         0
@@ -160,12 +166,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .areas(message_area);
         if modal_open {
             frame.render_widget(Clear, chat_area);
+            frame.render_widget(Block::new().style(theme.base_bg()), chat_area);
         } else {
             draw_messages(frame, app, clamp_width(chat_area, MAX_CONTENT_WIDTH));
         }
         draw_sidebar(frame, &*app, sidebar_area);
     } else if modal_open {
         frame.render_widget(Clear, message_area);
+        frame.render_widget(Block::new().style(theme.base_bg()), message_area);
     } else {
         draw_messages(frame, app, clamp_width(message_area, MAX_CONTENT_WIDTH));
     }
