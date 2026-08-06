@@ -93,6 +93,26 @@ impl ScriptedProvider {
         ])
     }
 
+    /// Only failures, in order — for tests about what a caller does when a
+    /// provider never recovers (fallback chains, retry exhaustion).
+    pub fn errors(errors: impl IntoIterator<Item = ProviderError>) -> Self {
+        Self::new(errors.into_iter().map(ScriptedResponse::Fail))
+    }
+
+    /// Successes first, then failures — for tests about strike counters and
+    /// state that a success is supposed to reset.
+    pub fn streams_then_errors(
+        streams: impl IntoIterator<Item = Vec<StreamEvent>>,
+        errors: impl IntoIterator<Item = ProviderError>,
+    ) -> Self {
+        Self::new(
+            streams
+                .into_iter()
+                .map(ScriptedResponse::Stream)
+                .chain(errors.into_iter().map(ScriptedResponse::Fail)),
+        )
+    }
+
     /// Every request received so far, in order.
     pub fn requests(&self) -> Vec<CompletionRequest> {
         self.requests.lock().unwrap().clone()

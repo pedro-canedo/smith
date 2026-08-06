@@ -151,6 +151,19 @@ pub trait LlmProvider: Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// The model a response actually came from, when the provider routed the
+    /// request somewhere other than `requested`. Default: `requested`.
+    ///
+    /// Exists for wrappers that reroute — a fallback chain that has advanced
+    /// past its first entry answers with the entry now serving. The agent
+    /// prices turns and fills `TurnAccounting.model` through this; without
+    /// it, a turn served by Ollama after a quota fallback would be priced
+    /// and persisted under the OpenRouter model's name — a silent accounting
+    /// error in the direction nobody checks.
+    fn effective_model(&self, requested: &str) -> String {
+        requested.to_string()
+    }
+
     /// Asks the provider to learn what it can about `model` before the first
     /// request, so `capabilities` stops guessing.
     ///

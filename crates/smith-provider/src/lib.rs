@@ -5,9 +5,11 @@ use std::time::Duration;
 use smith_core::ProviderError;
 
 pub mod anthropic;
+pub mod fallback;
 pub mod openai;
 
 pub use anthropic::AnthropicProvider;
+pub use fallback::{FallbackEntry, FallbackProvider};
 pub use openai::OpenAiProvider;
 
 /// TCP connect + TLS handshake. A healthy API endpoint completes this in well

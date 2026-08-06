@@ -809,19 +809,25 @@ impl Agent {
         self.session_usage.add(&usage);
 
         let provider = self.provider.id().to_string();
-        let cost = crate::pricing::cost_usd(&provider, &self.model, &usage);
+        // Through the provider, not `self.model` directly: a fallback chain
+        // that advanced mid-session answers with the entry now serving, and
+        // pricing/persisting the turn under the original model's name would
+        // be a silent accounting error.
+        let model = self.provider.effective_model(&self.model);
+        let cost = crate::pricing::cost_usd(&provider, &model, &usage);
         match cost {
             Some(cost) => self.session_cost_usd += cost,
             None => self.unpriced_turns = self.unpriced_turns.saturating_add(1),
         }
 
         // One `TurnAccounting` spans every round of a turn: the model cannot
-        // change mid-turn, so summing rounds loses nothing, and it keeps the
-        // persisted `turns` table one row per user-visible turn rather than
-        // one per HTTP request.
+        // change mid-turn (a fallback advancement lands between requests, and
+        // the round that failed never produced usage to note), so summing
+        // rounds loses nothing, and it keeps the persisted `turns` table one
+        // row per user-visible turn rather than one per HTTP request.
         let turn = self.last_turn.get_or_insert_with(|| TurnAccounting {
             provider: provider.clone(),
-            model: self.model.clone(),
+            model,
             usage: Usage::default(),
             cost_usd: None,
         });

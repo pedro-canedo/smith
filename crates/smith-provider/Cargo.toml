@@ -18,6 +18,8 @@ async-stream = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The fallback chain's tests script both rungs with `ScriptedProvider`.
+smith-core = { workspace = true, features = ["testkit"] }
 # The live `/api/show` probe test needs a runtime; nothing in the shipped
 # crate does, which is why this is dev-only.
 tokio = { workspace = true, features = ["macros", "rt"] }

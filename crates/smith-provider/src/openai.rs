@@ -65,6 +65,39 @@ fn parse_num_ctx(parameters: &str) -> Option<u32> {
     })
 }
 
+/// Extracts what smith needs from OpenRouter's `GET /models` payload:
+/// `(model -> context_length, free models that support tools)`.
+///
+/// Pure, so the shapes OpenRouter actually returns are pinned by fixture
+/// tests instead of live calls.
+fn parse_openrouter_catalogue(value: &serde_json::Value) -> (HashMap<String, u32>, Vec<String>) {
+    let mut windows = HashMap::new();
+    let mut free_tools = Vec::new();
+    let Some(data) = value.get("data").and_then(|d| d.as_array()) else {
+        return (windows, free_tools);
+    };
+    for model in data {
+        let Some(id) = model.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(window) = model
+            .get("context_length")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+        {
+            windows.insert(id.to_string(), window);
+        }
+        let supports_tools = model
+            .get("supported_parameters")
+            .and_then(|v| v.as_array())
+            .is_some_and(|params| params.iter().any(|p| p.as_str() == Some("tools")));
+        if id.ends_with(":free") && supports_tools {
+            free_tools.push(id.to_string());
+        }
+    }
+    (windows, free_tools)
+}
+
 /// Cap on the output half of the window.
 ///
 /// Halving works at 4096; at 262144 it would claim a 131k reply, which no
@@ -124,6 +157,10 @@ pub struct OpenAiProvider {
     /// request structs are built in dozens of places that should not know
     /// an OpenRouter-specific concept exists.
     fallback_models: Vec<String>,
+    /// `:free` models with tool support, from OpenRouter's catalogue.
+    free_tool_models: Arc<RwLock<Vec<String>>>,
+    /// Whether the OpenRouter catalogue has been fetched successfully.
+    catalogue_warmed: Arc<std::sync::atomic::AtomicBool>,
     /// Context windows learned from Ollama's own `/api/show`, keyed by model.
     ///
     /// A fact beats the constant below every time it is available. Empty until
@@ -140,6 +177,8 @@ impl OpenAiProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             flavor: Flavor::OpenAi,
             fallback_models: Vec::new(),
+            free_tool_models: Arc::new(RwLock::new(Vec::new())),
+            catalogue_warmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             known_windows: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -183,6 +222,63 @@ impl OpenAiProvider {
             .ok()
             .and_then(|known| known.get(model).copied())
             .unwrap_or(OLLAMA_CONTEXT_WINDOW)
+    }
+
+    /// Pulls OpenRouter's catalogue once and caches what smith needs from it:
+    /// each model's context window, and which `:free` models can call tools.
+    ///
+    /// One request for the whole account, guarded by `catalogue_warmed` — the
+    /// catalogue is not per-model, and `switch_model` calls the warm again.
+    async fn warm_openrouter_catalogue(&self) {
+        if self
+            .catalogue_warmed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let Ok(response) = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+        else {
+            // Best-effort by the trait contract: the conservative defaults
+            // stand, and a session must start without the catalogue.
+            self.catalogue_warmed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+        if !response.status().is_success() {
+            self.catalogue_warmed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let Ok(value) = response.json::<serde_json::Value>().await else {
+            self.catalogue_warmed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+
+        let (windows, free_tools) = parse_openrouter_catalogue(&value);
+        if let Ok(mut known) = self.known_windows.write() {
+            known.extend(windows);
+        }
+        if let Ok(mut free) = self.free_tool_models.write() {
+            *free = free_tools;
+        }
+    }
+
+    /// The `:free` models that can call tools, from the last catalogue warm.
+    /// Empty until warmed (or when the account genuinely has none) — the
+    /// setup wizard treats empty as "fall back to the curated list".
+    pub async fn list_free_tool_models(&self) -> Vec<String> {
+        self.warm_openrouter_catalogue().await;
+        self.free_tool_models
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     /// Ollama's native API sits beside the OpenAI-compatible one: the base URL
@@ -276,6 +372,10 @@ impl LlmProvider for OpenAiProvider {
     }
 
     async fn warm_capabilities(&self, model: &str) {
+        if self.flavor == Flavor::OpenRouter {
+            self.warm_openrouter_catalogue().await;
+            return;
+        }
         if self.flavor != Flavor::Ollama {
             return;
         }
@@ -314,10 +414,18 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         let body = self.request_body(&request);
 
-        let resp = self
+        let mut req = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(&self.api_key);
+        if self.flavor == Flavor::OpenRouter {
+            // Attribution, per OpenRouter's docs. Optional, but it is how an
+            // app appears on their rankings page, and it costs two headers.
+            req = req
+                .header("HTTP-Referer", "https://github.com/pedro-canedo/smith")
+                .header("X-Title", "smith");
+        }
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -559,6 +667,71 @@ fn messages_to_wire(messages: &[Message], system: Option<&str>) -> Vec<serde_jso
 
 #[cfg(test)]
 mod tests {
+    /// Fixture in OpenRouter's real `/models` shape (trimmed).
+    fn catalogue_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "data": [
+                {
+                    "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+                    "context_length": 1_000_000,
+                    "supported_parameters": ["tools", "temperature"]
+                },
+                {
+                    // Free but no tools: a chatbot, not an agent — excluded.
+                    "id": "somelab/chatty-7b:free",
+                    "context_length": 32_768,
+                    "supported_parameters": ["temperature"]
+                },
+                {
+                    // Tools but paid: window still learned, not in the free list.
+                    "id": "anthropic/claude-sonnet-5",
+                    "context_length": 200_000,
+                    "supported_parameters": ["tools"]
+                },
+                { "id": "broken/no-context" }
+            ]
+        })
+    }
+
+    #[test]
+    fn the_catalogue_parser_learns_windows_and_filters_free_tool_models() {
+        let (windows, free_tools) = parse_openrouter_catalogue(&catalogue_fixture());
+        assert_eq!(
+            windows.get("nvidia/nemotron-3-ultra-550b-a55b:free"),
+            Some(&1_000_000)
+        );
+        assert_eq!(windows.get("anthropic/claude-sonnet-5"), Some(&200_000));
+        assert!(!windows.contains_key("broken/no-context"));
+        assert_eq!(free_tools, ["nvidia/nemotron-3-ultra-550b-a55b:free"]);
+    }
+
+    #[test]
+    fn an_empty_or_alien_payload_parses_to_nothing_rather_than_panicking() {
+        let (windows, free) = parse_openrouter_catalogue(&serde_json::json!({}));
+        assert!(windows.is_empty() && free.is_empty());
+        let (windows, free) = parse_openrouter_catalogue(&serde_json::json!({"data": "?"}));
+        assert!(windows.is_empty() && free.is_empty());
+    }
+
+    /// Exercises the real catalogue endpoint. `/models` is public, so this
+    /// needs no key — only the network.
+    ///
+    /// `cargo test -p smith-provider live_openrouter -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_openrouter_lists_free_tool_models() {
+        let provider = OpenAiProvider::openrouter("unused".into(), "https://openrouter.ai/api/v1");
+        let free = provider.list_free_tool_models().await;
+        println!("free+tools: {free:?}");
+        assert!(
+            !free.is_empty(),
+            "no free tool-capable models — the curated chain needs revisiting"
+        );
+        let caps = provider.capabilities(&free[0]);
+        println!("{}: window {}", free[0], caps.context_window);
+        assert!(caps.context_window > GATEWAY_CONTEXT_WINDOW);
+    }
+
     /// Pins the id fix: this string prices turns and labels the
     /// `turns.provider` column, and it used to say "openai" for everyone.
     #[test]

@@ -13,7 +13,7 @@ use smith_core::{
     Action, Agent, AgentEvent, AgentPhase, LlmProvider, Message, PermissionAsk, QuestionAsk,
     Redactor, RetryPolicy, ToolContext, TurnLimits,
 };
-use smith_provider::{AnthropicProvider, OpenAiProvider};
+use smith_provider::{AnthropicProvider, FallbackEntry, FallbackProvider, OpenAiProvider};
 use smith_store::{SessionStore, TurnRecord, TurnTotals};
 use smith_tools::{CheckpointStore, ToolRegistry};
 use tokio::sync::{mpsc, Mutex};
@@ -155,6 +155,97 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
                 .unwrap_or_else(|| smith_config::DEFAULT_OLLAMA_BASE_URL.to_string());
             Ok(Arc::new(OpenAiProvider::ollama(base_url)))
         }
+    }
+}
+
+/// The provider the session actually drives: the primary alone when no
+/// `[fallback] providers` chain is configured (today's behavior, zero cost),
+/// or a `FallbackProvider` wrapping the primary plus each configured entry.
+///
+/// Errors are the design: an unknown provider name in the chain, or a chain
+/// entry whose key is missing, fails **naming the problem** instead of
+/// silently skipping the entry — a fallback that quietly is not there is
+/// discovered at the worst possible moment, which is the one moment it was
+/// configured for.
+pub fn build_provider_stack(
+    kind: ProviderKind,
+    config: &Config,
+) -> Result<Arc<dyn LlmProvider>, String> {
+    let primary = build_provider(kind, config)?;
+    if config.fallback.providers.is_empty() {
+        return Ok(primary);
+    }
+
+    let mut entries = vec![FallbackEntry {
+        provider: primary,
+        // The request's own model field drives the primary; the placeholder
+        // is overwritten per request by the wrapper.
+        model: config
+            .general
+            .model
+            .clone()
+            .unwrap_or_else(|| kind.default_model().to_string()),
+        label: kind.label().to_string(),
+    }];
+
+    for name in &config.fallback.providers {
+        let fallback_kind = ProviderKind::from_config_str(name).ok_or_else(|| {
+            format!(
+                "[fallback] providers names `{name}`, which is not a provider \
+                 (one of: anthropic, openai, openrouter, 9router, ollama)"
+            )
+        })?;
+        if fallback_kind == kind {
+            // The primary falling back to itself is a no-op; skip it rather
+            // than erroring, because a shared global config listing every
+            // provider someone has is a reasonable file to write.
+            continue;
+        }
+        let provider = build_provider(fallback_kind, config).map_err(|e| {
+            format!(
+                "[fallback] providers names `{name}`, but it is not usable: {e} \
+                 (a fallback that quietly is not there would be discovered at the \
+                 worst possible moment — configure it or remove it from the list)"
+            )
+        })?;
+        let model = match fallback_kind {
+            ProviderKind::NineRouter => config
+                .nine_router
+                .model
+                .clone()
+                .unwrap_or_else(|| fallback_kind.default_model().to_string()),
+            _ => fallback_kind.default_model().to_string(),
+        };
+        entries.push(FallbackEntry {
+            provider,
+            model,
+            label: fallback_kind.label().to_string(),
+        });
+    }
+
+    if entries.len() == 1 {
+        // Every configured entry was the primary itself.
+        return Ok(entries.remove(0).provider);
+    }
+    Ok(Arc::new(FallbackProvider::new(
+        entries,
+        RetryPolicy::default().max_retry_after,
+    )))
+}
+
+/// The retry budget, sized to the fallback chain.
+///
+/// The arithmetic: an advancement consumes one attempt (the handover error),
+/// and a strike-based advancement consumes up to `STRIKE_LIMIT` (2). With the
+/// default 4 attempts, a single dead entry could eat the whole budget before
+/// the next entry ever answers — so each fallback entry adds two attempts.
+/// Sleeps stay bounded: each is capped at `max_delay` (8s), and quota errors
+/// advance instead of sleeping out their `Retry-After`.
+pub fn retry_policy_for_chain(fallback_entries: usize) -> RetryPolicy {
+    let default = RetryPolicy::default();
+    RetryPolicy {
+        max_attempts: default.max_attempts + 2 * (fallback_entries as u32),
+        ..default
     }
 }
 
@@ -404,7 +495,7 @@ impl OrchestratorState {
             }
             None => self.provider_kind,
         };
-        let new_provider = build_provider(new_kind, config)?;
+        let new_provider = build_provider_stack(new_kind, config)?;
 
         let history = self.agent.history().to_vec();
         let permission_policy = self.agent.permission_policy();
@@ -633,7 +724,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
 
     let provider = match provider_override {
         Some(p) => p,
-        None => match build_provider(provider_kind, &config) {
+        None => match build_provider_stack(provider_kind, &config) {
             Ok(p) => p,
             Err(err) => {
                 let _ = event_tx.send(AgentEvent::Error(err));
@@ -753,7 +844,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         // `switch_model` has something to carry over and so `--max-turns` has
         // exactly one place to plug into.
         .with_limits(limits)
-        .with_retry_policy(RetryPolicy::default())
+        .with_retry_policy(retry_policy_for_chain(config.fallback.providers.len()))
         .with_redactor(secret_redactor(&config))
         .with_hooks(hook_set(&config))
         .with_permission_policy(permission_policy)
@@ -1142,6 +1233,69 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
 
 #[cfg(test)]
 mod tests {
+    /// A fallback that quietly is not there would be discovered at the worst
+    /// possible moment — the moment it was configured for.
+    /// Keys go through the config file, not env vars: env is process-global
+    /// and these tests run in parallel with the ones asserting on absence.
+    fn config_with_openrouter_key() -> Config {
+        let mut config = Config::default();
+        config.openrouter.api_key = Some("k".into());
+        config
+    }
+
+    #[test]
+    fn a_chain_naming_an_unknown_provider_errs_naming_it() {
+        let mut config = config_with_openrouter_key();
+        config.fallback.providers = vec!["chatgpt".into()];
+        let Err(err) = build_provider_stack(ProviderKind::Openrouter, &config) else {
+            panic!("an unknown chain entry must fail loudly");
+        };
+        assert!(err.contains("chatgpt"), "{err}");
+    }
+
+    #[test]
+    fn a_chain_entry_without_its_key_errs_naming_the_key() {
+        let mut config = config_with_openrouter_key();
+        config.fallback.providers = vec!["9router".into()];
+        let Err(err) = build_provider_stack(ProviderKind::Openrouter, &config) else {
+            panic!("an unusable chain entry must fail loudly");
+        };
+        assert!(err.contains("NINEROUTER_API_KEY"), "{err}");
+        assert!(err.contains("worst possible moment"), "{err}");
+    }
+
+    /// No chain configured — the primary alone, unwrapped, zero cost.
+    #[test]
+    fn an_empty_chain_returns_the_bare_primary() {
+        let provider =
+            build_provider_stack(ProviderKind::Openrouter, &config_with_openrouter_key()).unwrap();
+        assert_eq!(provider.id(), "openrouter");
+    }
+
+    /// A configured chain wraps: id() answers for the active (first) entry,
+    /// and a self-referential entry is skipped rather than duplicated.
+    #[test]
+    fn a_configured_chain_wraps_and_skips_the_primary_itself() {
+        let mut config = config_with_openrouter_key();
+        config.nine_router.api_key = Some("nk".into());
+        config.fallback.providers = vec!["openrouter".into(), "9router".into()];
+        let provider = build_provider_stack(ProviderKind::Openrouter, &config).unwrap();
+        assert_eq!(provider.id(), "openrouter", "primary serves first");
+    }
+
+    /// Two extra attempts per chain entry — the arithmetic in the doc.
+    #[test]
+    fn the_retry_budget_grows_with_the_chain() {
+        assert_eq!(
+            retry_policy_for_chain(0).max_attempts,
+            RetryPolicy::default().max_attempts
+        );
+        assert_eq!(
+            retry_policy_for_chain(2).max_attempts,
+            RetryPolicy::default().max_attempts + 4
+        );
+    }
+
     /// The clap value name is pinned because identifiers cannot start with a
     /// digit — without `#[value(name = "9router")]` the flag would demand
     /// `--provider nine-router`, a spelling nothing else uses.
