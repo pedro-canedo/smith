@@ -6,10 +6,12 @@ use smith_core::ProviderError;
 
 pub mod anthropic;
 pub mod fallback;
+pub mod ollama;
 pub mod openai;
 
 pub use anthropic::AnthropicProvider;
 pub use fallback::{FallbackEntry, FallbackProvider};
+pub use ollama::{classify_ollama_error, ollama_tags, OllamaModel};
 pub use openai::OpenAiProvider;
 
 /// TCP connect + TLS handshake. A healthy API endpoint completes this in well

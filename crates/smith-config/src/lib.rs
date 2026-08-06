@@ -176,6 +176,14 @@ pub struct FallbackSettings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OllamaSettings {
     pub base_url: Option<String>,
+    /// Which model a **fallback** entry should ask for.
+    ///
+    /// `[general] model` is the primary's model; a chain entry needs its own,
+    /// exactly as `[9router] model` already does. Without this every fallback
+    /// Ollama entry asked for the hardcoded default — and `setup_openrouter`
+    /// writes an Ollama fallback for almost everyone, so almost everyone's
+    /// chain pointed at a model they had probably never pulled.
+    pub model: Option<String>,
 }
 
 /// `[search]` — how `web_search` looks things up.
@@ -408,6 +416,7 @@ impl Config {
             target.api_key = incoming.api_key.or(target.api_key.take());
         }
         self.ollama.base_url = other.ollama.base_url.or(self.ollama.base_url.take());
+        self.ollama.model = other.ollama.model.or(self.ollama.model.take());
 
         let OpenRouterSettings {
             api_key,

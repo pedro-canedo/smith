@@ -36,7 +36,12 @@ const OPENAI_MODEL_LIMITS: &[(&str, u32, u32)] = &[
     ("o3", 200_000, 100_000),
 ];
 
-/// Ollama's own default `num_ctx`.
+/// Ollama's own default `num_ctx`, for a **local** model.
+///
+/// A cloud model (`:cloud`, proxied to ollama.com) is the exception and is
+/// handled in `warm_capabilities`: it has no local allocation to be truncated
+/// by, and `/api/tags` advertises its real window — 262144 for
+/// `nemotron-3-super:cloud`, which this constant would understate sixtyfold.
 ///
 /// The real window is whatever the *local* server allocates, which depends on
 /// the Modelfile, the `num_ctx` override, and how much VRAM the box has — none
@@ -290,6 +295,32 @@ impl OpenAiProvider {
             .to_string()
     }
 
+    /// Rewrites a provider error into something the user can act on.
+    ///
+    /// Only Ollama has anything to rewrite, and only because it is a proxy:
+    /// the failures that matter belong to `ollama.com` and to the daemon's
+    /// signed-in state, neither of which the raw JSON explains. Every other
+    /// flavour's errors are already about the thing the user configured, so
+    /// they pass through untouched — dressing up an error smith did not
+    /// understand is how a message stops being true.
+    pub(crate) fn translate_error(&self, err: ProviderError) -> ProviderError {
+        if self.flavor != Flavor::Ollama {
+            return err;
+        }
+        let ProviderError::Api { ref message, .. } = err else {
+            return err;
+        };
+        // The body is the message here: `api_error` puts the whole response
+        // text in it, and that text is the JSON the daemon sent.
+        let text = serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|body| crate::ollama::error_in_success_body(&body).map(str::to_string));
+        match text {
+            Some(inner) => crate::ollama::classify_ollama_error(&inner),
+            None => err,
+        }
+    }
+
     /// Asks Ollama what this model's context length actually is.
     ///
     /// `parameters` wins over `model_info` when it names `num_ctx`: the
@@ -379,6 +410,35 @@ impl LlmProvider for OpenAiProvider {
         if self.flavor != Flavor::Ollama {
             return;
         }
+
+        // A cloud model is proxied to ollama.com, so there is no local
+        // `num_ctx` allocation to be truncated by — the reason
+        // `OLLAMA_CONTEXT_WINDOW` is deliberately pessimistic does not apply
+        // to it. `/api/show` also does not answer for one, so probing it can
+        // only produce the 4096 guess: `nemotron-3-super:cloud` really has
+        // 262144, and reporting 4096 makes the gauge and auto-compaction both
+        // wrong by a factor of sixty.
+        //
+        // The catalogue is the one place that says so, and it says it for
+        // every model at once, so one call warms them all.
+        if let Ok(models) = crate::ollama::ollama_tags(&self.base_url).await {
+            if let Ok(mut known) = self.known_windows.write() {
+                for entry in models.iter().filter(|m| m.is_cloud) {
+                    if let Some(window) = entry.context_window {
+                        known.insert(entry.name.clone(), window);
+                    }
+                }
+            }
+            // A cloud model needs nothing further; the local probe below is
+            // about an allocation it does not have.
+            if models
+                .iter()
+                .any(|m| m.name == model && m.is_cloud && m.context_window.is_some())
+            {
+                return;
+            }
+        }
+
         let Some(window) = self.probe_ollama_window(model).await else {
             // Left unset on purpose: `known_window` then answers with the
             // conservative default, which is the right way to be wrong.
@@ -432,7 +492,7 @@ impl LlmProvider for OpenAiProvider {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(api_error(resp).await);
+            return Err(self.translate_error(api_error(resp).await));
         }
 
         let mut events = resp.bytes_stream().eventsource();
