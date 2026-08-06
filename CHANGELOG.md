@@ -4,6 +4,63 @@ All notable user-facing changes are tracked here.
 
 ## Unreleased
 
+## 0.2.0 — 2026-08-06
+
+### Added
+
+- **Free providers with automatic fallback**, so a fresh install has working
+  AI at no cost:
+  - **OpenRouter** — one free key unlocks the `:free` models. smith drives the
+    best free tool-capable one and sends the rest as a server-side chain
+    (`route: "fallback"`), so a model hitting its limit is replaced inside the
+    same request.
+  - **9Router** — a local gateway, auto-installed by `smith setup` along with
+    a private Node.js under `~/.smith/runtime/`, fanning out to 40+ upstream
+    providers with its own internal fallback.
+  - When the OpenRouter *account* quota dies mid-session, smith itself falls
+    over to the next entry in `[fallback] providers` without losing the
+    conversation. The handover is shown as it happens; the context gauge and
+    compaction follow the new model's window; costs are recorded under the
+    provider and model that actually served.
+  - `smith setup` now opens with the two free options.
+- Behavioral evals (`evals/`) for the halves of acceptance criteria #5 and #6
+  that `cargo test` deliberately does not assert, reported as a rate per model
+  rather than pass/fail. First run recorded under `evals/results/`.
+
+### Fixed
+
+- **Ollama context windows were assumed to be 4096.** For a cloud model with a
+  262144-token window that is wrong by a factor of 64 — and it is not
+  cosmetic, because auto-compaction fires against it: the conversation was
+  being summarised away every couple of rounds, so the model kept forgetting
+  what it had just searched for. smith now asks Ollama's own `/api/show`.
+- **The context gauge hid an over-full window**, printing `max(window, used)`
+  so 7.4k against a 4.1k window read as "100% 7.4k/7.4k" — a full window,
+  which is normal — instead of 181% of a window detected wrong.
+- **Every Ollama session was recorded as an OpenAI one.**
+  `OpenAiProvider::id()` was hardcoded; it prices turns and labels the
+  `turns.provider` column. Stored costs were always right; only the label was
+  wrong, and no migration is needed.
+- **`@path` completion ignored `.gitignore` outside a git repository**, so a
+  non-repo project offered build artifacts.
+- **The home directory could become the project root.** `~/.smith` is a root
+  marker and always exists, so any project without its own `.git` resolved to
+  `$HOME` — loading `~/SMITH.md` twice and widening the `@import` jail to the
+  whole home directory.
+- `smith setup` could fail to verify a freshly downloaded browser with "Text
+  file busy": between `fork` and `exec`, a subprocess started by another
+  thread holds an inherited write descriptor to the binary.
+
+### Changed
+
+- Answers are pinned to the language the user wrote in. Replies used to come
+  back in English when every source read along the way was English.
+- Settled knowledge is answered directly instead of searched for.
+- A message typed mid-turn is delivered *into* the running turn at its next
+  round boundary, so it can redirect work in flight; anything not taken by
+  the turn's end is sent as its own turn.
+- Consecutive searches collapse into one card with a row per query.
+
 ### Added
 
 - Terminal UI:
