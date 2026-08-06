@@ -1,0 +1,30 @@
+# Files allowed past the limit in scripts/check-file-size.sh, each with the
+# reason it earns the exception. This list is a backlog, not a record: the
+# check fails on an entry that has dropped under the limit, so removing a name
+# from here is part of the commit that shrinks the file.
+#
+# Every entry below is the same debt — a module that still holds more than one
+# concern. Splitting them is planned work, not a discovery.
+
+# `run_turn` (387 lines) and the tool-dispatch funnel around it. Twelve
+# cohesive groups have been mapped; `ReasoningFilter` and the text-tool-call
+# recovery are already `Agent`-free and come out first.
+crates/smith-core/src/agent.rs
+crates/smith-core/src/agent/tests.rs
+
+# `on_key` (435 lines) and `on_agent_event` (25 arms) in one impl, plus the
+# slash commands split across two non-contiguous blocks.
+crates/smith-tui/src/app.rs
+crates/smith-tui/src/app/tests.rs
+
+# The composition layer: layout arithmetic, tool cards, sidebar, modals.
+crates/smith-tui/src/ui.rs
+
+# One lexer with ~50 small scanner functions. Cohesive as it stands — this is
+# the entry least likely to be paid off, and splitting it into six files would
+# make the state machine harder to follow, not easier.
+crates/smith-tui/src/highlight.rs
+
+# Follows its module: the read-before-overwrite gate, the path jail and four
+# tools are tested together because they share the `ReadSet`.
+crates/smith-tools/src/fs_tools/tests.rs

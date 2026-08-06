@@ -19,26 +19,57 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Tests live inline in `#[cfg(test)] mod tests { ... }` at the bottom of the
-source file they cover. The only exceptions are the two files under
-`crates/smith-cli/tests/`, and both are forced rather than chosen: they test
-properties of the *process* that an in-process test cannot see.
-`headless_cli.rs` covers what stdin/stdout being pipes does and what the
-process exits with; `pty.rs` covers acceptance criterion #9 — "a panic leaves
-the terminal usable" — which needs a real tty, because with stdout on a pipe
-`enable_raw_mode` fails and the restore path under test is never entered.
-Both also need `CARGO_BIN_EXE_smith`, which cargo defines only for integration
-tests. Add a file under `tests/` only when a test genuinely cannot see what it
-needs from inside the crate. `cargo fmt`,
-`cargo clippy -D warnings`, and `cargo test --workspace` must all pass before
-committing.
+Tests live in a `#[cfg(test)] mod tests` that belongs to the module it
+covers — either inline at the bottom of the file, or, once the block passes
+roughly 400 lines, in a sibling `<module>/tests.rs` declared as
+`#[cfg(test)] mod tests;`. The two forms are the same thing: a non-inline
+`mod tests` is still a child module, so `use super::*` reaches every private
+item and the test paths are spelled identically
+(`agent::tests::a_bad_request_is_not_retried` either way). Fourteen modules
+use the sibling form today; the rest are small enough to stay inline. When
+moving a block out, let `cargo fmt` do the dedent rather than stripping
+columns by hand — a body line indented one level may be a line *inside* a
+multi-line string literal, and dedenting that edits the string's contents.
+
+Neither form is an integration test. The only files under
+`crates/smith-cli/tests/` are the two forced ones: they test properties of
+the *process* that an in-process test cannot see. `headless_cli.rs` covers
+what stdin/stdout being pipes does and what the process exits with; `pty.rs`
+covers acceptance criterion #9 — "a panic leaves the terminal usable" — which
+needs a real tty, because with stdout on a pipe `enable_raw_mode` fails and
+the restore path under test is never entered. Both also need
+`CARGO_BIN_EXE_smith`, which cargo defines only for integration tests. Add a
+file under `tests/` only when a test genuinely cannot see what it needs from
+inside the crate — an integration test cannot reach a private item, so moving
+tests there to shorten a file would mean publishing what is under test.
+
+`cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace`, and
+`bash scripts/check-file-size.sh` must all pass before committing. The clippy
+gate also lives in `[workspace.lints]`, so a local `cargo clippy` with no
+flags is already as strict as CI.
 
 ## Architecture
 
 `smith` is a terminal-based AI coding agent (Rust/ratatui), in the spirit of
-Claude Code. It's a Cargo workspace of 7 crates with dependencies flowing one
+Claude Code. It's a Cargo workspace of 8 crates with dependencies flowing one
 way: `smith-core` defines traits and knows nothing about HTTP, SQLite, or
 `ratatui`; every other crate implements against those traits.
+
+**There is deliberately no `domain/`, `application/` or `infrastructure/`
+split, and there should not be one.** The crate graph already *is* a
+ports-and-adapters architecture: `smith-core` holds the entities and the
+ports (`LlmProvider`, `Tool`, `ToolExecutor`, `Checkpointer`) and the one use
+case (`Agent::run_turn`); `smith-provider`, `smith-store`, `smith-tools` and
+`smith-mcp` are adapters; `smith-tui` is presentation; `smith-cli` is the
+composition root and the only crate that depends on all seven. The dependency
+rule is enforced by the compiler rather than by convention — `smith-core`'s
+manifest does not list `smith-store`, so it physically cannot write
+`use smith_store::...`. A folder taxonomy enforces nothing, because `rustc`
+has no opinion about directory names; adopting one would trade a
+compiler-checked boundary for a naming convention. Modules are therefore named
+after the domain concept (`agent`, `hooks`, `checkpoint`, `redact`), never
+after an architectural role, which is what the rest of the Rust ecosystem
+does too.
 
 - **`smith-core`** — domain types (`Message`, `ContentBlock`, `StreamEvent`),
   the `LlmProvider`/`Tool` traits, and the `Agent` orchestration loop

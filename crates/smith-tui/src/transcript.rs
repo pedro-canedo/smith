@@ -265,6 +265,7 @@ fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
 mod tests {
     use super::*;
     use crate::app::{ActivityStatus, ChatLine, ChatRole};
+    use crate::testkit::test_app;
 
     fn key(width: u16, verbose: bool) -> LayoutKey {
         LayoutKey {
@@ -319,26 +320,6 @@ mod tests {
             0,
             "ten more frames must not re-parse a single message"
         );
-    }
-
-    fn test_app() -> crate::app::App {
-        crate::app::App::new(crate::app::TuiConfig {
-            banner: String::new(),
-            provider_label: "ollama".into(),
-            model_label: "qwen2.5".into(),
-            cwd_display: "~/smith".into(),
-            git_branch: None,
-            idle_hint: crate::app::IdleHint::Tip(String::new()),
-            initial_lines: Vec::new(),
-            permission_policy: smith_core::PermissionPolicy::default(),
-            theme: crate::Theme::ansi(),
-            goal: None,
-            tasks: Vec::new(),
-            commands: crate::slash::SlashRegistry::builtin(),
-            keys: Default::default(),
-            history: Vec::new(),
-            logs: crate::logbuf::LogBuffer::default(),
-        })
     }
 
     fn rendered(cache: &TranscriptCache) -> String {

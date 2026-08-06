@@ -46,9 +46,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Reads no source semantics, so it runs before the toolchain is asked to
+      # do anything expensive and fails in seconds when it fails at all.
+      - name: file size
+        run: bash scripts/check-file-size.sh
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+      # `-D warnings` is now belt and braces: `[workspace.lints]` in the root
+      # manifest carries the same gate, so a local `cargo clippy` is as strict
+      # as this one. Keeping the flag catches anything outside that table.
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
