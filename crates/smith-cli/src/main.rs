@@ -823,7 +823,9 @@ fn resolve_session(
         return Ok((
             None,
             Vec::new(),
-            IdleHint::Tip(GENERIC_TIP.to_string()),
+            IdleHint::NewSession {
+                title: new_session_title(),
+            },
             None,
         ));
     };
@@ -876,13 +878,25 @@ fn resolve_session(
 
     let idle_hint = match store.latest_session() {
         Ok(Some(summary)) => IdleHint::ContinueSession {
-            title: summary.title,
+            title: format!(
+                "New session - {}",
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ),
             resume_cmd: format!("smith --resume {}", summary.id),
         },
-        _ => IdleHint::Tip(GENERIC_TIP.to_string()),
+        _ => IdleHint::NewSession {
+            title: new_session_title(),
+        },
     };
 
     Ok((None, Vec::new(), idle_hint, None))
+}
+
+fn new_session_title() -> String {
+    format!(
+        "New session - {}",
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    )
 }
 
 fn messages_to_chat_lines(messages: &[Message]) -> Vec<ChatLine> {

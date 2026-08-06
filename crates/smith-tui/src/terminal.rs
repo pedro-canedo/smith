@@ -1,4 +1,5 @@
 use std::io::{self, Stdout};
+use std::sync::OnceLock;
 
 use crossterm::cursor::Show;
 use crossterm::event::{
@@ -15,6 +16,13 @@ use ratatui::Terminal;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+// `supports_keyboard_enhancement` performs a terminal query.  Querying again
+// while restoring the terminal can leave the terminal's response in the
+// shell's input buffer (especially in WSL/Windows Terminal), which then shows
+// up as `^[[?...` after Smith exits.  Probe once when entering the TUI and use
+// the recorded result for every later cleanup path.
+static KEYBOARD_ENHANCEMENT_ENABLED: OnceLock<bool> = OnceLock::new();
+
 pub fn init() -> io::Result<Tui> {
     enable_raw_mode()?;
     // Bracketed paste turns a pasted block into one `Event::Paste` instead of
@@ -23,7 +31,9 @@ pub fn init() -> io::Result<Tui> {
     execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     // Lets terminals that support it distinguish Shift+Enter from Enter.
     // Everywhere else the two are the same byte and Alt+Enter is the fallback.
-    if keyboard_enhancement_available() {
+    let keyboard_enhancement = keyboard_enhancement_available();
+    let _ = KEYBOARD_ENHANCEMENT_ENABLED.set(keyboard_enhancement);
+    if keyboard_enhancement {
         execute!(
             io::stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -34,7 +44,7 @@ pub fn init() -> io::Result<Tui> {
 }
 
 pub fn restore() -> io::Result<()> {
-    if keyboard_enhancement_available() {
+    if KEYBOARD_ENHANCEMENT_ENABLED.get().copied().unwrap_or(false) {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
     let raw = disable_raw_mode();

@@ -212,6 +212,11 @@ fn draw_idle(frame: &mut Frame, app: &App, area: Rect) {
         ),
         theme.secondary(),
     )));
+    let location = match &app.git_branch {
+        Some(branch) => format!("{} · git:{branch}", app.cwd_display),
+        None => app.cwd_display.clone(),
+    };
+    lines.push(Line::from(Span::styled(location, theme.disabled())));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Enter send   Alt+Enter newline   Esc cancel   Ctrl+O pick a tool card   Ctrl+C ×2 quit",
@@ -225,6 +230,12 @@ fn draw_idle(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled("● ", theme.amber()),
                 Span::styled("Tip ", theme.amber().add_modifier(Modifier::BOLD)),
                 Span::styled(tip.clone(), theme.disabled()),
+            ]));
+        }
+        IdleHint::NewSession { title } => {
+            lines.push(Line::from(vec![
+                Span::styled("Session   ", theme.bold()),
+                Span::styled(title.clone(), theme.text()),
             ]));
         }
         IdleHint::ContinueSession { title, resume_cmd } => {

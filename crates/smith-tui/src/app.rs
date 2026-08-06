@@ -437,6 +437,7 @@ impl Modal {
 #[derive(Debug, Clone)]
 pub enum IdleHint {
     Tip(String),
+    NewSession { title: String },
     ContinueSession { title: String, resume_cmd: String },
 }
 
