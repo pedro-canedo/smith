@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use smith_config::Config;
 use smith_core::{Action, AgentEvent, ContentBlock, Message, PermissionAsk, QuestionAsk};
 use smith_store::SessionStore;
-use smith_tui::{ChatLine, ChatRole, IdleHint, TuiConfig};
+use smith_tui::{ChatLine, ChatRole, IdleHint, Theme, TuiConfig};
 use tokio::sync::mpsc;
 
 use headless::{HeadlessOptions, OutputFormat, EXIT_OK, EXIT_TURN_FAILED, EXIT_USAGE};
@@ -26,7 +26,7 @@ use orchestrator::{
 const GENERIC_TIP: &str = "run `smith setup` to add or change your provider or model";
 
 #[derive(Debug, Parser)]
-#[command(name = "smith", about = "A terminal AI coding agent")]
+#[command(name = "smith", version, about = "A terminal AI coding agent")]
 struct Cli {
     /// Which LLM provider to talk to (overrides the saved config).
     #[arg(long, value_enum)]
@@ -54,6 +54,19 @@ struct Cli {
     /// How a non-interactive run reports itself. Implies --print.
     #[arg(long, value_enum, value_name = "FORMAT")]
     output_format: Option<OutputFormat>,
+
+    /// Force ASCII glyphs in the terminal UI.
+    #[arg(long)]
+    ascii: bool,
+
+    /// Screen-reader friendly output: no TUI, no chrome, no colour escapes.
+    #[arg(long)]
+    plain: bool,
+
+    /// Debug-only: initialize the TUI terminal and then panic, for PTY tests.
+    #[cfg(debug_assertions)]
+    #[arg(long, hide = true)]
+    panic_now: bool,
 
     /// Cap the tool-call rounds one turn may take before it stops itself.
     #[arg(long, value_name = "N")]
@@ -88,7 +101,11 @@ impl Cli {
     /// CI log produces garbage that also never exits, because there is no
     /// terminal to send it the keystroke that would quit.
     fn is_headless(&self, stdout_is_tty: bool) -> bool {
-        self.print.is_some() || self.output_format.is_some() || !stdout_is_tty
+        self.print.is_some()
+            || self.output_format.is_some()
+            || self.plain
+            || is_dumb_terminal()
+            || !stdout_is_tty
     }
 }
 
@@ -185,6 +202,17 @@ async fn main() -> ExitCode {
             eprintln!("smith: cannot use --cwd {}: {e}", dir.display());
             return ExitCode::from(EXIT_USAGE);
         }
+    }
+
+    #[cfg(debug_assertions)]
+    if cli.panic_now {
+        return match smith_tui::panic_after_terminal_init_for_test() {
+            Ok(()) => ExitCode::from(EXIT_OK),
+            Err(e) => {
+                eprintln!("smith: {e}");
+                ExitCode::from(EXIT_TURN_FAILED)
+            }
+        };
     }
 
     // After `--cwd`, unlike `setup`: which SMITH.md this writes to is decided
@@ -579,6 +607,7 @@ async fn run_tui(cli: Cli) -> ExitCode {
         idle_hint: std::mem::replace(&mut startup.idle_hint, IdleHint::Tip(String::new())),
         initial_lines,
         permission_policy: startup.permission_policy,
+        theme: tui_theme(cli.ascii),
         goal: startup.initial_goal.clone(),
         tasks: last_write_tasks_call(&startup.initial_messages),
         commands: smith_tui::slash::SlashRegistry::new(commands),
@@ -688,7 +717,7 @@ async fn run_headless(cli: Cli) -> u8 {
         prompt,
         format: cli.output_format.unwrap_or_default(),
         allowed_tools: cli.allowed_tools.iter().cloned().collect::<BTreeSet<_>>(),
-        color: use_color(),
+        color: use_color() && !cli.plain,
         provider: startup.provider_kind.label().to_string(),
         model: startup.model.clone(),
     };
@@ -712,6 +741,23 @@ fn use_color() -> bool {
         std::env::var_os("NO_COLOR").as_deref(),
         std::io::stderr().is_terminal(),
     )
+}
+
+fn tui_theme(force_ascii: bool) -> Theme {
+    let theme = Theme::detect();
+    if force_ascii {
+        theme.ascii_glyphs()
+    } else {
+        theme
+    }
+}
+
+fn is_dumb_terminal() -> bool {
+    term_is_dumb(std::env::var_os("TERM").as_deref())
+}
+
+fn term_is_dumb(term: Option<&std::ffi::OsStr>) -> bool {
+    term.and_then(std::ffi::OsStr::to_str) == Some("dumb")
 }
 
 /// Whether the text format may use ANSI colour.
@@ -1053,6 +1099,7 @@ mod tests {
     fn print_forces_headless_even_on_a_terminal() {
         assert!(cli(&["-p", "hi"]).is_headless(true));
         assert!(cli(&["--print", "hi"]).is_headless(true));
+        assert!(cli(&["--plain", "-p", "hi"]).is_headless(true));
         // Asking for a machine-readable format is the same request by another
         // name — a TUI cannot produce one.
         assert!(cli(&["--output-format", "json"]).is_headless(true));
@@ -1093,6 +1140,19 @@ mod tests {
             Some(OutputFormat::StreamJson)
         );
         assert_eq!(cli(&["-p", "x"]).output_format, None);
+    }
+
+    #[test]
+    fn term_dumb_is_treated_as_non_interactive() {
+        assert!(term_is_dumb(Some(OsStr::new("dumb"))));
+        assert!(!term_is_dumb(Some(OsStr::new("xterm-256color"))));
+        assert!(!term_is_dumb(None));
+    }
+
+    #[test]
+    fn ascii_flag_forces_the_tui_glyph_axis_only() {
+        assert!(!tui_theme(true).unicode);
+        assert_eq!(tui_theme(false).raised, Theme::detect().raised);
     }
 
     #[test]

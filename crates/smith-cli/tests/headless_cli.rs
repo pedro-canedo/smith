@@ -142,3 +142,97 @@ fn an_unusable_cwd_is_rejected_up_front() {
     assert_eq!(output.status.code(), Some(EXIT_USAGE));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--cwd"));
 }
+
+/// A panic in the TUI has to leave the user's terminal usable. This cannot be
+/// tested in-process: raw/cooked mode and alternate-screen state belong to the
+/// tty device, not to a Rust value.
+#[cfg(unix)]
+#[test]
+fn an_induced_tui_panic_restores_the_pty() {
+    use std::fs::File;
+    use std::io::Read;
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let mut master_fd = 0;
+    let mut slave_fd = 0;
+    let opened = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(opened, 0, "openpty failed");
+
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let before = termios(slave.as_raw_fd());
+
+    let reader = std::thread::spawn(move || {
+        let mut reader = master;
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("pty read failed: {e}"),
+            }
+        }
+        bytes
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_smith"))
+        .arg("--panic-now")
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .unwrap();
+
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "--panic-now must actually panic");
+
+    let after = termios(slave.as_raw_fd());
+    assert_eq!(
+        after.c_lflag & libc::ICANON,
+        before.c_lflag & libc::ICANON,
+        "panic left canonical mode changed"
+    );
+    assert_eq!(
+        after.c_lflag & libc::ECHO,
+        before.c_lflag & libc::ECHO,
+        "panic left echo mode changed"
+    );
+
+    drop(slave);
+    let output = reader.join().unwrap();
+    let text = String::from_utf8_lossy(&output);
+    let entered = text
+        .find("\x1b[?1049h")
+        .unwrap_or_else(|| panic!("alternate screen was never entered: {text:?}"));
+    let left = text
+        .rfind("\x1b[?1049l")
+        .unwrap_or_else(|| panic!("alternate screen was never left: {text:?}"));
+    let cursor = text
+        .rfind("\x1b[?25h")
+        .unwrap_or_else(|| panic!("cursor was never shown again: {text:?}"));
+    assert!(entered < left, "leave must follow enter: {text:?}");
+    assert!(
+        entered < cursor,
+        "cursor restore must follow enter: {text:?}"
+    );
+
+    fn termios(fd: i32) -> libc::termios {
+        let mut termios = MaybeUninit::<libc::termios>::uninit();
+        let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+        assert_eq!(rc, 0, "tcgetattr failed");
+        unsafe { termios.assume_init() }
+    }
+}
