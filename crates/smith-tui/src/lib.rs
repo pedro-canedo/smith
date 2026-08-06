@@ -3,6 +3,7 @@
 pub mod app;
 pub mod banner;
 pub mod components;
+pub mod highlight;
 pub mod logbuf;
 pub mod markdown;
 pub mod slash;
