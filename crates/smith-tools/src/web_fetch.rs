@@ -986,7 +986,14 @@ fn decode_entities(text: &str) -> String {
         out.push_str(&rest[..amp]);
         rest = &rest[amp..];
         // Entities are short; a stray `&` in prose must not swallow a line.
-        let limit = rest.len().min(12);
+        // The cap is in bytes, so it can land inside a multi-byte character
+        // ("&0123456789é" puts byte 12 inside the é) — walk it back to a char
+        // boundary rather than panic. Entities are ASCII, so a window that
+        // shrank into one is a window that held no entity anyway.
+        let mut limit = rest.len().min(12);
+        while !rest.is_char_boundary(limit) {
+            limit -= 1;
+        }
         let Some(semi) = rest[..limit].find(';') else {
             out.push('&');
             rest = &rest[1..];
@@ -1300,6 +1307,21 @@ mod tests {
         // than being silently eaten.
         assert!(text.contains('&'), "{text}");
         assert!(text.contains("co — it’s 5 €"), "{text}");
+    }
+
+    /// The crash a Portuguese page produced in the wild: a stray `&` whose
+    /// 12-byte entity window ends inside a multi-byte character. Slicing at
+    /// the raw byte cap panicked on the char boundary; the window must shrink
+    /// to the boundary instead.
+    #[test]
+    fn a_stray_ampersand_before_a_multibyte_char_does_not_panic() {
+        // '&' + 10 ASCII bytes puts the é at bytes 11..13 — the cap of 12
+        // lands mid-character.
+        let decoded = decode_entities("&0123456789é ok");
+        assert_eq!(decoded, "&0123456789é ok");
+        // Same shape routed through the full page pipeline.
+        let (_, text) = html_to_text("<p>&0123456789é ok</p>");
+        assert!(text.contains("é ok"), "{text}");
     }
 
     #[test]
