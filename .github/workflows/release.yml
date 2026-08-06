@@ -40,6 +40,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       # `v0.1.0` -> `0.1.0`, from the pushed tag or the manual input.
       - name: Resolve version
@@ -107,6 +109,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -118,8 +122,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes \
-            --verify-tag \
-            dist/*
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag \
+              dist/*
+          fi
