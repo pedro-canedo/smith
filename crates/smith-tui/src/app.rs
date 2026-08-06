@@ -41,6 +41,14 @@ pub enum ChatRole {
     Thought,
 }
 
+/// Tools whose consecutive calls collapse into one card.
+///
+/// Deliberately a short list rather than "any repeated tool": the trade is
+/// only worth it when the card is pure status. A search card is its query; a
+/// `read_file` card can carry a diff or an error tail, and folding those would
+/// hide the thing you wanted to see.
+const GROUPABLE_TOOLS: &[&str] = &["web_search", "web_fetch"];
+
 /// Source of `LineStamp`s. Process-wide and monotonic, so a stamp is never
 /// reused across lines or across successive states of the same line.
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
@@ -60,6 +68,15 @@ pub(crate) struct LineStamp(u64);
 
 fn next_stamp() -> LineStamp {
     LineStamp(NEXT_STAMP.fetch_add(1, Ordering::Relaxed))
+}
+
+/// One call folded into a grouped card — see `ChatLine::grouped`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedCall {
+    pub id: String,
+    /// What the call was about, e.g. the search query.
+    pub label: String,
+    pub status: ActivityStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +111,21 @@ pub struct ChatLine {
     /// here ends in `touch()`, so toggling one card invalidates exactly that
     /// card's memo entry. A global "expanded" flag would have to join
     /// `LayoutKey` instead, and re-render the whole transcript per keystroke.
+    /// Further calls of the same tool folded into this card.
+    ///
+    /// A research turn issues six searches in a row, and six cards is six
+    /// times the chrome for one activity — it reads as noise and buries what
+    /// the agent is actually doing. They collapse into one card with a line
+    /// per query. Held on the line rather than derived at render time so the
+    /// transcript memo still keys on a single entry: a card whose rows
+    /// depended on its neighbours could not be cached per line.
+    grouped: Vec<GroupedCall>,
+    /// How *this* card's own call ended, as distinct from the group's verdict.
+    ///
+    /// They differ the moment a card has children: the first search finishing
+    /// must not settle a card whose second search is still running, which is
+    /// exactly what happened when one field carried both.
+    own_status: Option<ActivityStatus>,
     expanded: bool,
     /// Set only for `ChatRole::Tool` lines: the transcript's selection cursor
     /// is on this card. Same reasoning as `expanded` — and because nothing is
@@ -116,6 +148,8 @@ impl ChatLine {
             tool_output: None,
             tool_secs: None,
             started_at: None,
+            grouped: Vec::new(),
+            own_status: None,
             expanded: false,
             selected: false,
             stamp: next_stamp(),
@@ -236,10 +270,90 @@ impl ChatLine {
             && matches!(self.tool_status, Some(ActivityStatus::Running) | None)
     }
 
+    /// Whether this card can absorb another call of `name` as a sibling.
+    ///
+    /// Only tools whose cards are pure status — a search's card says which
+    /// query ran and nothing else, so five of them stacked are five headers
+    /// around one fact. A `read_file` or an `edit_file` card carries content
+    /// worth its own frame, so those are never folded.
+    fn can_group(&self, name: &str) -> bool {
+        self.role == ChatRole::Tool
+            && self.tool_name.as_deref() == Some(name)
+            && GROUPABLE_TOOLS.contains(&name)
+    }
+
+    /// Folds another call of the same tool into this card.
+    fn group(&mut self, id: String, label: String) {
+        self.grouped.push(GroupedCall {
+            id,
+            label,
+            status: ActivityStatus::Running,
+        });
+        // The card is running again as a whole while any child is.
+        self.tool_status = Some(ActivityStatus::Running);
+        if self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+        }
+        self.touch();
+    }
+
+    /// Every call this card stands for, its own first.
+    pub fn grouped(&self) -> &[GroupedCall] {
+        &self.grouped
+    }
+
+    /// Marks one folded call finished. `true` when this card owned it.
+    fn finish_grouped(&mut self, id: &str, status: ActivityStatus) -> bool {
+        let Some(child) = self.grouped.iter_mut().find(|c| c.id == id) else {
+            return false;
+        };
+        child.status = status;
+        self.settle_group();
+        self.touch();
+        true
+    }
+
+    /// Recomputes a grouped card's verdict from its own call and its children.
+    ///
+    /// Running while anything under it is; failed if any part failed, because
+    /// a group reported as clean when one search was blocked would hide the
+    /// only fact worth acting on.
+    fn settle_group(&mut self) {
+        let pending = self.own_status.is_none()
+            || self
+                .grouped
+                .iter()
+                .any(|c| c.status == ActivityStatus::Running);
+        if pending {
+            self.tool_status = Some(ActivityStatus::Running);
+            return;
+        }
+        let failed = self.own_status == Some(ActivityStatus::Error)
+            || self
+                .grouped
+                .iter()
+                .any(|c| c.status == ActivityStatus::Error);
+        self.tool_status = Some(if failed {
+            ActivityStatus::Error
+        } else {
+            ActivityStatus::Done
+        });
+        if let Some(started) = self.started_at.take() {
+            self.tool_secs = Some(started.elapsed().as_secs_f32());
+        }
+    }
+
     /// Records a tool call's outcome, on the `ToolCallResult` that ends it.
     fn finish_tool(&mut self, status: ActivityStatus, output: String) {
-        self.tool_status = Some(status);
+        self.own_status = Some(status);
         self.tool_output = Some(output);
+        if !self.grouped.is_empty() {
+            // A group settles on its slowest member, not its first.
+            self.settle_group();
+            self.touch();
+            return;
+        }
+        self.tool_status = Some(status);
         if let Some(started) = self.started_at {
             self.tool_secs = Some(started.elapsed().as_secs_f32());
         }
@@ -2507,10 +2621,31 @@ impl App {
                 // checklist panel — neither needs the generic tool-call line.
                 if tool_name != "ask_user" && tool_name != "write_tasks" {
                     self.phase = AgentPhase::Working;
-                    // Permanent transcript record — the tool card replaces
-                    // the old activity strip, so this line is all we need.
-                    self.lines
-                        .push(ChatLine::tool(id.clone(), tool_name.clone(), label, input));
+                    // Consecutive calls of a status-only tool fold into the
+                    // card above rather than stacking. Only when it is the
+                    // *last* line: a search after a reply is a new activity,
+                    // and joining it to a card further up would reorder the
+                    // transcript.
+                    match self.lines.last_mut() {
+                        Some(last) if last.can_group(&tool_name) => {
+                            // The child's row carries only its target: the
+                            // header above it already says the activity, and
+                            // repeating "Searching the web…" per row is the
+                            // noise this exists to remove.
+                            last.group(id.clone(), group_target(&tool_name, &input));
+                        }
+                        _ => {
+                            // Permanent transcript record — the tool card
+                            // replaces the old activity strip, so this line is
+                            // all we need.
+                            self.lines.push(ChatLine::tool(
+                                id.clone(),
+                                tool_name.clone(),
+                                label,
+                                input,
+                            ));
+                        }
+                    }
                 }
                 // End any in-flight thinking gap — the model is acting now.
                 self.end_thinking();
@@ -2521,17 +2656,26 @@ impl App {
                 output,
                 is_error,
             } => {
+                let status = if is_error {
+                    ActivityStatus::Error
+                } else {
+                    ActivityStatus::Done
+                };
                 if let Some(line) = self
                     .lines
                     .iter_mut()
                     .find(|l| l.tool_id() == Some(id.as_str()))
                 {
-                    let status = if is_error {
-                        ActivityStatus::Error
-                    } else {
-                        ActivityStatus::Done
-                    };
                     line.finish_tool(status, output.clone());
+                } else {
+                    // Not a card of its own: it was folded into one, so the id
+                    // belongs to a child. Searched second because the common
+                    // case is the first branch.
+                    for line in self.lines.iter_mut() {
+                        if line.finish_grouped(&id, status) {
+                            break;
+                        }
+                    }
                 }
                 // Model starts thinking again after a result — but only once
                 // the *last* result of a concurrent round has landed. A round
@@ -2877,6 +3021,22 @@ fn pretty_tool_name(name: &str) -> String {
 /// Short, human-readable summary of what a tool call is doing — the
 /// running-state label plus its target, kept as the tool line's `text` for
 /// anything that reads lines as plain strings (tests, future exports).
+/// What one folded call was about — the query, the URL — with no activity
+/// wording around it. Mirrors `ui::tool_target`, which does the same job for
+/// a card's own header, but from the raw input rather than from a `ChatLine`.
+fn group_target(tool_name: &str, input: &serde_json::Value) -> String {
+    let field = match tool_name {
+        "web_search" => "query",
+        "web_fetch" => "url",
+        _ => return String::new(),
+    };
+    input
+        .get(field)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn activity_label(tool_name: &str, input: &serde_json::Value) -> String {
     let field = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or_default();
     let target = match tool_name {
@@ -3736,6 +3896,113 @@ mod tests {
             app.is_animating(),
             "the running card's throbber has to keep ticking"
         );
+    }
+
+    fn search(app: &mut App, id: &str, query: &str) {
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: id.to_string(),
+            tool_name: "web_search".into(),
+            input: serde_json::json!({ "query": query }),
+        });
+    }
+
+    fn finish(app: &mut App, id: &str) {
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: id.to_string(),
+            output: "3 results".into(),
+            is_error: false,
+        });
+    }
+
+    /// A research turn issues six searches in a row; six cards is six times
+    /// the chrome for one activity, and it buries what the agent is doing.
+    #[test]
+    fn consecutive_searches_collapse_into_one_card() {
+        let mut app = test_app();
+        search(&mut app, "s1", "rust 1.97 release");
+        search(&mut app, "s2", "rust release schedule");
+        search(&mut app, "s3", "rust beta 1.98");
+
+        let cards: Vec<&ChatLine> = app
+            .lines
+            .iter()
+            .filter(|l| l.role == ChatRole::Tool)
+            .collect();
+        assert_eq!(cards.len(), 1, "one card per run of searches");
+        assert_eq!(cards[0].grouped().len(), 2, "the other two folded in");
+        assert_eq!(cards[0].grouped()[0].label, "rust release schedule");
+    }
+
+    /// The card is done only once nothing under it is still running.
+    #[test]
+    fn a_grouped_card_stays_running_until_its_last_child_lands() {
+        let mut app = test_app();
+        search(&mut app, "s1", "one");
+        search(&mut app, "s2", "two");
+
+        finish(&mut app, "s1");
+        let card = app.lines.iter().find(|l| l.role == ChatRole::Tool).unwrap();
+        assert_eq!(card.tool_status(), Some(ActivityStatus::Running));
+
+        finish(&mut app, "s2");
+        let card = app.lines.iter().find(|l| l.role == ChatRole::Tool).unwrap();
+        assert_eq!(card.tool_status(), Some(ActivityStatus::Done));
+    }
+
+    /// One failure inside the group is visible on the card.
+    #[test]
+    fn a_failed_child_makes_the_group_report_failure() {
+        let mut app = test_app();
+        search(&mut app, "s1", "one");
+        search(&mut app, "s2", "two");
+        finish(&mut app, "s1");
+        app.on_agent_event(AgentEvent::ToolCallResult {
+            id: "s2".into(),
+            output: "blocked".into(),
+            is_error: true,
+        });
+        let card = app.lines.iter().find(|l| l.role == ChatRole::Tool).unwrap();
+        assert_eq!(card.tool_status(), Some(ActivityStatus::Error));
+    }
+
+    /// Only *consecutive* calls fold. A search after a reply is a new
+    /// activity, and joining it to a card further up would reorder history.
+    #[test]
+    fn a_search_after_something_else_starts_a_new_card() {
+        let mut app = test_app();
+        search(&mut app, "s1", "one");
+        finish(&mut app, "s1");
+        app.lines
+            .push(ChatLine::new(ChatRole::Assistant, "here is what I found"));
+        search(&mut app, "s2", "two");
+
+        let cards = app
+            .lines
+            .iter()
+            .filter(|l| l.role == ChatRole::Tool)
+            .count();
+        assert_eq!(cards, 2);
+    }
+
+    /// A card that carries content of its own is never folded — a `read_file`
+    /// card can hold a diff or an error tail, and hiding those is the opposite
+    /// of the point.
+    #[test]
+    fn only_status_only_tools_are_grouped() {
+        let mut app = test_app();
+        for (i, path) in ["a.rs", "b.rs", "c.rs"].iter().enumerate() {
+            app.on_agent_event(AgentEvent::ToolCallStarted {
+                id: format!("r{i}"),
+                tool_name: "read_file".into(),
+                input: serde_json::json!({ "path": path }),
+            });
+        }
+        let cards = app
+            .lines
+            .iter()
+            .filter(|l| l.role == ChatRole::Tool)
+            .count();
+        assert_eq!(cards, 3, "reads must keep their own cards");
     }
 
     /// Being unable to type until the agent stops is the wrong trade for an

@@ -785,6 +785,37 @@ fn tool_card(
 
     let mut out = vec![panel::fill_line(left, w, bg)];
 
+    // Folded siblings, one row each: the header says what activity is running
+    // and these say what it is running *on*. The first target is already in
+    // the header, so the list starts with the second call.
+    if !line.grouped().is_empty() {
+        let branch = if theme.unicode {
+            "\u{2514}\u{2500} "
+        } else {
+            "|- "
+        };
+        for call in line.grouped() {
+            let (glyph, style) = match call.status {
+                ActivityStatus::Running => (
+                    spinner_frame_for(line, spinner_frame, theme).to_string(),
+                    theme.ember(),
+                ),
+                ActivityStatus::Done => (theme.icon_ok().to_string(), theme.success()),
+                ActivityStatus::Error => (theme.icon_error().to_string(), theme.danger()),
+            };
+            let text = truncate_chars(&call.label, w.saturating_sub(branch.chars().count() + 4));
+            out.push(panel::fill_line(
+                vec![
+                    Span::styled(format!("  {branch}"), theme.disabled()),
+                    Span::styled(format!("{glyph} "), style),
+                    Span::styled(text, theme.secondary()),
+                ],
+                w,
+                bg,
+            ));
+        }
+    }
+
     let finished_error = matches!(line.tool_status(), Some(ActivityStatus::Error));
     let finished = matches!(
         line.tool_status(),
@@ -3158,6 +3189,45 @@ mod tests {
     /// could sit two rows past its own content. Asserting "the last line is
     /// still visible" is not enough to catch that: overscrolled by two, it is
     /// visible, just with dead space under it. The dead space is the symptom.
+    /// The card the user asked for: one activity header, one row per query.
+    #[test]
+    fn a_grouped_search_card_shows_one_row_per_query_under_one_header() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_for_input_tests();
+        for (i, query) in ["rust 1.97 release", "rust release schedule"]
+            .iter()
+            .enumerate()
+        {
+            app.on_agent_event(smith_core::AgentEvent::ToolCallStarted {
+                id: format!("s{i}"),
+                tool_name: "web_search".into(),
+                input: serde_json::json!({ "query": query }),
+            });
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        // One header for the activity…
+        assert_eq!(
+            text.matches("Searching the web").count(),
+            1,
+            "the activity header repeated: {text}"
+        );
+        // …and both queries visible under it.
+        assert!(text.contains("rust 1.97 release"), "{text}");
+        assert!(text.contains("rust release schedule"), "{text}");
+    }
+
     #[test]
     fn scrolling_a_modal_to_the_end_leaves_no_dead_space_under_it() {
         use ratatui::backend::TestBackend;
