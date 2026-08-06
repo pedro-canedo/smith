@@ -1054,7 +1054,6 @@ fn toml_string(lx: &mut Lexer) {
 /// lives in — including block scalars (`key: |`), whose body is every following
 /// line indented deeper than the key.
 fn yaml(lx: &mut Lexer) {
-    let src = lx.src;
     let mut block: Option<usize> = None;
     while !lx.eof() {
         let before = lx.pos;
@@ -1120,7 +1119,6 @@ fn yaml(lx: &mut Lexer) {
         consume_newline(lx);
         force_progress(lx, before);
     }
-    let _ = src;
 }
 
 fn consume_newline(lx: &mut Lexer) {
@@ -1147,11 +1145,12 @@ fn yaml_value(lx: &mut Lexer, block: &mut Option<usize>, indent: usize) {
                 lx.push(start, Tok::Comment);
                 return;
             }
-            Some(c @ ('|' | '>')) => {
+            // `|` or `>` (with any chomping indicator) opens a block scalar:
+            // every following line indented deeper than this key is its text.
+            Some('|' | '>') => {
                 lx.bump();
                 lx.take_while(|c| c != '\n');
                 lx.push(start, Tok::Punct);
-                let _ = c;
                 *block = Some(indent);
                 return;
             }
