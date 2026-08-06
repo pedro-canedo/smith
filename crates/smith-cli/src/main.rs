@@ -6,6 +6,7 @@ mod resources;
 mod runtime;
 mod setup;
 mod subagents;
+mod update;
 
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Read};
@@ -137,6 +138,8 @@ enum Commands {
     /// permissions and MCP servers. Exits non-zero if anything FAILs, so it
     /// can gate a CI job.
     Doctor,
+    /// Check for and install the latest published Smith release.
+    Update,
 }
 
 #[derive(Debug, Subcommand)]
@@ -194,6 +197,10 @@ async fn main() -> ExitCode {
         };
     }
 
+    if matches!(&command, Some(Commands::Update)) {
+        return update::run().await;
+    }
+
     // Before anything reads the working directory — the config layering, the
     // session store and the tools' sandbox root all derive from it, and they
     // must all agree on which directory this run is about.
@@ -232,7 +239,16 @@ async fn main() -> ExitCode {
         return ExitCode::from(doctor::run().await);
     }
 
-    if cli.is_headless(std::io::stdout().is_terminal()) {
+    let headless = cli.is_headless(std::io::stdout().is_terminal());
+    if !headless {
+        if std::env::var("SMITH_AUTO_UPDATE").as_deref() == Ok("1") {
+            update::auto_update().await;
+        } else {
+            update::startup_notice().await;
+        }
+    }
+
+    if headless {
         ExitCode::from(run_headless(cli).await)
     } else {
         run_tui(cli).await

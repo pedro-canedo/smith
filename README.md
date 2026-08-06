@@ -66,6 +66,26 @@ install Smith without Rust. The Unix installer uses `~/.local/bin` by default;
 the PowerShell installer uses `%LOCALAPPDATA%\smith\bin` and updates the user
 `PATH`.
 
+### Updates
+
+Interactive sessions check GitHub Releases at most once every 24 hours. The
+check never blocks headless runs and never replaces the binary automatically:
+
+```sh
+smith update
+```
+
+`smith update` downloads the matching platform archive, verifies its SHA-256
+checksum, and replaces the current executable. If you prefer automatic
+updates, opt in explicitly with:
+
+```sh
+SMITH_AUTO_UPDATE=1 smith
+```
+
+Set `SMITH_DISABLE_UPDATE_CHECK=1` to disable the startup notice. Update
+metadata is cached in `~/.smith/update-check.json`.
+
 To install a specific version or directory:
 
 ```sh
@@ -285,6 +305,7 @@ smith [OPTIONS] [COMMAND]
 | `remember` | Add a standing instruction to `SMITH.md` |
 | `sessions` | List, export, fork, or inspect sessions |
 | `doctor` | Validate the local installation and configuration |
+| `update` | Check for and install the latest published release |
 
 Run `smith --help` or `smith <command> --help` for the complete reference.
 

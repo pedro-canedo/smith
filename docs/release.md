@@ -58,6 +58,17 @@ package-manager metadata become the bottleneck.
    installer targets native 64-bit Windows, installs under `%LOCALAPPDATA%`,
    updates the user `PATH`, and verifies the archive with `Get-FileHash`.
 
+8. Verify an existing installation can update in place:
+
+   ```sh
+   smith update
+   smith --version
+   ```
+
+   Startup notices are cached for 24 hours. Automatic replacement is opt-in
+   with `SMITH_AUTO_UPDATE=1`; `SMITH_DISABLE_UPDATE_CHECK=1` disables the
+   notice entirely.
+
 ## Package-manager templates
 
 - Shell installer: [`scripts/install.sh`](../scripts/install.sh)
