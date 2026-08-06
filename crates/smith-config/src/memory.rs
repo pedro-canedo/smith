@@ -175,11 +175,40 @@ impl MemoryScope {
 }
 
 /// First ancestor of `from` (inclusive) holding a root marker, else `from`.
+///
+/// # The home directory is never somebody's project
+///
+/// `.smith` is a root marker, and `~/.smith` exists on every machine that has
+/// run `smith setup` — it is smith's own global directory. So the walk used to
+/// run all the way up and hand back the *home directory* as the project root
+/// for any project without a `.git` of its own. Two things went wrong then:
+/// `~/SMITH.md`, already loaded as the global layer, was loaded a second time
+/// as the project layer, and the `@import` jail for that layer became the
+/// whole home directory. A `.git` in `$HOME` — a dotfiles repo, which is
+/// common — did the same thing without `.smith` being involved at all.
+///
+/// So the walk stops at the home directory. Reaching it without finding a
+/// marker means there is no project, not that the project is `$HOME`. Running
+/// smith *in* `$HOME` still works: `dir != from` keeps the stop from applying
+/// to the directory you actually asked about.
+///
+/// The temp-directory skip above it is the same idea, and it is why this only
+/// showed up on Windows CI: there `TEMP` lives inside the user profile, so a
+/// fixture walked straight into the home directory. On Linux and macOS `/tmp`
+/// is not under `$HOME`, so the test passed while the bug was still there for
+/// every real project outside a git repository.
 fn find_project_root(from: &Path) -> PathBuf {
     let temp_root = lexical_normalize(&std::env::temp_dir());
+    let home = directories::BaseDirs::new().map(|d| lexical_normalize(d.home_dir()));
     for dir in from.ancestors() {
-        if lexical_normalize(dir) == temp_root && dir != from {
-            continue;
+        let normalized = lexical_normalize(dir);
+        if dir != from {
+            if normalized == temp_root {
+                continue;
+            }
+            if home.as_ref() == Some(&normalized) {
+                break;
+            }
         }
         if ROOT_MARKERS.iter().any(|m| dir.join(m).exists()) {
             return dir.to_path_buf();
@@ -860,6 +889,39 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         let scope = MemoryScope::discover(&deep);
         assert_eq!(scope.root, lexical_normalize(&deep));
+    }
+
+    /// `~/.smith` is smith's own global directory and exists on every machine
+    /// that has run `smith setup`. Since `.smith` is a root marker, the walk
+    /// used to hand back `$HOME` as the project root for any project without a
+    /// `.git` — loading `~/SMITH.md` twice and widening the `@import` jail to
+    /// the whole home directory.
+    #[test]
+    fn the_home_directory_is_never_treated_as_a_project_root() {
+        let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) else {
+            return;
+        };
+        // A directory under the home that carries no marker of its own. Not
+        // created on disk: `find_project_root` only asks whether markers
+        // exist, and nothing here should match, which is the point.
+        let deep = home.join("some-project-without-a-marker/src");
+        let scope = MemoryScope::discover(&deep);
+        assert_eq!(
+            scope.root,
+            lexical_normalize(&deep),
+            "the walk escaped into the home directory"
+        );
+    }
+
+    /// …but running smith *in* the home directory still works. The stop
+    /// applies to ancestors, not to the directory actually asked about.
+    #[test]
+    fn asking_about_the_home_directory_itself_still_answers() {
+        let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) else {
+            return;
+        };
+        let scope = MemoryScope::discover(&home);
+        assert_eq!(scope.root, lexical_normalize(&home));
     }
 
     #[test]

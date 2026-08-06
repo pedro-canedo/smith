@@ -674,6 +674,15 @@ pub struct App {
     /// again returns it rather than eating it.
     history_pos: Option<usize>,
     history_draft: String,
+    /// Prompts typed while a turn was already running, oldest first.
+    ///
+    /// Being unable to type the next thing until the agent stops is the wrong
+    /// trade for an agent that runs for minutes: the most common reason to
+    /// speak mid-turn is to *add* to what you just asked. They are held here,
+    /// shown above the prompt, and sent one at a time as the agent frees up —
+    /// never merged into the running turn, which would change a request the
+    /// user can already see being worked on.
+    pub queued: std::collections::VecDeque<String>,
     /// The read-only panel on screen, if any — see `Overlay`. Yields to a
     /// real `Modal`, which is why both can be set without ambiguity.
     pub overlay: Option<Overlay>,
@@ -771,6 +780,7 @@ impl App {
             history: config.history,
             history_pos: None,
             history_draft: String::new(),
+            queued: std::collections::VecDeque::new(),
             overlay: None,
             logs: config.logs,
             session_cost: None,
@@ -1401,7 +1411,19 @@ impl App {
                 None
             }
             KeyCode::Enter => {
-                if self.input.text().trim().is_empty() || self.waiting_on_assistant {
+                if self.input.text().trim().is_empty() {
+                    return None;
+                }
+                // Mid-turn, a plain message is queued rather than refused.
+                // A slash command still runs now: they are how you *steer* a
+                // running turn (`/queue clear`, `/plan approve`), and queueing
+                // one would be the opposite of what it is for. The ones that
+                // genuinely cannot run mid-turn already say so themselves.
+                if self.waiting_on_assistant && !self.input.text().starts_with('/') {
+                    let text = self.input.take();
+                    self.slash_selected = 0;
+                    self.remember_prompt(&text);
+                    self.queued.push_back(text);
                     return None;
                 }
                 // A highlighted path is accepted rather than submitted — the
@@ -1512,6 +1534,7 @@ impl App {
                 None
             }
             "mcp" => self.run_mcp_command(args),
+            "queue" => self.run_queue_command(args),
             "plan" => self.run_plan_command(args),
             "rewind" => self.run_rewind_command(args),
             "goal" => self.run_goal_command(args),
@@ -1913,6 +1936,94 @@ impl App {
             Overlay::table("session usage", &["metric", "value"], &[60, 40], rows)
                 .with_footer(footer),
         );
+    }
+
+    /// Hands back the next queued prompt once the agent is free, as the
+    /// `Action` the run loop would have got from `Enter`.
+    ///
+    /// Polled by the run loop rather than returned from `on_agent_event`,
+    /// which several different events would otherwise have to remember to do —
+    /// `AssistantTurnComplete`, `LoopFinished`, `TurnLimitReached` and `Error`
+    /// all end a turn, and one of them forgetting would strand the queue
+    /// silently. Asking "is the agent free and is anything waiting" cannot be
+    /// forgotten by a new event arm.
+    ///
+    /// One at a time, and never while a modal is up: a permission prompt is
+    /// the agent blocked on the user, and answering it by starting a different
+    /// turn is not what the queue is for.
+    pub fn take_queued_prompt(&mut self) -> Option<Action> {
+        if self.waiting_on_assistant || self.modal.is_some() || self.plan_gated {
+            return None;
+        }
+        let text = self.queued.pop_front()?;
+        self.lines.push(ChatLine::new(ChatRole::User, text.clone()));
+        self.waiting_on_assistant = true;
+        self.phase = AgentPhase::Thinking;
+        self.in_flight_text = None;
+        self.turn_started_at = Some(Instant::now());
+        self.stream_started_at = None;
+        self.stream_output_chars = 0;
+        self.live_tokens_per_sec = None;
+        self.request_count += 1;
+        Some(Action::SubmitMessage(text))
+    }
+
+    /// `/queue` — show what is waiting; `clear` empties it, `drop` removes the
+    /// most recent entry.
+    fn run_queue_command(&mut self, args: &str) -> Option<Action> {
+        match args.trim() {
+            "" => {
+                if self.queued.is_empty() {
+                    self.lines
+                        .push(ChatLine::new(ChatRole::System, "nothing queued"));
+                    return None;
+                }
+                let listed: Vec<String> = self
+                    .queued
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| format!("{}. {q}", i + 1))
+                    .collect();
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("queued ({}):\n{}", self.queued.len(), listed.join("\n")),
+                ));
+                None
+            }
+            "clear" => {
+                let count = self.queued.len();
+                self.queued.clear();
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    match count {
+                        0 => "nothing queued".to_string(),
+                        1 => "dropped the queued message".to_string(),
+                        n => format!("dropped {n} queued messages"),
+                    },
+                ));
+                None
+            }
+            "drop" => {
+                match self.queued.pop_back() {
+                    // Echoed back so "which one did I just lose" is answered
+                    // without having to remember.
+                    Some(text) => self
+                        .lines
+                        .push(ChatLine::new(ChatRole::System, format!("dropped: {text}"))),
+                    None => self
+                        .lines
+                        .push(ChatLine::new(ChatRole::System, "nothing queued")),
+                }
+                None
+            }
+            other => {
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!("unknown /queue subcommand: {other} — try /queue, /queue clear, or /queue drop"),
+                ));
+                None
+            }
+        }
     }
 
     /// `Ctrl+L` — open the diagnostics panel, or close it if it is already up.
@@ -3609,6 +3720,114 @@ mod tests {
             app.is_animating(),
             "the running card's throbber has to keep ticking"
         );
+    }
+
+    /// Being unable to type until the agent stops is the wrong trade for an
+    /// agent that runs for minutes — the commonest reason to speak mid-turn is
+    /// to add to what you just asked.
+    #[test]
+    fn a_message_typed_mid_turn_is_queued_rather_than_refused() {
+        let mut app = test_app();
+        submit(&mut app, "first task");
+        assert!(app.waiting_on_assistant);
+
+        submit(&mut app, "and also handle the errors");
+        assert_eq!(app.queued.len(), 1);
+        assert_eq!(app.queued[0], "and also handle the errors");
+        // Not in the transcript yet: it has not been sent, and drawing it as a
+        // user bubble would claim the agent has seen it.
+        assert!(
+            !app.lines
+                .iter()
+                .any(|l| l.text.contains("handle the errors")),
+            "a queued message was shown as if it had been sent"
+        );
+    }
+
+    #[test]
+    fn the_queue_is_sent_one_at_a_time_once_the_agent_is_free() {
+        let mut app = test_app();
+        submit(&mut app, "first");
+        submit(&mut app, "second");
+        submit(&mut app, "third");
+        assert_eq!(app.queued.len(), 2);
+
+        // Nothing goes out while the turn is still running.
+        assert!(app.take_queued_prompt().is_none());
+
+        app.waiting_on_assistant = false;
+        let Some(Action::SubmitMessage(text)) = app.take_queued_prompt() else {
+            panic!("expected the first queued message");
+        };
+        assert_eq!(text, "second");
+        assert_eq!(app.queued.len(), 1);
+        // And it is now busy again, so the third waits its turn.
+        assert!(app.take_queued_prompt().is_none());
+    }
+
+    /// A permission prompt is the agent blocked on the user; answering it by
+    /// starting a different turn is not what the queue is for.
+    #[test]
+    fn the_queue_waits_for_a_modal_to_be_answered() {
+        let mut app = test_app();
+        submit(&mut app, "first");
+        submit(&mut app, "second");
+        app.waiting_on_assistant = false;
+        app.on_agent_event(AgentEvent::PermissionPromptNeeded(
+            smith_core::PermissionRequest {
+                tool_call_id: "1".into(),
+                tool_name: "run_bash".into(),
+                detail: "rm -rf /".into(),
+            },
+        ));
+        assert!(app.take_queued_prompt().is_none());
+    }
+
+    /// Slash commands are how you steer a running turn, so queueing one would
+    /// be the opposite of what it is for.
+    #[test]
+    fn a_slash_command_typed_mid_turn_still_runs_now() {
+        let mut app = test_app();
+        submit(&mut app, "first");
+        submit(&mut app, "second");
+        assert_eq!(app.queued.len(), 1);
+
+        app.input.set("/queue clear");
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            app.queued.is_empty(),
+            "the command was queued instead of run"
+        );
+        assert!(app
+            .lines
+            .last()
+            .is_some_and(|l| l.text.contains("dropped the queued message")));
+    }
+
+    #[test]
+    fn queue_drop_removes_only_the_most_recent_and_says_which() {
+        let mut app = test_app();
+        submit(&mut app, "first");
+        submit(&mut app, "keep me");
+        submit(&mut app, "drop me");
+        app.run_slash_command("queue drop");
+        assert_eq!(app.queued.len(), 1);
+        assert_eq!(app.queued[0], "keep me");
+        assert!(app.lines.last().unwrap().text.contains("drop me"));
+    }
+
+    #[test]
+    fn queue_lists_what_is_waiting_and_says_so_when_nothing_is() {
+        let mut app = test_app();
+        app.run_slash_command("queue");
+        assert!(app.lines.last().unwrap().text.contains("nothing queued"));
+
+        submit(&mut app, "first");
+        submit(&mut app, "waiting one");
+        app.run_slash_command("queue");
+        let listed = &app.lines.last().unwrap().text;
+        assert!(listed.contains("queued (1)"), "{listed}");
+        assert!(listed.contains("waiting one"), "{listed}");
     }
 
     /// The motivating case for remappable keys: tmux owns Ctrl+B by default,

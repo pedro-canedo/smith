@@ -112,6 +112,13 @@ pub async fn run(
             }
         }
 
+        // Polled here rather than pushed from `on_agent_event`: four
+        // different events end a turn, and one of them forgetting to check
+        // would strand the queue with no sign of why.
+        if let Some(action) = app.take_queued_prompt() {
+            let _ = action_tx.send(action);
+        }
+
         term.draw(|f| ui::draw(f, &mut app))?;
 
         if app.should_quit {

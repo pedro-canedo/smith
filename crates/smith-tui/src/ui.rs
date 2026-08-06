@@ -41,6 +41,8 @@ const MAX_CONTENT_WIDTH: u16 = 100;
 /// Error cards always surface the tail of the failure output, even in
 /// compact mode — the reason a call broke should never be one keystroke away.
 const ERROR_TAIL_LINES: usize = 3;
+/// Queued prompts listed before the rest collapse into a "+N more" row.
+const MAX_QUEUE_ROWS: usize = 3;
 /// Cap for tool output in verbose (expanded) mode.
 const VERBOSE_OUTPUT_CAP: usize = 12;
 /// Shown in the status bar between the two `Ctrl+C` presses that quit.
@@ -56,6 +58,8 @@ struct VerticalLayout {
     messages: u16,
     strip: u16,
     suggest: u16,
+    /// Rows for the queued-prompt list, between the slash list and the input.
+    queue: u16,
     input: u16,
     status: u16,
 }
@@ -67,6 +71,7 @@ fn vertical_layout(
     height: u16,
     wanted_input: u16,
     wanted_suggest: u16,
+    wanted_queue: u16,
     strip_wanted: bool,
 ) -> VerticalLayout {
     // 1. Status bar.
@@ -104,7 +109,13 @@ fn vertical_layout(
         suggest += borrow;
     }
 
-    // 6. The prompt's growth — last, so a long draft never costs transcript.
+    // 6. Queued prompts. Above the prompt's growth: a message you have
+    //    already committed to sending outranks room to type the next one, and
+    //    a queue you cannot see is a queue you will forget you filled.
+    let queue = wanted_queue.min(free);
+    free -= queue;
+
+    // 7. The prompt's growth — last, so a long draft never costs transcript.
     let growth = wanted_input.saturating_sub(input_min).min(free);
     free -= growth;
 
@@ -113,6 +124,7 @@ fn vertical_layout(
         messages: messages + free,
         strip,
         suggest,
+        queue,
         input: input_min + growth,
         status,
     }
@@ -142,20 +154,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         && frame.area().width < SIDEBAR_MIN_TERMINAL_WIDTH
         && (app.context.is_some() || !strip_extras(app).is_empty());
 
+    // One row per queued prompt plus the hint line naming the command, capped
+    // so a long queue cannot eat the transcript.
+    let wanted_queue = if app.queued.is_empty() {
+        0
+    } else {
+        (app.queued.len().min(MAX_QUEUE_ROWS) as u16) + 1
+    };
+
     let layout = vertical_layout(
         frame.area().height,
         wanted_input_rows(app, frame.area()),
         wanted_suggest,
+        wanted_queue,
         strip_wanted,
     );
-    let [message_area, strip_area, suggest_area, input_area, footer_area] = Layout::vertical([
-        Constraint::Length(layout.messages),
-        Constraint::Length(layout.strip),
-        Constraint::Length(layout.suggest),
-        Constraint::Length(layout.input),
-        Constraint::Length(layout.status),
-    ])
-    .areas(frame.area());
+    let [message_area, strip_area, suggest_area, queue_area, input_area, footer_area] =
+        Layout::vertical([
+            Constraint::Length(layout.messages),
+            Constraint::Length(layout.strip),
+            Constraint::Length(layout.suggest),
+            Constraint::Length(layout.queue),
+            Constraint::Length(layout.input),
+            Constraint::Length(layout.status),
+        ])
+        .areas(frame.area());
     // A modal takes over the interface — the transcript behind it must not
     // stay on screen too. Left up, its unwrapped-at-full-width lines poke
     // out on both sides of the centered popup and compete with it for
@@ -195,6 +218,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &suggestions,
             clamp_width(suggest_area, MAX_CONTENT_WIDTH),
         );
+    }
+
+    if layout.queue > 0 {
+        draw_queue(frame, &*app, clamp_width(queue_area, MAX_CONTENT_WIDTH));
     }
 
     draw_input(frame, app, clamp_width(input_area, MAX_CONTENT_WIDTH));
@@ -422,7 +449,7 @@ fn wanted_input_rows(app: &mut App, frame_area: Rect) -> u16 {
 #[cfg(test)]
 fn input_height(app: &mut App, frame_area: Rect) -> u16 {
     let wanted = wanted_input_rows(app, frame_area);
-    vertical_layout(frame_area.height, wanted, 0, false).input
+    vertical_layout(frame_area.height, wanted, 0, 0, false).input
 }
 
 /// The vitals that live in the sidebar, compressed onto one row for the
@@ -1402,6 +1429,49 @@ fn resource_lines(stats: &smith_core::ResourceStats, theme: &Theme) -> Vec<Line<
         )));
     }
     lines
+}
+
+/// Prompts typed while the agent was busy, waiting their turn.
+///
+/// Drawn as its own region rather than as transcript lines: they have not been
+/// sent, and a queued message rendered as a user bubble would claim the agent
+/// has seen something it has not.
+fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let w = area.width as usize;
+    let marker = if theme.unicode { "\u{21b3} " } else { "> " };
+
+    let mut lines: Vec<Line> = app
+        .queued
+        .iter()
+        .take(MAX_QUEUE_ROWS)
+        .map(|text| {
+            let one_line = text.replace('\n', " ");
+            Line::from(vec![
+                Span::styled(marker.to_string(), theme.warning()),
+                Span::styled(
+                    truncate_chars(&one_line, w.saturating_sub(4)),
+                    theme.secondary(),
+                ),
+            ])
+        })
+        .collect();
+
+    if app.queued.len() > MAX_QUEUE_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more queued", app.queued.len() - MAX_QUEUE_ROWS),
+            theme.disabled(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} queued — sent when this turn ends  \u{b7}  /queue clear to drop",
+                app.queued.len()
+            ),
+            theme.disabled(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_slash_suggestions(
@@ -2662,7 +2732,7 @@ mod tests {
     #[test]
     fn at_80x24_the_transcript_keeps_its_floor_whatever_else_is_open() {
         // Closed slash list: status + full prompt + the rest.
-        let plain = vertical_layout(24, INPUT_MAX_ROWS, 0, false);
+        let plain = vertical_layout(24, INPUT_MAX_ROWS, 0, 0, false);
         assert_eq!(plain.status, 1);
         assert_eq!(plain.input, INPUT_MAX_ROWS);
         assert_eq!(plain.messages, 13);
@@ -2670,7 +2740,7 @@ mod tests {
         // Slash list open — the case that used to squeeze the transcript,
         // because the prompt grew against `height - 3` and the list was
         // simply subtracted from whatever was left.
-        let typing = vertical_layout(24, INPUT_MAX_ROWS, 7, false);
+        let typing = vertical_layout(24, INPUT_MAX_ROWS, 7, 0, false);
         assert_eq!(typing.suggest, 7);
         assert_eq!(typing.messages, TRANSCRIPT_MIN_ROWS);
         assert_eq!(typing.input, 8);
@@ -2682,19 +2752,19 @@ mod tests {
 
     #[test]
     fn the_strip_costs_the_transcript_one_row_and_only_above_20() {
-        let with = vertical_layout(24, INPUT_MIN_ROWS, 0, true);
-        let without = vertical_layout(24, INPUT_MIN_ROWS, 0, false);
+        let with = vertical_layout(24, INPUT_MIN_ROWS, 0, 0, true);
+        let without = vertical_layout(24, INPUT_MIN_ROWS, 0, 0, false);
         assert_eq!(with.strip, 1);
         assert_eq!(with.messages + 1, without.messages);
 
         // Too short to spend a row on vitals.
-        assert_eq!(vertical_layout(19, INPUT_MIN_ROWS, 0, true).strip, 0);
+        assert_eq!(vertical_layout(19, INPUT_MIN_ROWS, 0, 0, true).strip, 0);
     }
 
     #[test]
     fn the_slash_list_may_borrow_from_the_floor_but_nothing_else_may() {
         // 10 rows: status 1 + prompt 3 leaves 6, less than the 8-row floor.
-        let short = vertical_layout(10, INPUT_MAX_ROWS, 7, false);
+        let short = vertical_layout(10, INPUT_MAX_ROWS, 7, 0, false);
         assert_eq!(short.input, INPUT_MIN_ROWS, "growth never takes transcript");
         assert!(short.suggest > 0, "the completion list must stay visible");
         assert_eq!(short.messages, TRANSCRIPT_MIN_ROWS_WITH_SUGGEST);
@@ -2707,7 +2777,7 @@ mod tests {
     #[test]
     fn a_tiny_terminal_still_gets_a_prompt_and_a_status_bar() {
         for height in [1u16, 2, 3, 4, 8] {
-            let l = vertical_layout(height, INPUT_MAX_ROWS, 7, true);
+            let l = vertical_layout(height, INPUT_MAX_ROWS, 7, 0, true);
             assert_eq!(
                 l.messages + l.strip + l.suggest + l.input + l.status,
                 height,

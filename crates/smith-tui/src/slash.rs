@@ -38,6 +38,10 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("model", "show or switch provider/model"),
     ("permission", "show or set tool permission policy"),
     ("plan", "propose a plan before executing"),
+    (
+        "queue",
+        "show, clear or drop prompts waiting for the current turn",
+    ),
     ("remember", "append a standing note to the project SMITH.md"),
     (
         "rewind",
