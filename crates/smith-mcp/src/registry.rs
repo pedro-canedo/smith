@@ -473,9 +473,15 @@ mod tests {
         // Reads stdin and never answers anything.
         let hangs = stdio_spec("hangs", "import sys\nfor line in sys.stdin:\n    pass\n");
         let started = tokio::time::Instant::now();
-        let registry = McpRegistry::connect_all(&[hangs]).await;
-        // Auto-advanced virtual time: the assertion is that the wait is
-        // bounded by our budget, not by the 30s per-request timeout.
+        let task = tokio::spawn(async move { McpRegistry::connect_all(&[hangs]).await });
+        // A real child-process I/O future can remain pending forever on
+        // Windows, so Tokio's paused clock does not auto-advance here. Start
+        // the connection first, then move the clock past the explicit budget.
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONNECT_TIMEOUT).await;
+        let registry = task.await.expect("connect task should not panic");
+        // The assertion is that the wait is bounded by our budget, not by the
+        // 30s per-request timeout.
         assert!(started.elapsed() <= CONNECT_TIMEOUT);
         assert_eq!(registry.status().servers[0].health, McpHealth::Failed);
         assert!(registry.problems()[0].contains("within"));
