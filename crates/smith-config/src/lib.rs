@@ -44,8 +44,54 @@ pub struct Config {
     /// this same struct could not read back.
     #[serde(default)]
     pub runtime: RuntimeSettings,
+    /// Shell commands run at fixed points in a turn. Between `runtime` and
+    /// `mcp_servers` for the ordering reason above: its own fields are arrays
+    /// of tables, so anything serialized after it must be a table too.
+    #[serde(default)]
+    pub hooks: HookSettings,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// `[hooks]` — user code smith runs at three points in a turn. See
+/// `docs/hooks.md` for the JSON contract and `docs/authorization.md` for where
+/// `PreToolUse` sits relative to the plan gate and the permission prompt.
+///
+/// One array per event rather than one array with an `event` field: the event
+/// decides what the hook is *handed* and what its answer *means* (a timeout
+/// denies a `PreToolUse` and is only a warning on a `PostToolUse`), so a typo
+/// in an `event = "..."` string would silently move a hook from a gate to a
+/// logger. A typo in a table name is a parse error instead.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookSettings {
+    /// Before a tool runs. May deny the call and may rewrite its arguments.
+    #[serde(default)]
+    pub pre_tool_use: Vec<HookCommand>,
+    /// After a tool ran. May add text to the result; may not deny it.
+    #[serde(default)]
+    pub post_tool_use: Vec<HookCommand>,
+    /// Before a user message is sent to the provider. May rewrite it or refuse
+    /// the turn. Never fires for a subagent's prompt.
+    #[serde(default)]
+    pub user_prompt_submit: Vec<HookCommand>,
+}
+
+/// One `[[hooks.*]]` entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookCommand {
+    /// Run through `sh -c` (`cmd /C` on Windows), with the event's JSON on
+    /// stdin and its answer expected on stdout.
+    pub command: String,
+    /// `|`-separated exact tool names, or `*`/omitted for every tool.
+    /// Deliberately not a regex — a typo that matches nothing is exactly the
+    /// failure mode a policy hook must not have. Ignored for
+    /// `user_prompt_submit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// Defaults to 5000. A `pre_tool_use` or `user_prompt_submit` hook that
+    /// exceeds it *denies*; a `post_tool_use` hook that does is only a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -230,6 +276,15 @@ impl Config {
         } = other.runtime;
         self.runtime.chromium_path = chromium_path.or(self.runtime.chromium_path.take());
         self.runtime.chromium_version = chromium_version.or(self.runtime.chromium_version.take());
+
+        // Hooks are **not** merged from the project layer, and that is a
+        // security decision rather than an oversight. A hook is an arbitrary
+        // shell command run on every tool call; honouring one from
+        // `<project>/.smith/config.toml` would make `git clone && smith` a
+        // code-execution vector for whoever wrote the repository. `~/.smith/
+        // config.toml` is the only file that can define one, because it is the
+        // only one the user certainly wrote themselves. (`other.hooks` is
+        // therefore dropped here on purpose — see `docs/hooks.md`.)
 
         // MCP servers are a list, not a scalar: a project declaring servers
         // means "these too", not "forget the global ones". Same name in both

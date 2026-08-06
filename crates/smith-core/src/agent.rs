@@ -17,6 +17,7 @@ use crate::event::{
     AgentEvent, AgentPhase, PermissionDecision, PermissionRequest, ProgressReporter, Task,
     TaskStatus, TurnLimitKind, UserQuestion,
 };
+use crate::hooks::{HookContext, HookSet};
 use crate::message::{
     CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition, Usage,
 };
@@ -274,6 +275,22 @@ pub trait ToolExecutor: Send + Sync {
     fn scratch_scoped(&self, _name: &str, _input: &serde_json::Value, _ctx: &ToolContext) -> bool {
         false
     }
+    /// Checks a call against the schema the model was shown, without running
+    /// it.
+    ///
+    /// `execute` already does this at dispatch and still does; this exists so
+    /// the *same* check can be applied to arguments a `PreToolUse` hook
+    /// rewrote, at the point the rewrite happens. Without it the only place a
+    /// hook's mistake would surface is a dispatch-time error that reads as if
+    /// the model had written the bad arguments — blaming the one participant
+    /// that did not.
+    ///
+    /// Defaulted to `Ok(())` so executors that publish no schemas compile
+    /// unchanged. That is safe rather than lax: a default `Ok` only loses the
+    /// attribution, never the check, because dispatch validates again.
+    fn validate_input(&self, _name: &str, _input: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
     async fn execute(
         &self,
         name: &str,
@@ -427,6 +444,15 @@ pub struct Agent {
     /// When the turn in flight runs out of wall clock, so a child can be given
     /// what is actually left rather than a fresh full allowance.
     turn_deadline: Option<Instant>,
+    /// User-configured shell commands run at three fixed points — see
+    /// [`crate::hooks`] and `docs/hooks.md`.
+    ///
+    /// Behind an `Arc` and used from `&self`, because the read-only tool path
+    /// dispatches concurrently: a hook set that needed `&mut self` would have
+    /// silently excluded exactly the calls a logging hook most wants to see.
+    /// Empty by default, and empty is a hard short-circuit — a session with no
+    /// hooks configured pays nothing at all.
+    hooks: Arc<HookSet>,
 }
 
 impl Agent {
@@ -468,7 +494,31 @@ impl Agent {
             subagent_definitions: Vec::new(),
             subagent_tool_budget: 0,
             turn_deadline: None,
+            hooks: Arc::new(HookSet::empty()),
         }
+    }
+
+    /// Attaches the user's configured hooks. See `docs/authorization.md` for
+    /// where `PreToolUse` sits relative to the plan gate and the permission
+    /// prompt, and why it can only ever subtract authority.
+    pub fn with_hooks(mut self, hooks: Arc<HookSet>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    pub fn hooks(&self) -> &Arc<HookSet> {
+        &self.hooks
+    }
+
+    /// Who the hooks are being run on behalf of. Rebuilt per call rather than
+    /// stored, because `cwd` and the session id are the agent's own and a
+    /// stale copy would misreport them to a policy hook.
+    fn hook_ctx(&self) -> HookContext {
+        HookContext::new(
+            self.tool_ctx.session_id.clone(),
+            self.tool_ctx.cwd.clone(),
+            self.subagent_depth,
+        )
     }
 
     /// Subagent definitions loaded from disk, on top of the built-in
@@ -907,6 +957,33 @@ impl Agent {
         question_tx: mpsc::UnboundedSender<QuestionAsk>,
         cancel: CancellationToken,
     ) -> bool {
+        // Before the checkpoint is opened and before anything is pushed to
+        // history: a turn a hook refuses must leave no trace at all, and an
+        // allocated turn sequence with nothing in it would show up in
+        // `/rewind` as an undo that undoes nothing.
+        //
+        // Only for the agent the user is actually talking to. A subagent's
+        // "prompt" is written by the parent *model*; firing an event called
+        // `UserPromptSubmit` on it would misreport who said it, and a hook
+        // that redacts what the user typed has nothing to do there.
+        let user_text = if self.subagent_depth == 0 {
+            let outcome = self
+                .hooks
+                .user_prompt_submit(&self.hook_ctx(), user_text, &cancel)
+                .await;
+            for notice in &outcome.notices {
+                let _ = events.send(AgentEvent::Error(notice.clone()));
+            }
+            if let Some(denial) = outcome.denial {
+                let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
+                let _ = events.send(AgentEvent::Error(denial));
+                return false;
+            }
+            outcome.prompt
+        } else {
+            user_text
+        };
+
         // Allocated before anything can run a tool, and held for the whole
         // turn: every file this turn overwrites lands in the same checkpoint,
         // which is what makes "undo that turn" a single operation.
@@ -1471,6 +1548,63 @@ impl Agent {
         question_tx: &mpsc::UnboundedSender<QuestionAsk>,
         cancel: CancellationToken,
     ) -> ToolResult {
+        // `ask_user` (a modal), `write_tasks` (a checklist) and `task`
+        // (delegation) are intercepted below and never reach the class lookup,
+        // the plan gate, the permission prompt or `tools.execute`. Named once
+        // here so the gates in between can say what they are exempting rather
+        // than re-testing the names one at a time.
+        let intercepted =
+            name == "ask_user" || name == "write_tasks" || name == subagent::TASK_TOOL;
+
+        let class = self
+            .tools
+            .permission_class(name)
+            .unwrap_or(PermissionClass::Dangerous);
+
+        if !intercepted && self.plan_gated && class != PermissionClass::ReadOnly {
+            let result = ToolResult::error(
+                "Blocked: a plan is awaiting approval. Tell the user to run `/plan approve` (or `/plan reject` to discard it) before this can run.",
+            );
+            let _ = events.send(AgentEvent::ToolCallStarted {
+                id: id.to_string(),
+                tool_name: name.to_string(),
+                input,
+            });
+            let _ = events.send(AgentEvent::ToolCallResult {
+                id: id.to_string(),
+                output: result.content.clone(),
+                is_error: true,
+            });
+            return result;
+        }
+
+        // `PreToolUse`, and this is the only defensible place for it — the
+        // full argument is in `docs/authorization.md`, the two halves of it
+        // are:
+        //
+        // - *After* the plan gate, because a hook can only ever subtract
+        //   authority. Running it above the gate would spawn a process per
+        //   call that could never have run, and would put a hook's "allow"
+        //   syntactically upstream of the one gate in this system with no
+        //   bypass — an invitation to someone later wiring it up as an
+        //   override.
+        // - *Before* everything below, because a hook that runs after the
+        //   permission prompt cannot prevent the prompt (its main job), and a
+        //   hook that rewrites arguments after `format_permission_detail` has
+        //   built the modal would have the user approve one call and a
+        //   different one run. Above `needs_prompt` rather than merely above
+        //   the prompt itself, so a session grant, `scratch_scoped` or
+        //   `/permission skip` cannot skip the hook along with the modal.
+        //
+        // The three intercepted tools below reach this too. They have no plan
+        // gate to be after, so for them the hook is simply the first gate
+        // there is — which is what lets a policy hook see `task`, the one
+        // intercepted tool whose effects are not confined to the UI.
+        let input = match self.pre_tool_hooks(id, name, input, events, &cancel).await {
+            Ok(input) => input,
+            Err(blocked) => return blocked,
+        };
+
         // Clarifying questions are allowed even while plan-gated.
         if name == "ask_user" {
             return self
@@ -1494,28 +1628,6 @@ impl Agent {
         // like `ask_user` it is exempt from the plan gate and the prompt.
         if name == subagent::TASK_TOOL {
             return self.run_task(id, input, events, cancel).await;
-        }
-
-        let class = self
-            .tools
-            .permission_class(name)
-            .unwrap_or(PermissionClass::Dangerous);
-
-        if self.plan_gated && class != PermissionClass::ReadOnly {
-            let result = ToolResult::error(
-                "Blocked: a plan is awaiting approval. Tell the user to run `/plan approve` (or `/plan reject` to discard it) before this can run.",
-            );
-            let _ = events.send(AgentEvent::ToolCallStarted {
-                id: id.to_string(),
-                tool_name: name.to_string(),
-                input,
-            });
-            let _ = events.send(AgentEvent::ToolCallResult {
-                id: id.to_string(),
-                output: result.content.clone(),
-                is_error: true,
-            });
-            return result;
         }
 
         // A call the tool itself vouches is confined to the session's scratch
@@ -1565,6 +1677,108 @@ impl Agent {
 
         self.dispatch_tool(id, name, input, class, events, cancel)
             .await
+    }
+
+    /// Runs the `PreToolUse` chain for one call, answering with the arguments
+    /// to run with — or with the `ToolResult` that ends the call.
+    ///
+    /// Takes `&self`, which is what lets the concurrent read-only path call it
+    /// too. If it needed `&mut self` the hook would silently not fire for
+    /// batched reads, and "the hook did not run and nobody said so" is the one
+    /// failure this feature must not have.
+    async fn pre_tool_hooks(
+        &self,
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<serde_json::Value, ToolResult> {
+        if self.hooks.is_empty() {
+            return Ok(input);
+        }
+        // The same schema check dispatch applies, handed to the hook layer so
+        // a rewrite is validated where it happens and the resulting error can
+        // name the hook rather than implicating the model.
+        let validate = |candidate: &serde_json::Value| self.tools.validate_input(name, candidate);
+        let outcome = self
+            .hooks
+            .pre_tool_use(&self.hook_ctx(), name, input, &validate, cancel)
+            .await;
+
+        let Some(denial) = outcome.denial else {
+            // Notices ride the tool's own card, so a hook that fired, rewrote
+            // or misbehaved is attached to the call it acted on.
+            for line in outcome.notices {
+                let _ = events.send(AgentEvent::ToolProgress {
+                    id: id.to_string(),
+                    line,
+                });
+            }
+            return Ok(outcome.input);
+        };
+
+        // A blocked call still gets a card: the user has to be able to see
+        // that the agent tried, and what stopped it.
+        let _ = events.send(AgentEvent::ToolCallStarted {
+            id: id.to_string(),
+            tool_name: name.to_string(),
+            input: outcome.input,
+        });
+        for line in outcome.notices {
+            let _ = events.send(AgentEvent::ToolProgress {
+                id: id.to_string(),
+                line,
+            });
+        }
+        let result = ToolResult::error(denial);
+        let _ = events.send(AgentEvent::ToolCallResult {
+            id: id.to_string(),
+            output: result.content.clone(),
+            is_error: true,
+        });
+        Err(result)
+    }
+
+    /// Runs the `PostToolUse` chain over a finished call, folding whatever it
+    /// wrote into the result the model will read.
+    ///
+    /// Never fails the call — see `HookEvent::fails_closed`. The tool has
+    /// already run; the only thing left to decide is whether the model is told
+    /// the truth about it.
+    async fn post_tool_hooks(
+        &self,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        mut result: ToolResult,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> ToolResult {
+        if self.hooks.is_empty() {
+            return result;
+        }
+        let outcome = self
+            .hooks
+            .post_tool_use(
+                &self.hook_ctx(),
+                name,
+                input,
+                &result.content,
+                result.is_error,
+                cancel,
+            )
+            .await;
+        for line in outcome.notices {
+            let _ = events.send(AgentEvent::ToolProgress {
+                id: id.to_string(),
+                line,
+            });
+        }
+        if let Some(extra) = outcome.extra {
+            result.content = format!("{}\n{extra}", result.content);
+        }
+        result
     }
 
     /// Whether this call may run alongside others from the same round.
@@ -1629,15 +1843,21 @@ impl Agent {
                 if cancel.is_cancelled() {
                     return (slot, None);
                 }
+                // The second path through authorization, and every gate that
+                // applies on the serial one has to be considered here too.
+                // The plan gate and the permission prompt are no-ops for
+                // `ReadOnly` calls, which is why they are absent — but a
+                // `PreToolUse` hook is not, and a hook that silently skipped
+                // every batched read would be worse than no hook at all.
+                let input = match self
+                    .pre_tool_hooks(id, name, input.clone(), events, &cancel)
+                    .await
+                {
+                    Ok(input) => input,
+                    Err(blocked) => return (slot, Some(blocked)),
+                };
                 let result = self
-                    .dispatch_tool(
-                        id,
-                        name,
-                        input.clone(),
-                        PermissionClass::ReadOnly,
-                        events,
-                        cancel,
-                    )
+                    .dispatch_tool(id, name, input, PermissionClass::ReadOnly, events, cancel)
                     .await;
                 (slot, Some(result))
             }
@@ -1692,8 +1912,26 @@ impl Agent {
         // every mutating tool and quietly skipped whichever one is added next.
         let snapshotted = self.checkpoint_before(name, &input, class, &ctx).await;
 
-        let mut result = self.tools.execute(name, input, &ctx, cancel).await;
+        let result = self
+            .tools
+            .execute(name, input.clone(), &ctx, cancel.clone())
+            .await;
         self.checkpoint_after(&snapshotted).await;
+
+        // `PostToolUse` lives here rather than in `run_one_tool` because this
+        // is the point both authorization paths funnel through, and because it
+        // is the only place a result exists at all. It runs before the
+        // `ToolCallResult` event below so the card the user reads and the
+        // string the model reads are the same string.
+        //
+        // The three tools intercepted in `run_one_tool` never reach here and
+        // so observe `PreToolUse` only. That asymmetry is deliberate and
+        // documented rather than papered over: their "results" are UI state (a
+        // typed answer, a checklist, a child's report) that a post hook's
+        // contract — observe what the tool wrote — does not describe.
+        let mut result = self
+            .post_tool_hooks(id, name, &input, result, events, &cancel)
+            .await;
 
         // The only place raw tool output exists before it fans out to the
         // transcript, the session database and the next provider request.
@@ -2059,6 +2297,20 @@ impl Agent {
             // nothing to block, but an unapproved plan must not become a hole the
             // moment delegation is involved.
             child.plan_gated = self.plan_gated;
+            // Hooks *are* inherited, unlike the permission policy right above
+            // — and the two are not in tension, because they point the same
+            // way. A policy is authority the user granted and a child does not
+            // get to inherit; a hook is authority the user withheld, and a
+            // child is the last place to relax it. A child's calls are the
+            // least-watched calls in the system (one summarised progress line
+            // on a card), so if any calls need a policy hook, those do.
+            //
+            // The surprise — a hook the user wrote for their own calls firing
+            // on a child's — is real, and is why the payload carries
+            // `"agent": "subagent"` and `depth`: filtering it back out is one
+            // line in the hook. The opposite default cannot be filtered back
+            // *in*, because a hook that never runs cannot ask to.
+            child.hooks = self.hooks.clone();
             // Deliberately no checkpointer: a read-only agent has nothing to
             // snapshot, and allocating a second turn sequence inside the parent's
             // turn would split one user action across two manifests.
@@ -3102,6 +3354,679 @@ mod tests {
         assert!(
             !saw_blocked_result,
             "write_tasks must not be blocked by the plan gate"
+        );
+    }
+
+    // ---- hooks --------------------------------------------------------
+    //
+    // These cover the *wiring*: that a hook reaches the tool path at the
+    // documented rung, that what it decides actually changes what runs, and
+    // that what it says reaches the model in a form the model can act on.
+    // `hooks::tests` covers the contract itself (parsing, timeouts, quoting).
+
+    /// A hook runner that answers every invocation with the same canned
+    /// stdout, and records what it was asked.
+    #[derive(Debug)]
+    struct CannedHook {
+        stdout: String,
+        code: i32,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CannedHook {
+        fn new(stdout: &str) -> Arc<Self> {
+            Arc::new(Self {
+                stdout: stdout.to_string(),
+                code: 0,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn tool_names(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|payload| {
+                    serde_json::from_str::<serde_json::Value>(payload).ok()?["tool_name"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookInvoker for CannedHook {
+        async fn invoke(
+            &self,
+            _def: &crate::hooks::HookDefinition,
+            payload: String,
+            _cancel: &CancellationToken,
+        ) -> crate::hooks::HookOutcome {
+            self.calls.lock().unwrap().push(payload);
+            crate::hooks::HookOutcome::Completed {
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+                code: self.code,
+            }
+        }
+    }
+
+    fn hook_set(
+        event: crate::hooks::HookEvent,
+        invoker: Arc<CannedHook>,
+    ) -> Arc<crate::hooks::HookSet> {
+        Arc::new(crate::hooks::HookSet::with_invoker(
+            vec![crate::hooks::HookDefinition::new(event, "policy.sh")],
+            invoker,
+        ))
+    }
+
+    /// Records the arguments each call arrived with, and can be told to reject
+    /// arguments that do not carry a `path` — standing in for a real schema.
+    struct ArgumentRecordingTools {
+        seen: std::sync::Mutex<Vec<serde_json::Value>>,
+        require_path: bool,
+    }
+
+    impl ArgumentRecordingTools {
+        fn new(require_path: bool) -> Arc<Self> {
+            Arc::new(Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                require_path,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ArgumentRecordingTools {
+        /// One real definition, because `subagent::resolve_tool_set`
+        /// intersects a child's tools with what is actually *registered* — an
+        /// executor that publishes nothing gives every child no tools at all.
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            vec![crate::message::ToolDefinition {
+                name: "read_file".to_string(),
+                description: "reads a file".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        fn validate_input(&self, _name: &str, input: &serde_json::Value) -> Result<(), String> {
+            if self.require_path && input.get("path").is_none() {
+                return Err("missing required property `path`".into());
+            }
+            Ok(())
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            self.seen.lock().unwrap().push(input);
+            ToolResult::ok("ran")
+        }
+    }
+
+    /// The denial has to land in *history*, not just on a card: a block the
+    /// model never sees is a block it will retry forever.
+    #[tokio::test]
+    async fn a_pre_tool_use_hook_denial_reaches_the_model_and_stops_the_tool() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tools = Arc::new(RecordingTools {
+            executed: executed.clone(),
+        });
+        let mut agent = Agent::new(
+            Arc::new(write_file_then_done()),
+            tools,
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_permission_policy(PermissionPolicy::Skip)
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PreToolUse,
+            CannedHook::new(r#"{"decision":"deny","reason":"writes are frozen during a release"}"#),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "do it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "a denied call must not run"
+        );
+
+        let denial = agent
+            .history()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content,
+                    is_error: true,
+                    ..
+                } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the model must receive the denial as a tool result");
+        assert!(denial.contains("Blocked by a PreToolUse hook"));
+        assert!(denial.contains("> writes are frozen during a release"));
+        assert!(
+            denial.contains("Change your approach or ask the user"),
+            "the model needs to be told what to do instead"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pre_tool_use_hook_rewrites_the_arguments_the_tool_receives() {
+        let tools = ArgumentRecordingTools::new(false);
+        let mut agent = Agent::new(
+            Arc::new(ScriptedProvider::tool_call_then_text(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "/etc/shadow"}),
+                "done",
+            )),
+            tools.clone(),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PreToolUse,
+            CannedHook::new(r#"{"tool_input":{"path":"README.md"}}"#),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "read it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let seen = tools.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0], serde_json::json!({"path": "README.md"}));
+    }
+
+    #[tokio::test]
+    async fn a_hook_rewrite_that_changes_the_tool_is_refused_before_dispatch() {
+        let tools = ArgumentRecordingTools::new(false);
+        let mut agent = Agent::new(
+            Arc::new(ScriptedProvider::tool_call_then_text(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "README.md"}),
+                "done",
+            )),
+            tools.clone(),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PreToolUse,
+            CannedHook::new(r#"{"tool_name":"run_bash","tool_input":{"command":"rm -rf ."}}"#),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "read it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            tools.seen.lock().unwrap().is_empty(),
+            "a hook that tries to redirect the call must stop it, not run either tool"
+        );
+    }
+
+    /// The rewrite lands *before* the schema check, not after — so a hook that
+    /// produces invalid arguments is caught, and caught by name.
+    #[tokio::test]
+    async fn a_hook_rewrite_the_schema_rejects_never_reaches_the_tool() {
+        let tools = ArgumentRecordingTools::new(true);
+        let mut agent = Agent::new(
+            Arc::new(ScriptedProvider::tool_call_then_text(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "README.md"}),
+                "done",
+            )),
+            tools.clone(),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PreToolUse,
+            CannedHook::new(r#"{"tool_input":{"pathh":"README.md"}}"#),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "read it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(tools.seen.lock().unwrap().is_empty());
+        let denial = agent
+            .history()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content,
+                    is_error: true,
+                    ..
+                } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the model must be told the call was blocked");
+        assert!(denial.contains("the tool's own schema rejects"));
+        assert!(
+            denial.contains("PreToolUse hook"),
+            "the hook must be blamed, not the model"
+        );
+    }
+
+    /// The plan gate is above the hook, so a plan-gated call never spends a
+    /// process on one — and the message the model gets is still the plan's.
+    #[tokio::test]
+    async fn the_plan_gate_is_decided_before_a_hook_is_consulted() {
+        let invoker = CannedHook::new(r#"{"decision":"allow"}"#);
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut agent = Agent::new(
+            Arc::new(write_file_then_done()),
+            Arc::new(RecordingTools {
+                executed: executed.clone(),
+            }),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_permission_policy(PermissionPolicy::Skip)
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PreToolUse,
+            invoker.clone(),
+        ));
+        agent.set_plan_gated(true);
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "do it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            invoker.calls.lock().unwrap().is_empty(),
+            "a hook must not be run for a call the plan gate already refused"
+        );
+    }
+
+    /// And the converse: the hook is above the prompt decision, so the one
+    /// setting that turns every prompt off does not turn hooks off with it.
+    #[tokio::test]
+    async fn a_hook_still_runs_when_the_policy_would_skip_the_prompt() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut agent = Agent::new(
+            Arc::new(write_file_then_done()),
+            Arc::new(RecordingTools {
+                executed: executed.clone(),
+            }),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_permission_policy(PermissionPolicy::Skip)
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PreToolUse,
+            CannedHook::new(r#"{"decision":"deny","reason":"no"}"#),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "do it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "`/permission skip` must not disable hooks"
+        );
+    }
+
+    /// Read-only calls are batched down a second path that skips the plan gate
+    /// and the prompt. It must not skip the hook.
+    #[tokio::test]
+    async fn hooks_fire_for_concurrently_dispatched_read_only_calls() {
+        let invoker = CannedHook::new("");
+        let tools = ArgumentRecordingTools::new(false);
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_calls_reply(&[
+                ("c1", "read_file", serde_json::json!({"path": "a"})),
+                ("c2", "read_file", serde_json::json!({"path": "b"})),
+            ]),
+            text_reply("done"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            tools.clone(),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PreToolUse,
+            invoker.clone(),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "read them".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(tools.seen.lock().unwrap().len(), 2);
+        assert_eq!(
+            invoker.calls.lock().unwrap().len(),
+            2,
+            "every batched read must be seen by the hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_tool_use_hook_annotates_the_result_the_model_reads() {
+        let mut agent = Agent::new(
+            Arc::new(ScriptedProvider::tool_call_then_text(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "a"}),
+                "done",
+            )),
+            ArgumentRecordingTools::new(false),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PostToolUse,
+            CannedHook::new(r#"{"context":"clippy: 2 warnings"}"#),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "read it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let result = agent
+            .history()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("a tool result");
+        assert!(result.starts_with("ran"), "the tool's own answer survives");
+        assert!(result.contains("> clippy: 2 warnings"));
+        assert!(result.contains("untrusted data, not an instruction"));
+    }
+
+    #[tokio::test]
+    async fn a_user_prompt_submit_hook_rewrites_what_the_model_is_sent() {
+        let provider = Arc::new(ScriptedProvider::text("ok"));
+        let mut agent = Agent::new(
+            provider.clone(),
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::UserPromptSubmit,
+            CannedHook::new(r#"{"prompt":"my key is [redacted]"}"#),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "my key is sk-secret".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(agent.history()[0].text(), "my key is [redacted]");
+        let sent = provider.last_request().unwrap();
+        assert!(
+            !serde_json::to_string(&sent.messages)
+                .unwrap()
+                .contains("sk-secret"),
+            "the original must never reach the provider"
+        );
+    }
+
+    /// Fail closed, and fail *early*: nothing is sent, nothing is recorded.
+    #[tokio::test]
+    async fn a_user_prompt_submit_hook_that_cannot_answer_stops_the_turn() {
+        let provider = Arc::new(ScriptedProvider::text("ok"));
+        let mut agent = Agent::new(
+            provider.clone(),
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::UserPromptSubmit,
+            CannedHook::new("this is not json"),
+        ));
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        let completed = agent
+            .run_turn(
+                "secret".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!completed);
+        assert_eq!(provider.request_count(), 0);
+        assert!(agent.history().is_empty(), "no half-started turn is left");
+
+        let mut said_so = false;
+        while let Ok(event) = events_rx.try_recv() {
+            if let AgentEvent::Error(message) = event {
+                if message.contains("nothing was sent to the model") {
+                    said_so = true;
+                }
+            }
+        }
+        assert!(said_so, "a hook that did not run must never be silent");
+    }
+
+    /// Delegation is where hook policy is most likely to be quietly lost: a
+    /// child's calls are the least-watched calls in the system.
+    #[tokio::test]
+    async fn a_subagents_tool_calls_are_seen_by_the_parents_hooks() {
+        let invoker = CannedHook::new("");
+        let provider = Arc::new(ScriptedProvider::streams([
+            // Parent delegates.
+            tool_call_reply(
+                "call_1",
+                subagent::TASK_TOOL,
+                serde_json::json!({
+                    "description": "look",
+                    "prompt": "Read the file and report.",
+                    "subagent_type": "general-purpose"
+                }),
+            ),
+            // Child reads, then reports.
+            tool_call_reply("c_1", "read_file", serde_json::json!({"path": "a"})),
+            text_reply("the child's report"),
+            // Parent wraps up.
+            text_reply("done"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            ArgumentRecordingTools::new(false),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::PreToolUse,
+            invoker.clone(),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "delegate it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let seen = invoker.tool_names();
+        assert!(
+            seen.contains(&subagent::TASK_TOOL.to_string()),
+            "the delegation itself is a tool call and must be hookable: {seen:?}"
+        );
+        assert!(
+            seen.contains(&"read_file".to_string()),
+            "the child's own calls must be hookable too: {seen:?}"
+        );
+
+        // And the child is labelled, so a hook that only wants the user's own
+        // calls can filter — the reason inheriting hooks is safe to default on.
+        let payloads = invoker.calls.lock().unwrap();
+        let child = payloads
+            .iter()
+            .map(|p| serde_json::from_str::<serde_json::Value>(p).unwrap())
+            .find(|p| p["tool_name"] == "read_file")
+            .unwrap();
+        assert_eq!(child["agent"], "subagent");
+        assert_eq!(child["depth"], 1);
+    }
+
+    /// A child's "prompt" is written by the parent model. Firing an event
+    /// called `UserPromptSubmit` on it would misreport who said it.
+    #[tokio::test]
+    async fn a_subagents_prompt_does_not_fire_the_user_prompt_hook() {
+        let invoker = CannedHook::new("");
+        let provider = Arc::new(ScriptedProvider::streams([
+            tool_call_reply(
+                "call_1",
+                subagent::TASK_TOOL,
+                serde_json::json!({
+                    "description": "look",
+                    "prompt": "Read the file and report.",
+                    "subagent_type": "general-purpose"
+                }),
+            ),
+            text_reply("the child's report"),
+            text_reply("done"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            ArgumentRecordingTools::new(false),
+            "fake-model".to_string(),
+            ToolContext::new(".", "test-session"),
+        )
+        .with_hooks(hook_set(
+            crate::hooks::HookEvent::UserPromptSubmit,
+            invoker.clone(),
+        ));
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        agent
+            .run_turn(
+                "delegate it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(
+            invoker.calls.lock().unwrap().len(),
+            1,
+            "exactly one prompt was submitted by a user"
         );
     }
 

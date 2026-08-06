@@ -139,6 +139,20 @@ impl ToolExecutor for ToolRegistry {
             .is_some_and(|t| t.scratch_scoped(input, ctx))
     }
 
+    /// The same check `execute` runs, without running the tool.
+    ///
+    /// Exists for `PreToolUse` hooks: a hook may rewrite a call's arguments,
+    /// and the rewrite is validated at the hook site so that a bad one is
+    /// blamed on the hook instead of surfacing later as a dispatch error that
+    /// reads as if the model had written it. `execute` still validates — this
+    /// is the attribution, that is the backstop.
+    fn validate_input(&self, name: &str, input: &serde_json::Value) -> Result<(), String> {
+        let Some(tool) = self.tools.get(name) else {
+            return Err(format!("unknown tool: {name}"));
+        };
+        crate::schema_validate::validate_input(name, &tool.input_schema(), input)
+    }
+
     /// The one place a tool call is checked against the schema the model was
     /// shown.
     ///

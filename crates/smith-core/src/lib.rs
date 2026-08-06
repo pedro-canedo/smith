@@ -4,6 +4,7 @@ pub mod agent;
 pub mod checkpoint;
 pub mod context;
 pub mod event;
+pub mod hooks;
 pub mod message;
 pub mod permission_detail;
 pub mod pricing;
@@ -25,6 +26,7 @@ pub use event::{
     Action, AgentEvent, AgentPhase, LoopStopReason, PermissionDecision, PermissionRequest,
     ProgressReporter, ResourceStats, Task, TaskStatus, TurnLimitKind, UserQuestion,
 };
+pub use hooks::{HookDefinition, HookEvent, HookSet};
 pub use message::{
     CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition, Usage,
 };

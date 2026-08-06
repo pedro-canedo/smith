@@ -123,6 +123,40 @@ fn secret_redactor(config: &Config) -> Redactor {
     Redactor::new(from_env.chain(from_config))
 }
 
+/// Turns the `[hooks]` config into the set the agent runs.
+///
+/// Shared by both places an `Agent` is built, so `/model` cannot silently drop
+/// the user's hooks the way it once could have dropped their redactor: a
+/// policy that stops being enforced because the model was switched is exactly
+/// the invisible failure hooks exist to avoid.
+fn hook_set(config: &Config) -> Arc<smith_core::HookSet> {
+    use smith_core::hooks::{HookDefinition, HookEvent, DEFAULT_TIMEOUT};
+
+    let build = |event: HookEvent, entries: &[smith_config::HookCommand]| {
+        entries
+            .iter()
+            .map(|entry| {
+                HookDefinition::new(event, entry.command.clone())
+                    .with_matcher(entry.matcher.clone())
+                    .with_timeout(
+                        entry
+                            .timeout_ms
+                            .map(std::time::Duration::from_millis)
+                            .unwrap_or(DEFAULT_TIMEOUT),
+                    )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut hooks = build(HookEvent::PreToolUse, &config.hooks.pre_tool_use);
+    hooks.extend(build(HookEvent::PostToolUse, &config.hooks.post_tool_use));
+    hooks.extend(build(
+        HookEvent::UserPromptSubmit,
+        &config.hooks.user_prompt_submit,
+    ));
+    Arc::new(smith_core::HookSet::new(hooks))
+}
+
 /// Collects the config `web_search` reads, in one place so the orchestrator and
 /// `doctor` cannot disagree about which backends are configured.
 pub(crate) fn web_search_settings(config: &Config) -> smith_tools::web_search::SearchSettings {
@@ -353,6 +387,10 @@ impl OrchestratorState {
             // since startup is covered too. Forgetting it here would silently
             // disable redaction for the rest of the session.
             .with_redactor(secret_redactor(config))
+            // Rebuilt from config for the same reason as the redactor above,
+            // and with the same failure mode if forgotten: a hook the user
+            // believes is enforcing a policy, silently gone since `/model`.
+            .with_hooks(hook_set(config))
             .with_permission_policy(permission_policy);
         if let Some(checkpointer) = checkpointer {
             agent = agent.with_checkpointer(checkpointer);
@@ -594,6 +632,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         .with_limits(limits)
         .with_retry_policy(RetryPolicy::default())
         .with_redactor(secret_redactor(&config))
+        .with_hooks(hook_set(&config))
         .with_permission_policy(permission_policy);
     agent.set_goal(initial_goal);
     let seeded_tasks = crate::last_write_tasks_call(&initial_messages);
@@ -902,6 +941,65 @@ mod tests {
     use super::*;
     use crate::headless::{self, HeadlessOptions, OutputFormat, EXIT_LIMIT, EXIT_OK};
     use smith_core::testkit::{text_reply, tool_call_reply, ScriptedProvider, ScriptedResponse};
+
+    /// `[hooks]` sits between a plain table and an array of tables in
+    /// `Config`, and the TOML serializer is order-sensitive about exactly
+    /// that: a field in the wrong place writes a file this same struct cannot
+    /// read back, and nothing but a round trip catches it.
+    #[test]
+    fn a_config_carrying_hooks_survives_a_toml_round_trip() {
+        let mut config = Config::default();
+        config.runtime.chromium_path = Some("/usr/bin/chromium".into());
+        config.hooks.pre_tool_use.push(smith_config::HookCommand {
+            command: "guard.sh".into(),
+            matcher: Some("write_file|edit_file".into()),
+            timeout_ms: Some(2_000),
+        });
+        config
+            .hooks
+            .user_prompt_submit
+            .push(smith_config::HookCommand {
+                command: "redact.sh".into(),
+                matcher: None,
+                timeout_ms: None,
+            });
+        config.mcp_servers.push(smith_config::McpServerConfig {
+            name: "files".into(),
+            command: "mcp-files".into(),
+            args: vec!["--root".into()],
+        });
+
+        let text = toml::to_string_pretty(&config).expect("must serialize");
+        let parsed: Config = toml::from_str(&text).expect("must parse back");
+
+        assert_eq!(parsed.hooks.pre_tool_use.len(), 1);
+        assert_eq!(parsed.hooks.pre_tool_use[0].command, "guard.sh");
+        assert_eq!(parsed.hooks.pre_tool_use[0].timeout_ms, Some(2_000));
+        assert_eq!(parsed.hooks.user_prompt_submit[0].matcher, None);
+        assert!(parsed.hooks.post_tool_use.is_empty());
+        assert_eq!(parsed.mcp_servers.len(), 1);
+    }
+
+    /// Every configured entry has to become a hook the agent will actually
+    /// run: a mapping that drops one silently is the exact failure mode this
+    /// feature cannot have.
+    #[test]
+    fn every_configured_hook_reaches_the_agent() {
+        let mut config = Config::default();
+        for (list, command) in [
+            (&mut config.hooks.pre_tool_use, "pre.sh"),
+            (&mut config.hooks.post_tool_use, "post.sh"),
+            (&mut config.hooks.user_prompt_submit, "prompt.sh"),
+        ] {
+            list.push(smith_config::HookCommand {
+                command: command.into(),
+                matcher: None,
+                timeout_ms: None,
+            });
+        }
+        assert_eq!(hook_set(&config).len(), 3);
+        assert!(hook_set(&Config::default()).is_empty());
+    }
 
     /// The whole stack minus the network: a real `run_orchestrator` driving a
     /// real `Agent` and `ToolRegistry` over the real channels, with only the
