@@ -476,12 +476,23 @@ pub async fn ensure_ninerouter_running(config: &Config) -> Result<(), String> {
         .ok_or_else(|| "the 9router gateway is not installed — run `smith setup`".to_string())?;
 
     let port = port_of(&base_url).unwrap_or(NINEROUTER_PORT);
+
+    // The gateway writes here instead of to /dev/null. It cost a whole
+    // debugging session to learn that the process had *said* why it was
+    // leaving; a daemon whose only failure report is "did not answer" blames
+    // the network for what was a missing flag.
+    let log = ninerouter_log(&cli);
+    let sink = || {
+        std::fs::File::create(&log)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null())
+    };
+
     tokio::process::Command::new(&node)
-        .arg(&cli)
-        .env("PORT", port.to_string())
+        .args(ninerouter_args(&cli, port))
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(sink())
+        .stderr(sink())
         .spawn()
         .map_err(|e| format!("could not start the 9router gateway: {e}"))?;
 
@@ -494,8 +505,77 @@ pub async fn ensure_ninerouter_running(config: &Config) -> Result<(), String> {
         }
     }
     Err(format!(
-        "the 9router gateway did not answer on {base_url} within 10s — check `smith doctor`"
+        "the 9router gateway did not answer on {base_url} within 10s{}",
+        match ninerouter_log_tail(&log) {
+            Some(tail) => format!(" — it said:\n{tail}"),
+            None => " — check `smith doctor`".to_string(),
+        }
     ))
+}
+
+/// Where the spawned gateway's output goes, beside the install it came from.
+fn ninerouter_log(cli: &Path) -> PathBuf {
+    cli.parent()
+        .map(|dir| dir.join("gateway.log"))
+        .unwrap_or_else(|| PathBuf::from("gateway.log"))
+}
+
+/// The last few lines the gateway printed, for a failure message. Best effort:
+/// a missing or unreadable log costs the detail, never the error.
+fn ninerouter_log_tail(log: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(log).ok()?;
+    let tail: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(6)
+        .collect();
+    if tail.is_empty() {
+        return None;
+    }
+    Some(
+        tail.into_iter()
+            .rev()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// How the gateway is invoked for an unattended start.
+///
+/// `--tray` is the load-bearing one, and it is not about a tray icon. Without
+/// it the CLI binds the port and then drops into an interactive menu
+/// (update / web / terminal / hide / exit). Spawned with a null stdin, that
+/// menu reads EOF, takes the `exit` branch and shuts the gateway down a
+/// moment after it started — which surfaced as "did not answer within 10s"
+/// and sent people to look at the network. These are the same arguments the
+/// CLI passes when it re-launches *itself* in the background, which is the
+/// best evidence available that this is the supported unattended mode.
+///
+/// `--skip-update` because an update check on a pinned install can only
+/// produce a prompt nobody is there to answer; the pin moves in a smith
+/// release, per this module's doc.
+///
+/// `--host 127.0.0.1` because the CLI binds `0.0.0.0` by default and says so
+/// in a warning that went to /dev/null. The gateway proxies the user's
+/// provider credentials and smith only ever reaches it over loopback, so
+/// exposing it to the LAN is a cost with no matching benefit.
+fn ninerouter_args(cli: &Path, port: u16) -> Vec<std::ffi::OsString> {
+    vec![
+        // Node's own flag, ahead of the script: WSL2 and some corporate DNS
+        // resolvers answer AAAA for localhost and the gateway then dials an
+        // address nothing is listening on. The CLI sets it on itself too.
+        "--dns-result-order=ipv4first".into(),
+        cli.as_os_str().to_os_string(),
+        "--tray".into(),
+        "--skip-update".into(),
+        "-p".into(),
+        port.to_string().into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+    ]
 }
 
 /// Port of an `http://host:port/...` URL, without pulling in a URL crate.
@@ -508,6 +588,100 @@ fn port_of(base_url: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression this file was fixed for. Without `--tray` the gateway
+    /// binds its port, drops into an interactive menu, reads EOF from the null
+    /// stdin smith gives it, and exits — leaving a health probe to time out
+    /// and blame the network. Asserted by name because the failure it prevents
+    /// is invisible: the process starts, so nothing looks wrong until the
+    /// port stops answering a second later.
+    #[test]
+    fn the_gateway_is_started_in_its_unattended_mode() {
+        let args = ninerouter_args(Path::new("/opt/9router/cli.js"), 20128);
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.contains(&"--tray".to_string()), "{args:?}");
+        assert!(args.contains(&"--skip-update".to_string()), "{args:?}");
+        // The script path has to precede the script's own flags, and Node's
+        // flags have to precede the script.
+        let cli = args
+            .iter()
+            .position(|a| a.ends_with("cli.js"))
+            .expect("the script is passed at all");
+        let node_flag = args
+            .iter()
+            .position(|a| a == "--dns-result-order=ipv4first")
+            .expect("node's resolver order is set");
+        let tray = args.iter().position(|a| a == "--tray").unwrap();
+        assert!(node_flag < cli, "node flags come first: {args:?}");
+        assert!(cli < tray, "script flags come after the script: {args:?}");
+    }
+
+    /// Loopback, not `0.0.0.0`: the gateway holds provider credentials and
+    /// smith only ever dials it locally.
+    #[test]
+    fn the_gateway_is_not_exposed_to_the_network() {
+        let args = ninerouter_args(Path::new("/opt/9router/cli.js"), 4242);
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let host = args.iter().position(|a| a == "--host").expect("host set");
+        assert_eq!(args[host + 1], "127.0.0.1", "{args:?}");
+
+        // The port is passed as a flag, not left to the CLI's default: a
+        // configured `base_url` on another port has to reach the gateway.
+        let port = args.iter().position(|a| a == "-p").expect("port set");
+        assert_eq!(args[port + 1], "4242", "{args:?}");
+    }
+
+    #[test]
+    fn a_missing_gateway_log_costs_the_detail_and_not_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ninerouter_log_tail(&dir.path().join("nope.log")).is_none());
+
+        let empty = dir.path().join("empty.log");
+        std::fs::write(&empty, "\n   \n\n").unwrap();
+        assert!(
+            ninerouter_log_tail(&empty).is_none(),
+            "whitespace is not a diagnosis"
+        );
+    }
+
+    #[test]
+    fn the_gateway_log_tail_keeps_the_last_lines_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("gateway.log");
+        std::fs::write(
+            &log,
+            (1..=10).fold(String::new(), |mut s, i| {
+                s.push_str(&format!("line {i}\n"));
+                s
+            }),
+        )
+        .unwrap();
+
+        let tail = ninerouter_log_tail(&log).expect("a written log has a tail");
+        assert!(tail.contains("line 10"), "{tail}");
+        assert!(tail.contains("line 5"), "{tail}");
+        assert!(!tail.contains("line 4"), "only the last six: {tail}");
+        assert!(
+            tail.find("line 5").unwrap() < tail.find("line 10").unwrap(),
+            "the tail reads forwards: {tail}"
+        );
+    }
+
+    #[test]
+    fn the_gateway_log_sits_beside_the_install_it_came_from() {
+        let log = ninerouter_log(Path::new("/opt/9router/node_modules/9router/cli.js"));
+        assert_eq!(
+            log,
+            Path::new("/opt/9router/node_modules/9router/gateway.log")
+        );
+    }
 
     #[test]
     fn the_platform_table_matches_nodejs_dist_naming() {
