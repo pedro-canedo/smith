@@ -88,6 +88,7 @@ impl ToolRegistry {
         registry.register(Arc::new(crate::shell_tool::RunBashTool));
         registry.register(Arc::new(crate::ask_user::AskUserTool));
         registry.register(Arc::new(crate::write_tasks::WriteTasksTool));
+        registry.register(Arc::new(crate::task::TaskTool));
         // Unconfigured by default: Bing (free, no key) with DuckDuckGo behind
         // it. A caller holding an Exa key or a SearXNG URL upgrades this with
         // `replace`.
@@ -327,6 +328,7 @@ mod tests {
             "run_bash",
             "ask_user",
             "write_tasks",
+            "task",
             "web_search",
             "web_fetch",
         ] {
@@ -567,6 +569,14 @@ mod tests {
                 "write_tasks",
                 serde_json::json!({
                     "tasks": [{"content": "do it", "status": "in_progress"}]
+                }),
+            ),
+            (
+                "task",
+                serde_json::json!({
+                    "description": "find call sites",
+                    "prompt": "Find every call site of run_one_tool and report each one.",
+                    "subagent_type": "general-purpose"
                 }),
             ),
             (

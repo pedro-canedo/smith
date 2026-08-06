@@ -1772,6 +1772,7 @@ fn activity_label(tool_name: &str, input: &serde_json::Value) -> String {
         "list_dir" => format!("Listing {}", field("path")),
         "glob" => format!("Searching {}", field("pattern")),
         "grep" => format!("Searching for {}", field("pattern")),
+        "task" => format!("Delegating: {}", field("description")),
         "multi_edit" => format!("Editing {}", field("path")),
         "run_bash" => format!("Running {}", field("command")),
         "write_tasks" => "Updating task list".to_string(),

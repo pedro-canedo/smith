@@ -5,6 +5,7 @@ mod prompts;
 mod resources;
 mod runtime;
 mod setup;
+mod subagents;
 
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Read};

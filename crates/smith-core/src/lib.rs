@@ -10,6 +10,7 @@ pub mod pricing;
 pub mod provider;
 pub mod redact;
 pub mod retry;
+pub mod subagent;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod tool;
@@ -31,4 +32,5 @@ pub use permission_detail::format_permission_detail;
 pub use provider::{LlmProvider, ProviderCapabilities, ProviderError};
 pub use redact::Redactor;
 pub use retry::RetryPolicy;
+pub use subagent::SubagentDefinition;
 pub use tool::{PermissionClass, PermissionPolicy, Tool, ToolContext, ToolResult};

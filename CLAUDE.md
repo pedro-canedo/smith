@@ -308,3 +308,67 @@ deltas (a tag may straddle two), leaves anything inside a ``` fence or
 immediately after a backtick alone, and removes a stray closing tag without
 eating the text around it. The reasoning itself is discarded; `Agent::
 reasoning_tags_stripped()` counts what was removed.
+
+### Subagents (the `task` tool)
+
+`task` delegates a bounded piece of work to a **child `Agent`** with its own
+history. The child runs a full `run_turn`, and the only thing that crosses back
+into the parent's history is its final message — everything it read is
+discarded. That asymmetry is the whole feature: measured inline in
+`agent.rs::tests`, six 4 KB reads leave the parent 8074 estimated tokens when
+it does them itself and 58 when it delegates.
+
+The mechanism is **interception**, like `ask_user` and `write_tasks`, but for a
+structural reason rather than a UI one: a subagent has to construct an `Agent`
+from the parent's provider, tool registry, model and context, and an ordinary
+`Tool` (`&self`, in `smith-tools`) can reach none of those.
+`Agent::run_task` (`smith-core/src/agent.rs`) builds the child; everything else
+lives in `smith-core/src/subagent.rs`. `run_task` returns a `BoxFuture` rather
+than being an `async fn` — `run_turn` → `run_one_tool` → `run_task` →
+`run_turn` is a real recursion, and naming the type is what breaks the `Send`
+inference cycle.
+
+The five limits, all of them load-bearing:
+
+- **Read-only, always.** A child's tool set is the registered `ReadOnly` tools
+  minus `ask_user`/`write_tasks`/`task`, and a definition asking for
+  `write_file` is refused that tool (visibly, as a progress line) rather than
+  granted it. Reads are what fill a context window; a write is one `tool_use`
+  the parent can emit itself after reading the report. Enforced by
+  `subagent::RestrictedTools`, not by the prompt.
+- **Depth 1.** A child never sees `task`, *and* `run_task` refuses on depth —
+  the JSON-envelope fallback resolves names against the registry, not the
+  visible set.
+- **A shared tool-call pool per turn.** `Agent::subagent_tool_budget` is
+  refilled from `max_tool_calls_per_turn` at the top of every `run_turn` and
+  drained by every child. Per-child caps multiply (50 parent calls × 30 each);
+  a pool is additive, so a turn spends at most twice its own cap. A child also
+  gets at most the parent turn's *remaining* wall clock.
+- **Permission prompts are refused, not routed up.** The modal is keyed by
+  `tool_call_id`, and a child's ids belong to a transcript the user cannot see,
+  so routing it up would ask them to approve a call with no card. Session
+  grants are not inherited either, and neither is a `skip` policy.
+- **`ask_user` is refused with a reason**, through the `Err(reason)` arm of
+  `QuestionAsk` that headless already uses.
+
+Cancellation: the child holds `cancel.child_token()`, so Esc reaches it
+immediately, and `run_task` still returns a real `ToolResult` — the parent's
+`tool_use` gets its `tool_result` exactly as for any other tool.
+
+Visibility is `AgentEvent::ToolProgress` on the parent's `task` card, emitted
+by `subagent::relay_child`, which drains the child's private event channel and
+turns each step into one line ("`general-purpose: [3] Read file src/agent.rs`").
+No new event variant, so `stream-json` and the TUI already render it. The one
+thing forwarded verbatim is `TokenUsage` — the user pays for those tokens —
+and the child's total is also billed to the parent's turn.
+
+A child that runs out of budget still returns whatever it wrote, with a
+`[This report is partial — …]` note (`finish_subagent`). Throwing partial work
+away makes the parent re-delegate and pay twice for the half it already had.
+
+Definitions live in `~/.smith/agents/*.md` with `name` / `description` /
+`tools` / `model` front matter and a markdown body appended to the child's
+prompt. `SubagentDefinition::parse` is in `smith-core`; the directory scan is
+`smith-cli/src/subagents.rs` (only the frontend knows about home directories).
+A broken file costs its own subagent and is reported — never startup. The
+built-in `general-purpose` child needs no file and cannot be shadowed by one.

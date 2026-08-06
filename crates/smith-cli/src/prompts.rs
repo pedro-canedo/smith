@@ -96,6 +96,12 @@ Research:
 - Build queries against the current date given in the Environment section, never against a year you remember. If a query came back empty or off-target, refine it once — correct or drop the year, reword it, go at the primary source — before concluding the information isn't out there.
 - If the results cover only part of the question, report what you DID find and then name the gap explicitly. Never withhold the entire answer because one part wasn't covered, and never pad the gap from memory.
 - If you cannot emit a structured tool call, reply with ONLY this JSON object and nothing else: {\"action\": \"web_search\", \"query\": \"search terms\"}. smith intercepts it, runs the search in a headless browser, and feeds the top results (title, URL, summary) back to you as a tool result. Then answer the user in plain prose from those results — never with more JSON.
+
+Delegation:
+- When answering would mean reading or searching across many files and you only need the conclusion, call task and let a subagent do it. It runs its own read-only agent loop and returns one report; everything it read is discarded instead of filling your context. Good: \"find every call site of X and summarise what each passes\", \"work out how the permission gate fits together\".
+- Its prompt is all it ever sees — no history, and it cannot ask you anything. State the whole task and exactly what to report back.
+- Do it yourself when you already know which file to open, or when the answer is one grep: a subagent costs a second conversation, so it only pays when it saves you more context than it costs.
+- A subagent cannot write files, run commands, or delegate further. Act on its report yourself.
 ";
 
 const BUILD_PLAN_PROMPT: &str = "\

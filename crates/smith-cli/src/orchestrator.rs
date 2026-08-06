@@ -337,10 +337,14 @@ impl OrchestratorState {
         // Dropping this would silently disable `/rewind` for the rest of the
         // session — the least visible way to lose an undo buffer.
         let checkpointer = self.agent.checkpointer();
+        // Read from disk once at startup; re-reading here would let a file
+        // edited mid-session take effect on `/model` and nowhere else.
+        let subagents = self.agent.subagent_definitions().to_vec();
 
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
             .with_system(SYSTEM_PROMPT)
             .with_context_provider(context_provider(self.memory.clone()))
+            .with_subagent_definitions(subagents)
             .with_limits(limits)
             .with_retry_policy(retry_policy)
             .with_compaction(compaction)
@@ -557,10 +561,19 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         });
     }
 
+    // A definition that will not parse costs its own subagent and nothing
+    // else — but it is said out loud, because a `task` call naming a subagent
+    // that quietly failed to load is otherwise just "no subagent named x".
+    let (subagents, subagent_problems) = crate::subagents::load();
+    for problem in subagent_problems {
+        let _ = event_tx.send(AgentEvent::Error(format!("subagent {problem}")));
+    }
+
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_checkpointer(checkpoints.clone())
         .with_system(SYSTEM_PROMPT)
         .with_context_provider(context_provider(memory.clone()))
+        .with_subagent_definitions(subagents)
         // Set explicitly (rather than left to `Agent`'s own default) so
         // `switch_model` has something to carry over and so `--max-turns` has
         // exactly one place to plug into.
