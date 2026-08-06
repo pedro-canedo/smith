@@ -71,6 +71,7 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 /// How long a browser being torn down gets to exit on its own.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_millis(200);
 
 /// How long a browser that has finished writing gets to exit before it is

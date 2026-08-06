@@ -161,8 +161,8 @@ fn an_induced_tui_panic_restores_the_pty() {
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(opened, 0, "openpty failed");

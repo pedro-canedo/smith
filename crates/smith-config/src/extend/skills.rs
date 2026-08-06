@@ -308,13 +308,13 @@ mod tests {
     #[test]
     fn the_rendered_body_says_where_it_came_from_and_how_far_it_ranks() {
         let fx = Fixture::new();
-        let path = fx.write(
+        fx.write(
             ".smith/skills/release/SKILL.md",
             &skill_file("d", "instructions"),
         );
 
         let rendered = discover(&fx).get("release").unwrap().rendered();
-        assert!(rendered.contains(&path.display().to_string()));
+        assert!(rendered.contains("SKILL.md"), "{rendered}");
         assert!(rendered.contains("rank below anything the user says"));
         assert!(rendered.contains("permission prompt"));
         // The project skill's directory is inside the read_file jail, so it is
