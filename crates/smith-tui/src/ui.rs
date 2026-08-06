@@ -1541,9 +1541,18 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         let sep = theme.separator();
         Some(format!("up/down card{sep}Enter expand{sep}Esc back"))
     } else if busy {
-        let frames = theme.spinner_frames();
-        let spinner = frames[app.spinner_frame % frames.len()];
-        let mut s = format!("{spinner} {}", app.phase_label());
+        // A spinner claims work is in progress. While the agent is blocked on
+        // the user — a permission prompt, a question — nothing is in progress,
+        // and a frozen spinner would be worse than none: it reads as a hang.
+        // `is_animating` is the same predicate the event loop wakes on, so the
+        // glyph and the redraws cannot disagree about whether anything moves.
+        let marker = if app.is_animating() {
+            let frames = theme.spinner_frames();
+            format!("{} ", frames[app.spinner_frame % frames.len()])
+        } else {
+            String::new()
+        };
+        let mut s = format!("{marker}{}", app.phase_label());
         if let Some((iteration, max_iterations)) = app.loop_progress {
             s.push_str(&format!(
                 "{}{iteration}/{max_iterations}",

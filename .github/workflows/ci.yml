@@ -72,3 +72,88 @@ jobs:
       # this job would silently check with stable instead of the MSRV.
       - name: cargo check
         run: cargo +1.88.0 check --workspace --all-targets
+
+  # Acceptance criterion #8, in its literal form: `NO_COLOR=1 smith -p "..."
+  # --output-format json | jq`. The serde round trip is unit-tested, but the
+  # criterion is about the *pipeline* — that stdout carries the JSON alone,
+  # with every progress line on stderr, and that a real `jq` accepts it.
+  #
+  # Ubuntu only: this asserts a property of our own output, not of the
+  # platform, and `jq` and a POSIX shell are on the runner already.
+  acceptance:
+    name: acceptance criteria (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the binary
+        run: cargo build -p smith-cli
+
+      - name: Start the fixture provider
+        run: |
+          python3 .github/fixtures/fake_provider.py 18923 &
+          echo $! > /tmp/fixture.pid
+          # Wait for the port rather than sleeping a guess.
+          for _ in $(seq 1 50); do
+            if curl -sf -o /dev/null http://127.0.0.1:18923/v1/models; then exit 0; fi
+            sleep 0.2
+          done
+          echo "fixture provider never came up" >&2
+          exit 1
+
+      - name: Criterion 8 — NO_COLOR json output pipes into jq
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/debug/smith"
+          # The *project* config layer, not the global one: it applies without
+          # depending on the runner's HOME, and `--cwd` puts the session store
+          # and the tool sandbox in the same throwaway directory.
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/.smith"
+          printf '[ollama]\nbase_url = "http://127.0.0.1:18923/v1"\n' \
+            > "$WORK/.smith/config.toml"
+
+          NO_COLOR=1 "$BIN" --cwd "$WORK" \
+            -p "diga oi" --output-format json \
+            --provider ollama --model fake-model \
+            > out.json 2> err.txt
+
+          # `jq -e` fails on malformed input *and* on a false/null result, so
+          # this is both "it parses" and "the field is what we say it is".
+          jq -e '.ok == true' out.json > /dev/null
+          jq -e '.result | length > 0' out.json > /dev/null
+          jq -e '.usage.input_tokens == 11' out.json > /dev/null
+
+          # The other half of the criterion: stdout is *only* the JSON, so a
+          # redirect gets a parseable file even when chrome was printed.
+          test "$(head -c 1 out.json)" = "{"
+
+      - name: Criterion 8 — stream-json emits one parseable event per line
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/debug/smith"
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/.smith"
+          printf '[ollama]\nbase_url = "http://127.0.0.1:18923/v1"\n' \
+            > "$WORK/.smith/config.toml"
+
+          NO_COLOR=1 "$BIN" --cwd "$WORK" \
+            -p "diga oi" --output-format stream-json \
+            --provider ollama --model fake-model \
+            > stream.jsonl 2> /dev/null
+
+          # Every line must parse on its own — that is what "stream" means to
+          # a consumer reading it incrementally.
+          while IFS= read -r line; do
+            printf '%s' "$line" | jq -e 'has("type")' > /dev/null
+          done < stream.jsonl
+          test -s stream.jsonl
+
+      - name: Stop the fixture provider
+        if: always()
+        run: kill "$(cat /tmp/fixture.pid)" || true

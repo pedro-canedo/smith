@@ -55,6 +55,10 @@ base64 = "0.23"
 # normal build of the dependency above.
 smith-core = { workspace = true, features = ["testkit"] }
 tempfile = "3"
+# Acceptance criterion #9 needs a *real* pseudo-terminal: with stdout on a
+# pipe, `enable_raw_mode` fails and the whole restore path this asserts is
+# never entered. Dev-only, so it never reaches the shipped binary.
+portable-pty = "0.9"
 # Doctor's tests build `Config` values from literal TOML, which is how a user's
 # file actually reaches it. Test-only: nothing in the binary parses TOML —
 # `smith-config` owns the format.

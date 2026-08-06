@@ -20,7 +20,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Tests live inline in `#[cfg(test)] mod tests { ... }` at the bottom of the
-source file they cover — there are no separate test files. `cargo fmt`,
+source file they cover. There is exactly one exception, and it is forced
+rather than chosen: `crates/smith-cli/tests/pty.rs`, which spawns the real
+`smith` binary under a pseudo-terminal for acceptance criterion #9. Cargo
+defines `CARGO_BIN_EXE_smith` only for integration tests, and the criterion —
+"a panic leaves the terminal usable" — cannot be checked without running the
+actual binary against a real tty. Add a file under `tests/` only when a test
+genuinely cannot see what it needs from inside the crate. `cargo fmt`,
 `cargo clippy -D warnings`, and `cargo test --workspace` must all pass before
 committing.
 

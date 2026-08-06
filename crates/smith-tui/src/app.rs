@@ -865,8 +865,27 @@ impl App {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
     }
 
+    /// Whether anything on screen is actually moving.
+    ///
+    /// The event loop redraws on a timer only while this is true, so it is the
+    /// whole of acceptance criterion #10: an idle smith must do no work.
+    ///
+    /// **Waiting on the user is not animation.** This used to return `true`
+    /// for *any* open modal, which meant a permission prompt redrew the whole
+    /// frame eight times a second for as long as the user took to read it —
+    /// while a spinner told them work was in progress and nothing whatsoever
+    /// was happening. Both halves were wrong: the wakeups and the claim.
+    ///
+    /// A tool card mid-flight is still checked in those phases, because a
+    /// parallel read-only call can genuinely be running behind the prompt.
     pub fn is_animating(&self) -> bool {
-        self.waiting_on_assistant || self.modal.is_some() || !matches!(self.phase, AgentPhase::Idle)
+        if matches!(
+            self.phase,
+            AgentPhase::WaitingPermission | AgentPhase::Asking
+        ) {
+            return self.lines.iter().any(ChatLine::is_animating);
+        }
+        self.waiting_on_assistant || !matches!(self.phase, AgentPhase::Idle)
     }
 
     // --- Card focus -------------------------------------------------------
@@ -3521,6 +3540,75 @@ mod tests {
         });
         assert_eq!(app.overlay.as_ref().unwrap().scroll, 3);
         assert_eq!(app.scroll, 10, "the transcript stayed put");
+    }
+
+    /// Acceptance criterion #10, asserted where it is actually decided.
+    ///
+    /// `lib.rs::run` redraws on the spinner tick only when `is_animating()`
+    /// is true, so "zero wakeups while idle" is exactly "this predicate is
+    /// false". Asserting it here rather than counting frames through a real
+    /// terminal is the stronger test: it names the states, and it fails on the
+    /// state that regressed rather than on a timing measurement.
+    #[test]
+    fn an_idle_smith_does_no_work() {
+        let mut app = test_app();
+        assert!(!app.is_animating(), "a fresh session");
+
+        app.lines
+            .push(ChatLine::new(ChatRole::Assistant, "a finished reply"));
+        assert!(!app.is_animating(), "a settled transcript");
+
+        app.run_slash_command("usage");
+        assert!(!app.is_animating(), "an open panel is a still image");
+    }
+
+    /// The regression the roadmap called out: a permission prompt used to
+    /// redraw the whole frame ~8 times a second while the *user* was reading
+    /// it, with a spinner claiming work was happening.
+    #[test]
+    fn waiting_on_the_user_is_not_animation() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::PermissionPromptNeeded(
+            smith_core::PermissionRequest {
+                tool_call_id: "1".into(),
+                tool_name: "run_bash".into(),
+                detail: "ls".into(),
+            },
+        ));
+        assert!(app.modal.is_some(), "the prompt is up");
+        assert!(
+            !app.is_animating(),
+            "nothing is moving while the agent waits for a human"
+        );
+
+        app.on_agent_event(AgentEvent::UserQuestionNeeded(smith_core::UserQuestion {
+            id: "q".into(),
+            prompt: "which one?".into(),
+            options: ["a".into(), "b".into(), "c".into()],
+        }));
+        assert!(!app.is_animating(), "same for a question");
+    }
+
+    /// …but a read-only tool running in parallel behind the prompt still is.
+    #[test]
+    fn a_tool_still_running_behind_a_prompt_keeps_the_frame_alive() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "read_file".into(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+        });
+        app.on_agent_event(AgentEvent::PermissionPromptNeeded(
+            smith_core::PermissionRequest {
+                tool_call_id: "2".into(),
+                tool_name: "run_bash".into(),
+                detail: "ls".into(),
+            },
+        ));
+        assert!(
+            app.is_animating(),
+            "the running card's throbber has to keep ticking"
+        );
     }
 
     /// The motivating case for remappable keys: tmux owns Ctrl+B by default,
