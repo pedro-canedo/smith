@@ -343,6 +343,15 @@ pub struct QuestionAsk {
     pub respond_to: oneshot::Sender<Result<String, String>>,
 }
 
+/// The tools `run_one_tool` handles itself instead of dispatching to
+/// `ToolExecutor::execute`.
+///
+/// Named in one place because two things have to agree about the list: the
+/// interception arms below, and the schema check that has to run *before*
+/// them precisely because `execute` — where every other call is validated —
+/// is never reached.
+const INTERCEPTED_TOOLS: &[&str] = &["ask_user", "write_tasks", subagent::TASK_TOOL];
+
 pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     tools: Arc<dyn ToolExecutor>,
@@ -1635,6 +1644,33 @@ impl Agent {
             Ok(input) => input,
             Err(blocked) => return blocked,
         };
+
+        // The intercepted tools below return before `ToolExecutor::execute`,
+        // which is where every other call is checked against the schema the
+        // model was shown. That made the registry's claim to be "the one
+        // place" false, and left three tools re-implementing ad-hoc argument
+        // parsing — decent today, but the invariant is what the next
+        // intercepted tool inherits. Checked here instead, before the
+        // interception, so the claim is true again for every path.
+        //
+        // A rejection is an ordinary tool error for the same reason it is in
+        // the registry: the model sees it and a wrong argument is the most
+        // correctable thing it can be told.
+        if INTERCEPTED_TOOLS.contains(&name) {
+            if let Err(message) = self.tools.validate_input(name, &input) {
+                let _ = events.send(AgentEvent::ToolCallStarted {
+                    id: id.to_string(),
+                    tool_name: name.to_string(),
+                    input: input.clone(),
+                });
+                let _ = events.send(AgentEvent::ToolCallResult {
+                    id: id.to_string(),
+                    output: message.clone(),
+                    is_error: true,
+                });
+                return ToolResult::error(message);
+            }
+        }
 
         // Clarifying questions are allowed even while plan-gated.
         if name == "ask_user" {
@@ -3333,6 +3369,87 @@ mod tests {
             executed.load(std::sync::atomic::Ordering::SeqCst),
             "a scratch-confined Mutating call must run without a prompt"
         );
+    }
+
+    /// The three intercepted tools never reach `ToolExecutor::execute`, which
+    /// is where every dispatched call is checked against its published schema.
+    /// They are checked before the interception instead, so "a tool call is
+    /// validated against the schema the model was shown" holds on every path
+    /// rather than on most of them.
+    #[tokio::test]
+    async fn the_intercepted_tools_are_checked_against_their_schema_too() {
+        for tool in INTERCEPTED_TOOLS {
+            let provider = Arc::new(
+                ScriptedProvider::tool_call_then_text(
+                    "call_1",
+                    tool,
+                    // Missing every required property, whatever they are.
+                    serde_json::json!({}),
+                    "done",
+                )
+                .with_id("anthropic"),
+            );
+            let tool_ctx = ToolContext::new(".", "test-session");
+            let mut agent = Agent::new(
+                provider,
+                Arc::new(RejectingSchemaTools),
+                "fake-model".to_string(),
+                tool_ctx,
+            );
+
+            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+            let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+            let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+            agent
+                .run_turn(
+                    "go".to_string(),
+                    events_tx,
+                    permission_tx,
+                    question_tx,
+                    CancellationToken::new(),
+                )
+                .await;
+
+            let mut rejected = false;
+            while let Ok(event) = events_rx.try_recv() {
+                if matches!(&event, AgentEvent::ToolCallResult { output, is_error, .. }
+                    if *is_error && output.contains("schema says no"))
+                {
+                    rejected = true;
+                }
+            }
+            assert!(rejected, "{tool} ran without its arguments being checked");
+        }
+    }
+
+    /// Refuses every argument object, so a call that was validated at all is
+    /// distinguishable from one that was not.
+    struct RejectingSchemaTools;
+
+    #[async_trait]
+    impl ToolExecutor for RejectingSchemaTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            Vec::new()
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::ReadOnly)
+        }
+
+        fn validate_input(&self, _name: &str, _input: &serde_json::Value) -> Result<(), String> {
+            Err("schema says no".to_string())
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            ToolResult::ok("should never run")
+        }
     }
 
     /// `task` is classed `ReadOnly` because a child's own tools are, and it

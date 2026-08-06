@@ -1634,7 +1634,6 @@ fn draw_permission_modal(
     body_lines.push(Line::from(""));
     body_lines.push(Line::from(key_row));
 
-    let inner_width = width.saturating_sub(2);
     let block = |scrollable: bool| {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1655,9 +1654,11 @@ fn draw_permission_modal(
         .block(block(false))
         .wrap(Wrap { trim: false });
 
-    // `line_count` already includes the block's two border rows, so it is the
-    // full popup height the content wants — clamp that, don't grow it again.
-    let content_height = paragraph.line_count(inner_width) as u16;
+    // `line_count` takes the **outer** width and returns the **outer** height:
+    // it subtracts the block's borders itself before wrapping, and adds its two
+    // border rows back to the count. Handing it `inner_width` therefore wrapped
+    // the text at `width - 4` and over-counted every line that wrapped.
+    let content_height = paragraph.line_count(width) as u16;
     let height = content_height
         .min(max_height)
         .max(PERMISSION_MODAL_MIN_HEIGHT)
@@ -1720,8 +1721,6 @@ fn draw_plan_modal(
         height,
     };
 
-    let inner_width = width.saturating_sub(2);
-    let inner_height = height.saturating_sub(2);
     let paragraph = Paragraph::new(Text::from(body_lines))
         .style(theme.raised_bg())
         .block(
@@ -1732,8 +1731,12 @@ fn draw_plan_modal(
                 .border_style(theme.plan()),
         )
         .wrap(Wrap { trim: false });
-    let content_height = paragraph.line_count(inner_width) as u16;
-    let max_scroll = content_height.saturating_sub(inner_height);
+    // Both sides of this are *outer* measurements — see the note in
+    // `draw_permission_modal`. Mixing them was worth two rows of overscroll:
+    // `line_count` includes the two border rows, so subtracting the inner
+    // height let the plan scroll two lines past its own end into blank space.
+    let content_height = paragraph.line_count(width) as u16;
+    let max_scroll = content_height.saturating_sub(height);
     modal.scroll = modal.scroll.min(max_scroll);
 
     frame.render_widget(Clear, popup);
@@ -3074,6 +3077,77 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    /// Scrolling a modal to its end must leave no blank rows at the bottom.
+    ///
+    /// `Paragraph::line_count` takes the **outer** width and returns the
+    /// **outer** height — it subtracts the block's borders before wrapping and
+    /// adds the two border rows back to the count. The plan modal mixed that
+    /// with the *inner* height, so `max_scroll` was two too large and the view
+    /// could sit two rows past its own content. Asserting "the last line is
+    /// still visible" is not enough to catch that: overscrolled by two, it is
+    /// visible, just with dead space under it. The dead space is the symptom.
+    #[test]
+    fn scrolling_a_modal_to_the_end_leaves_no_dead_space_under_it() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_for_input_tests();
+        let body: String = (0..60).map(|i| format!("plan line {i}\n")).collect();
+        app.modal = crate::app::Modal::Plan(crate::app::PlanModal {
+            text: format!("{body}THE-LAST-LINE"),
+            scroll: 0,
+        });
+
+        // Far past any plausible end; the renderer clamps it.
+        for _ in 0..40 {
+            app.on_key(
+                crossterm::event::KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            );
+        }
+
+        let (w, h) = (100u16, 30u16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let row_text = |y: u16| -> String {
+            (0..w)
+                .map(|x| {
+                    buf.cell(ratatui::layout::Position::new(x, y))
+                        .unwrap()
+                        .symbol()
+                })
+                .collect()
+        };
+
+        // Anchored on the modal's own title, not on "the last corner glyph on
+        // screen" — the input box is drawn below the modal and owns the last
+        // border on the frame, so that shortcut measured the wrong widget.
+        let top = (0..h)
+            .find(|&y| row_text(y).contains("plan ready"))
+            .expect("the modal drew its title");
+        let bottom = ((top + 1)..h)
+            .find(|&y| {
+                let r = row_text(y);
+                r.contains('╰') || r.contains('┘') || r.contains('+')
+            })
+            .expect("the modal drew a bottom border");
+
+        // The row directly above it belongs to the content, and at the end of
+        // the scroll it must not be empty.
+        let last_content = row_text(bottom - 1);
+        let inner: String = last_content
+            .chars()
+            .filter(|c| !matches!(c, '│' | '|' | ' '))
+            .collect();
+        assert!(
+            !inner.is_empty(),
+            "blank row above the bottom border: the modal scrolled past its \
+             own content.\nbottom border row {bottom}: {last_content:?}"
+        );
     }
 
     #[test]

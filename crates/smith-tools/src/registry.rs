@@ -153,15 +153,22 @@ impl ToolExecutor for ToolRegistry {
         crate::schema_validate::validate_input(name, &tool.input_schema(), input)
     }
 
-    /// The one place a tool call is checked against the schema the model was
-    /// shown.
+    /// Where a dispatched tool call is checked against the schema the model
+    /// was shown.
     ///
     /// It goes here rather than in each tool for the same reason the plan gate
     /// and the permission prompt live in `Agent::run_one_tool`: it is the
-    /// choke point every call passes through, so a tool added tomorrow is
-    /// covered by the schema it already has to publish, and no tool can forget.
-    /// Tools keep their own checks behind this — validation proves the
-    /// *shape*, never that a path exists or that `old_str` is unique.
+    /// choke point every dispatched call passes through, so a tool added
+    /// tomorrow is covered by the schema it already has to publish, and no
+    /// tool can forget. Tools keep their own checks behind this — validation
+    /// proves the *shape*, never that a path exists or that `old_str` is
+    /// unique.
+    ///
+    /// "Dispatched" is load-bearing. Three tools are intercepted by
+    /// `Agent::run_one_tool` and never reach this function, so it validates
+    /// those against the same schema itself, immediately before intercepting
+    /// them. This used to claim to be the only such place and was not, which
+    /// left the intercepted three on hand-written argument parsing.
     async fn execute(
         &self,
         name: &str,
@@ -176,6 +183,12 @@ impl ToolExecutor for ToolRegistry {
         // model already sees these, and a wrong argument is the most
         // correctable thing it can be told. Anything harsher (aborting the
         // turn) would spend a whole turn on a fixable typo.
+        //
+        // Not the *only* place this happens, despite how it reads: `ask_user`,
+        // `write_tasks` and `task` are intercepted by `Agent::run_one_tool`
+        // and never arrive here, so it validates those three itself, against
+        // this same schema, before dispatching them. Two call sites, one rule
+        // — see `smith_core::agent::INTERCEPTED_TOOLS`.
         if let Err(message) =
             crate::schema_validate::validate_input(name, &tool.input_schema(), &input)
         {

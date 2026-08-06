@@ -272,13 +272,20 @@ against the schema the model was shown", and argues it belongs there because
 covered". It is not that choke point. `ask_user`, `write_tasks` and `task`
 return from `run_one_tool` before `execute` is reached, and each re-implements
 ad-hoc argument parsing (`str_arg`, `parse_tasks`, the option triple). Today
-their hand-written checks are decent, so this is a latent bug rather than a
-live one — but the invariant the comment states is false, and the next
+their hand-written checks are decent, so this was a latent bug rather than a
+live one — but the invariant the comment stated was false, and the next
 intercepted tool inherits the false version.
 
-The `PreToolUse` hook implementation partially closes this: rewritten arguments
-are validated at the hook site through `ToolExecutor::validate_input`, which
-covers the intercepted three as well.
+**Fixed.** `run_one_tool` validates the intercepted three against the same
+published schema immediately before intercepting them, and the registry's own
+doc comment now says "dispatched call" rather than claiming to be the only
+place. The list lives in one constant, `INTERCEPTED_TOOLS`, because two things
+have to agree about it: the interception arms and the check that has to run
+ahead of them.
+
+The `PreToolUse` hook implementation already closed part of this: rewritten
+arguments are validated at the hook site through `ToolExecutor::validate_input`.
+That covered a hook's rewrite, never the model's original call.
 
 ---
 
