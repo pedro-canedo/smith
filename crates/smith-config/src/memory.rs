@@ -198,15 +198,23 @@ impl MemoryScope {
 /// is not under `$HOME`, so the test passed while the bug was still there for
 /// every real project outside a git repository.
 fn find_project_root(from: &Path) -> PathBuf {
-    let temp_root = lexical_normalize(&std::env::temp_dir());
-    let home = directories::BaseDirs::new().map(|d| lexical_normalize(d.home_dir()));
+    // Compared through `real_path`, not lexically. On Windows the two sides
+    // arrive in different spellings of the same directory:
+    // `std::env::temp_dir()` answers with the 8.3 short name
+    // (`C:\Users\RUNNER~1\AppData\Local\Temp`) while `home_dir()` answers
+    // with the long one (`C:\Users\runneradmin`), so a string comparison
+    // never matches and the boundary silently does not exist. Canonicalising
+    // both is what makes "is this the home directory" a question about the
+    // directory rather than about how it was spelled.
+    let temp_root = real_path(&std::env::temp_dir());
+    let home = directories::BaseDirs::new().map(|d| real_path(d.home_dir()));
     for dir in from.ancestors() {
-        let normalized = lexical_normalize(dir);
         if dir != from {
-            if normalized == temp_root {
+            let resolved = real_path(dir);
+            if resolved == temp_root {
                 continue;
             }
-            if home.as_ref() == Some(&normalized) {
+            if home.as_ref() == Some(&resolved) {
                 break;
             }
         }
@@ -889,6 +897,29 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         let scope = MemoryScope::discover(&deep);
         assert_eq!(scope.root, lexical_normalize(&deep));
+    }
+
+    /// The same boundary, reached through a directory spelled differently.
+    ///
+    /// Windows hands out both an 8.3 short name and a long one for the same
+    /// directory, and the two sources disagree about which: `temp_dir()`
+    /// answers short, `home_dir()` long. A lexical comparison therefore found
+    /// no boundary at all and walked straight past it — which is what CI kept
+    /// catching after the first fix looked right.
+    #[test]
+    fn the_boundary_is_a_directory_not_a_spelling() {
+        let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) else {
+            return;
+        };
+        // The temp directory is inside the profile on Windows and outside it
+        // elsewhere; either way it must not resolve to a project root above.
+        let deep = std::env::temp_dir().join("smith-boundary-probe/a/b");
+        let scope = MemoryScope::discover(&deep);
+        assert_ne!(
+            scope.root,
+            lexical_normalize(&home),
+            "the walk reached the home directory"
+        );
     }
 
     /// `~/.smith` is smith's own global directory and exists on every machine
