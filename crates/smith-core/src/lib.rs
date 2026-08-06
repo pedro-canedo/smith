@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub mod context;
 pub mod event;
 pub mod hooks;
+pub mod mcp;
 pub mod message;
 pub mod permission_detail;
 pub mod pricing;
@@ -27,6 +28,7 @@ pub use event::{
     ProgressReporter, ResourceStats, Task, TaskStatus, TurnLimitKind, UserQuestion,
 };
 pub use hooks::{HookDefinition, HookEvent, HookSet};
+pub use mcp::{McpCommand, McpHealth, McpServerStatus, McpStatus};
 pub use message::{
     CompletionRequest, ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition, Usage,
 };

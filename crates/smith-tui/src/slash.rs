@@ -7,6 +7,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("goal", "set, show, or clear the session goal"),
     ("help", "list available commands"),
     ("loop", "repeat a task until done, N iterations, or Esc"),
+    ("mcp", "list MCP servers, or run a server-supplied prompt"),
     ("model", "show or switch provider/model"),
     ("permission", "show or set tool permission policy"),
     ("plan", "propose a plan before executing"),

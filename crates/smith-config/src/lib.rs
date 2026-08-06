@@ -151,14 +151,40 @@ pub struct RuntimeSettings {
     pub chromium_version: Option<String>,
 }
 
-/// One entry in `[[mcp_servers]]`: a stdio-transport MCP server smith should
-/// connect to at startup and pull tools from.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One entry in `[[mcp_servers]]`: an MCP server smith should connect to at
+/// startup and pull tools, resources and prompts from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub name: String,
+    /// The program to spawn for a stdio-transport server. `#[serde(default)]`
+    /// because a `url` server has no command — an entry with neither is what
+    /// is rejected, not an entry missing this one field.
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    // --- added by the MCP transports work; keep contiguous -----------------
+    /// Endpoint of a URL-based server. Its presence is what selects a network
+    /// transport, so every existing `command`-only entry keeps working with no
+    /// edit at all.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Forces a transport instead of inferring one: `stdio`, `http`
+    /// (Streamable HTTP) or `sse` (the older HTTP+SSE pair). Unset means
+    /// infer — `command` implies stdio, and a `url` is tried as Streamable
+    /// HTTP first, then as HTTP+SSE.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// Extra HTTP headers for a URL server — in practice `Authorization`.
+    /// Ignored by the stdio transport.
+    ///
+    /// Must stay the **last** field: it serializes as a nested table, and TOML
+    /// forbids a scalar key after a table inside the same `[[mcp_servers]]`
+    /// element. `skip_serializing_if` additionally keeps a stdio entry's
+    /// round-tripped bytes byte-identical to what they were before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 pub const OLLAMA_HOST: &str = "http://127.0.0.1:11434";
@@ -511,6 +537,73 @@ mod tests {
             Some("/home/u/.smith/runtime/chrome")
         );
         assert_eq!(parsed.mcp_servers.len(), 1);
+    }
+
+    /// Same hazard one level down: `headers` is a table inside an
+    /// `[[mcp_servers]]` element, so any scalar field serialized after it
+    /// would land in the wrong table. And a `command`-only entry must still
+    /// serialize to exactly what it did before `url`/`headers` existed.
+    #[test]
+    fn a_url_server_with_headers_round_trips_and_a_stdio_one_is_unchanged() {
+        let mut config = Config {
+            mcp_servers: vec![
+                McpServerConfig {
+                    name: "local".into(),
+                    command: "mcp-fs".into(),
+                    args: vec!["--root".into(), "/tmp".into()],
+                    ..Default::default()
+                },
+                McpServerConfig {
+                    name: "remote".into(),
+                    url: Some("https://mcp.example.com/mcp".into()),
+                    transport: Some("http".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        config.mcp_servers[1]
+            .headers
+            .insert("Authorization".into(), "Bearer t".into());
+
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).expect("must parse back: {text}");
+
+        assert_eq!(parsed.mcp_servers[0].command, "mcp-fs");
+        assert!(parsed.mcp_servers[0].url.is_none());
+        assert!(parsed.mcp_servers[0].headers.is_empty());
+        // An entry with no headers writes no `headers` table at all.
+        assert_eq!(text.matches("headers").count(), 1);
+
+        assert_eq!(
+            parsed.mcp_servers[1].url.as_deref(),
+            Some("https://mcp.example.com/mcp")
+        );
+        assert_eq!(parsed.mcp_servers[1].transport.as_deref(), Some("http"));
+        assert_eq!(
+            parsed.mcp_servers[1].headers.get("Authorization").unwrap(),
+            "Bearer t"
+        );
+    }
+
+    /// An existing `[[mcp_servers]]` entry written before URL transports
+    /// existed still loads, with the new fields simply absent.
+    #[test]
+    fn a_pre_existing_stdio_entry_loads_untouched() {
+        let config: Config = toml::from_str(
+            r#"
+            [[mcp_servers]]
+            name = "files"
+            command = "mcp-server-filesystem"
+            args = ["/home/u"]
+            "#,
+        )
+        .unwrap();
+        let server = &config.mcp_servers[0];
+        assert_eq!(server.command, "mcp-server-filesystem");
+        assert_eq!(server.args, vec!["/home/u".to_string()]);
+        assert!(server.url.is_none() && server.transport.is_none());
+        assert!(server.headers.is_empty());
     }
 
     #[test]

@@ -256,55 +256,42 @@ fn persist_turn(state: &mut OrchestratorState) {
     }
 }
 
-/// Connects to every configured MCP server and registers its tools into
-/// `tools`, each under the namespaced `mcp__{server}__{tool}` name so a remote
-/// server can't shadow a built-in or another server. A server that fails to
-/// connect or list tools is skipped (with an error surfaced in the UI) rather
-/// than aborting startup — one bad server shouldn't take down the whole
-/// session; an individual tool whose name is somehow still taken is skipped
-/// the same way.
-async fn connect_mcp_servers(
-    config: &Config,
+/// Starts connecting to every configured MCP server, concurrently, and hands
+/// back a join handle rather than a result.
+///
+/// Nothing here is awaited on the way in, and that is the point. Connecting is
+/// process spawns and network handshakes — the slowest thing in startup — and
+/// it used to sit in front of everything else in `run_orchestrator`, serially,
+/// with no deadline. Now: N servers cost the slowest one instead of the sum,
+/// they overlap with provider construction, memory discovery and subagent
+/// loading, and `McpRegistry::connect_all` caps each server at
+/// `smith_mcp::CONNECT_TIMEOUT`, so a wedged server is a bounded delay rather
+/// than a hang. The remaining cost is that the *first turn* waits for the
+/// registry; the UI has never waited, since `main` spawns the orchestrator and
+/// renders the first frame in parallel with it.
+fn start_mcp_connections(config: &Config) -> tokio::task::JoinHandle<smith_mcp::McpRegistry> {
+    let specs = config.mcp_servers.clone();
+    tokio::spawn(async move { smith_mcp::McpRegistry::connect_all(&specs).await })
+}
+
+/// Registers everything a connected registry publishes, under the namespaced
+/// `mcp__{server}__{tool}` name so a remote server can't shadow a built-in or
+/// another server. A server that failed is reported and skipped rather than
+/// aborting startup — one bad server shouldn't take down the whole session;
+/// an individual tool whose name is somehow still taken is skipped the same
+/// way.
+fn register_mcp_tools(
+    registry: &smith_mcp::McpRegistry,
     tools: &mut ToolRegistry,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
 ) {
-    for server in &config.mcp_servers {
-        let client = match smith_mcp::McpClient::connect(
-            &server.name,
-            &server.command,
-            &server.args,
-        )
-        .await
-        {
-            Ok(client) => Arc::new(client),
-            Err(e) => {
-                let _ = event_tx.send(AgentEvent::Error(format!(
-                    "mcp server '{}': failed to connect: {e}",
-                    server.name
-                )));
-                continue;
-            }
-        };
-
-        match client.list_tools().await {
-            Ok(defs) => {
-                for def in defs {
-                    let remote_name = def.name.clone();
-                    let adapter = Arc::new(smith_mcp::McpToolAdapter::new(client.clone(), def));
-                    if let Err(e) = tools.try_register(adapter) {
-                        let _ = event_tx.send(AgentEvent::Error(format!(
-                            "mcp server '{}': skipping tool '{remote_name}': {e}",
-                            server.name
-                        )));
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = event_tx.send(AgentEvent::Error(format!(
-                    "mcp server '{}': failed to list tools: {e}",
-                    server.name
-                )));
-            }
+    for problem in registry.problems() {
+        let _ = event_tx.send(AgentEvent::Error(problem));
+    }
+    for tool in registry.tools() {
+        let name = tool.name().to_string();
+        if let Err(e) = tools.try_register(tool) {
+            let _ = event_tx.send(AgentEvent::Error(format!("mcp: skipping '{name}': {e}")));
         }
     }
 }
@@ -543,6 +530,10 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         question_tx,
     } = chans;
 
+    // Started before anything else in this function, so the process spawns and
+    // network handshakes overlap with everything below instead of preceding it.
+    let mcp_connecting = start_mcp_connections(&config);
+
     let provider = match provider_override {
         Some(p) => p,
         None => match build_provider(provider_kind, &config) {
@@ -563,8 +554,6 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     tools.replace(Arc::new(
         smith_tools::web_search::WebSearchTool::with_settings(web_search_settings(&config)),
     ));
-    connect_mcp_servers(&config, &mut tools, &event_tx).await;
-    let tools = Arc::new(tools);
 
     // Allocate a stable session id up front for staging (and reuse a resumed
     // id). The DB row is still created lazily on first persist via ensure_session.
@@ -619,6 +608,13 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     for problem in subagent_problems {
         let _ = event_tx.send(AgentEvent::Error(format!("subagent {problem}")));
     }
+
+    // The latest point the MCP registry can be joined: everything above ran
+    // while the servers were connecting, and `Agent::new` needs the finished
+    // tool registry. A panicked connect task costs MCP and nothing else.
+    let mcp = Arc::new(mcp_connecting.await.unwrap_or_default());
+    register_mcp_tools(&mcp, &mut tools, &event_tx);
+    let tools = Arc::new(tools);
 
     let scratch_dir = tool_ctx.scratch_dir();
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
@@ -928,6 +924,56 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                     .await;
                 });
             }
+            Action::Mcp(command) => {
+                let mcp = mcp.clone();
+                let state = state.clone();
+                let event_tx = event_tx.clone();
+                let permission_tx = permission_tx.clone();
+                let question_tx = question_tx.clone();
+                let cancel = CancellationToken::new();
+                current_cancel = Some(cancel.clone());
+                // Spawned like every other arm: `/mcp prompt` runs a whole
+                // turn, and a turn must never block this loop from handling
+                // the Esc that would cancel it.
+                tokio::spawn(async move {
+                    match command {
+                        smith_core::McpCommand::Status => {
+                            let _ = event_tx.send(AgentEvent::McpStatus(mcp.status()));
+                        }
+                        smith_core::McpCommand::Prompt {
+                            server,
+                            name,
+                            arguments,
+                        } => {
+                            match mcp
+                                .render_prompt(server.as_deref(), &name, &arguments)
+                                .await
+                            {
+                                Ok(text) => {
+                                    let mut guard = state.lock().await;
+                                    guard
+                                        .agent
+                                        .run_turn(
+                                            text,
+                                            event_tx,
+                                            permission_tx,
+                                            question_tx,
+                                            cancel,
+                                        )
+                                        .await;
+                                    persist_turn(&mut guard);
+                                }
+                                // An `Error` is what resets the frontend's
+                                // "waiting on assistant" state, so a prompt
+                                // that cannot be fetched must report as one.
+                                Err(e) => {
+                                    let _ = event_tx.send(AgentEvent::Error(e));
+                                }
+                            }
+                        }
+                    }
+                });
+            }
             Action::Quit => break,
             Action::PermissionResponse(_) | Action::QuestionResponse(_) => {
                 // Resolved directly by smith-tui via the oneshot channels.
@@ -967,6 +1013,11 @@ mod tests {
             name: "files".into(),
             command: "mcp-files".into(),
             args: vec!["--root".into()],
+            // A stdio entry predates the network transports and must still
+            // round-trip byte-identically — that is what this test is for.
+            url: None,
+            transport: None,
+            headers: Default::default(),
         });
 
         let text = toml::to_string_pretty(&config).expect("must serialize");

@@ -7,10 +7,19 @@ rust-version.workspace = true
 
 [dependencies]
 smith-core = { workspace = true }
+smith-config = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+
+[dev-dependencies]
+# `net` only for the in-process HTTP/SSE server the transport tests talk to;
+# nothing is listened to or dialled outside 127.0.0.1.
+tokio = { workspace = true, features = ["net", "test-util"] }

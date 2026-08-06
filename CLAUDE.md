@@ -40,9 +40,10 @@ way: `smith-core` defines traits and knows nothing about HTTP, SQLite, or
 - **`smith-tools`** — built-in tools (`read_file`, `write_file`, `edit_file`,
   `list_dir`, `glob`, `run_bash`, `ask_user`) and the `ToolRegistry` that
   implements `smith_core::ToolExecutor`.
-- **`smith-mcp`** — hand-rolled JSON-RPC-over-stdio MCP client; bridges
-  remote MCP server tools into the same `Tool` trait as built-ins (default
-  `PermissionClass::Dangerous`, same as `run_bash`).
+- **`smith-mcp`** — hand-rolled JSON-RPC MCP client over three transports
+  (stdio, Streamable HTTP, HTTP+SSE); bridges remote MCP server tools into
+  the same `Tool` trait as built-ins (default `PermissionClass::Dangerous`,
+  same as `run_bash`).
 - **`smith-store`** — global config (`~/.smith/config.toml`) and
   per-project session history (`.smith/sessions.db`, SQLite).
 - **`smith-tui`** — the `ratatui`/`crossterm` terminal UI (chat pane, input
@@ -298,6 +299,45 @@ Only the pure halves are unit-tested; two `#[ignore]`d tests
 (`web_search::tests::live_search_returns_results_relevant_to_the_query` and
 `chromium::tests::live_fetch_returns_a_parseable_search_feed`) exercise the real
 network and browser.
+
+### MCP servers
+
+`[[mcp_servers]]` entries carry either a `command` (stdio) or a `url`
+(`transport = "http" | "sse"`, or unset to try Streamable HTTP and then
+HTTP+SSE). `command`-only entries written before URL support keep working
+untouched — the presence of `url` is what selects a network transport.
+`smith_mcp::transport::Transport` is the whole abstraction: `send` one JSON-RPC
+message, receive on an `Incoming` channel. `McpClient` is written against that
+pair alone, so all three transports share one correlator, one 30s request
+deadline and one liveness rule (**the incoming channel closing** fails every
+in-flight call at once, so a server dying mid-session costs no timeouts).
+
+`McpRegistry::connect_all` connects every server **concurrently**, each capped
+at `CONNECT_TIMEOUT` (15s), and `run_orchestrator` starts it before anything
+else and joins it immediately before `Agent::new` — so N servers cost the
+slowest one, overlapped with provider/memory/subagent setup. The UI never
+waited: `main` spawns the orchestrator and renders in parallel.
+
+Three decisions worth not re-litigating:
+
+- **Resources are a tool, not context.** `list_mcp_resources` /
+  `read_mcp_resource` are registered only when some server actually publishes
+  resources. A resource list injected into every request would cost tokens on
+  every turn of the session, forever, and go stale; a tool is paid for only
+  when used. `read_mcp_resource` is `Mutating` for `web_fetch`'s reason (a
+  model-composed URI leaving the machine); the listing is `ReadOnly`.
+- **Prompts are user-invoked, never model-reachable.** `/mcp prompt [<server>]
+  <name> [key=value ...]` → `McpRegistry::render_prompt` → the text of one user
+  message. No tool exposes them: a prompt template is *meant* to be an
+  instruction, and the only thing that makes that safe is that the user asked
+  for it by name.
+- **Everything else a server says is data.** Tool results and resource
+  contents go through `untrusted::fence` — `web_fetch`'s framing verbatim,
+  stated before *and* after the body, with every run of five hyphens defanged
+  so a payload cannot close the fence. Tool *descriptions* cannot be fenced
+  (an ignored description is an unusable tool), so they get provenance and a
+  4 KB cap; what actually protects those is the `mcp__{server}__{tool}`
+  namespacing and `Dangerous`.
 
 ### The JSON action envelope
 

@@ -162,6 +162,10 @@ pub enum Action {
         prompt: String,
         max_iterations: Option<u32>,
     },
+    /// `/mcp` and its subcommands. One variant for the family rather than one
+    /// per subcommand: the orchestrator is the only thing that can answer any
+    /// of them, and splitting them would just spread the same match wider.
+    Mcp(crate::mcp::McpCommand),
     Quit,
 }
 
@@ -265,6 +269,9 @@ pub enum AgentEvent {
     /// them differently would be inviting the user to mistake one for the
     /// other.
     Rewind(crate::checkpoint::RewindReport),
+    /// The answer to `Action::Mcp(McpCommand::Status)`: every configured MCP
+    /// server, its transport, health and inventory counts.
+    McpStatus(crate::mcp::McpStatus),
     /// The agent replaced its task checklist via `write_tasks` — the full
     /// list, not a diff; the frontend just swaps its copy wholesale.
     TasksUpdated(Vec<Task>),

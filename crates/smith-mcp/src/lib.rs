@@ -1,8 +1,17 @@
-//! MCP client: server lifecycle management and bridging remote tools into smith_core::Tool.
+//! MCP client: server lifecycle management over stdio, Streamable HTTP and
+//! HTTP+SSE, and bridging remote tools, resources and prompts into smith.
 
 pub mod bridge;
 pub mod client;
-mod transport;
+pub mod http;
+pub mod registry;
+pub mod transport;
+pub mod untrusted;
 
-pub use bridge::{namespaced_tool_name, McpToolAdapter};
-pub use client::{McpClient, McpError, McpToolDef};
+pub use bridge::{namespaced_tool_name, ListMcpResourcesTool, McpToolAdapter, ReadMcpResourceTool};
+pub use client::{
+    McpClient, McpError, McpPromptDef, McpPromptResult, McpResourceDef, McpToolDef,
+    ServerCapabilities,
+};
+pub use registry::{ConnectedServer, McpRegistry, CONNECT_TIMEOUT};
+pub use transport::{Transport, TransportKind};

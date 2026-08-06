@@ -787,7 +787,15 @@ fn check_session_db(cwd: &Path) -> Check {
 
 async fn check_mcp_server(server: &McpServerConfig) -> Check {
     let name = format!("mcp:{}", server.name);
-    let connect = smith_mcp::McpClient::connect(&server.name, &server.command, &server.args);
+    // What to call the server in a diagnostic: a URL entry has no command, and
+    // telling its owner to check `PATH` would send them somewhere with nothing
+    // in it.
+    let target = match server.url.as_deref() {
+        Some(url) if !url.is_empty() => url.to_string(),
+        _ => server.command.clone(),
+    };
+    let is_url = server.url.as_deref().is_some_and(|u| !u.is_empty());
+    let connect = smith_mcp::McpClient::connect(&server.name, server);
 
     let client = match tokio::time::timeout(MCP_TIMEOUT, connect).await {
         Ok(Ok(client)) => client,
@@ -795,12 +803,19 @@ async fn check_mcp_server(server: &McpServerConfig) -> Check {
             let spawn_failed = matches!(e, smith_mcp::McpError::Spawn(_));
             return Check::fail(
                 name,
-                format!("cannot start `{}`: {e}", server.command),
-                if spawn_failed {
+                format!("cannot start `{target}`: {e}"),
+                if is_url {
                     format!(
-                        "`{}` is not on PATH or is not executable. Install it, or correct \
+                        "smith could not complete the MCP handshake against {target}. Check the \
+                         URL, that the server is running, and any credentials it needs in \
+                         `headers` (the [[mcp_servers]] entry \"{}\").",
+                        server.name
+                    )
+                } else if spawn_failed {
+                    format!(
+                        "`{target}` is not on PATH or is not executable. Install it, or correct \
                          `command` in the [[mcp_servers]] entry named \"{}\".",
-                        server.command, server.name
+                        server.name
                     )
                 } else {
                     format!(
@@ -816,17 +831,20 @@ async fn check_mcp_server(server: &McpServerConfig) -> Check {
             return Check::fail(
                 name,
                 format!(
-                    "`{}` did not respond within {}s",
-                    server.command,
+                    "`{target}` did not respond within {}s",
                     MCP_TIMEOUT.as_secs()
                 ),
-                format!(
-                    "The server hung during startup. Run `{} {}` by hand — one that waits on \
-                     stdin, or asks for credentials interactively, will hang smith the same way \
-                     at every launch.",
-                    server.command,
-                    server.args.join(" ")
-                ),
+                if is_url {
+                    format!("{target} accepted the connection but never answered `initialize`.")
+                } else {
+                    format!(
+                        "The server hung during startup. Run `{} {}` by hand — one that waits on \
+                         stdin, or asks for credentials interactively, will hang smith the same \
+                         way at every launch.",
+                        server.command,
+                        server.args.join(" ")
+                    )
+                },
             )
         }
     };
@@ -1355,7 +1373,7 @@ mod tests {
         let check = check_mcp_server(&McpServerConfig {
             name: "ghost".to_string(),
             command: "smith-doctor-definitely-not-a-real-command".to_string(),
-            args: vec![],
+            ..Default::default()
         })
         .await;
 
@@ -1408,6 +1426,7 @@ for line in sys.stdin:
             name: "fake".to_string(),
             command: "python3".to_string(),
             args: vec!["-c".to_string(), FAKE_SERVER.replace("TOOLS", tools_json)],
+            ..Default::default()
         }
     }
 

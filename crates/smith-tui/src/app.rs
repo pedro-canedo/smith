@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use smith_core::{
-    Action, AgentEvent, AgentPhase, PermissionDecision, PermissionPolicy, PermissionRequest,
-    ResourceStats, StopReason, Task, Usage, UserQuestion,
+    Action, AgentEvent, AgentPhase, McpCommand, PermissionDecision, PermissionPolicy,
+    PermissionRequest, ResourceStats, StopReason, Task, Usage, UserQuestion,
 };
 
 use crate::components::input::TextInput;
@@ -949,7 +949,7 @@ impl App {
             "help" | "" => {
                 self.lines.push(ChatLine::new(
                     ChatRole::System,
-                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /compact (summarise old history to reclaim context), /remember <note> (append a standing note to this project's SMITH.md), /rewind [<turn>] [confirm] [--force] (undo a turn's file writes — shows the plan first; does NOT undo anything run_bash did), /help (this message)",
+                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /compact (summarise old history to reclaim context), /remember <note> (append a standing note to this project's SMITH.md), /mcp [prompt [<server>] <name> [key=value ...]] (list MCP servers, or run one's prompt template),/rewind [<turn>] [confirm] [--force] (undo a turn's file writes — shows the plan first; does NOT undo anything run_bash did), /help (this message)",
                 ));
                 None
             }
@@ -959,6 +959,7 @@ impl App {
                 self.show_usage();
                 None
             }
+            "mcp" => self.run_mcp_command(args),
             "plan" => self.run_plan_command(args),
             "rewind" => self.run_rewind_command(args),
             "goal" => self.run_goal_command(args),
@@ -998,6 +999,79 @@ impl App {
                 self.lines.push(ChatLine::new(
                     ChatRole::System,
                     format!("unknown command: /{other}"),
+                ));
+                None
+            }
+        }
+    }
+
+    /// `/mcp` — connected servers — and `/mcp prompt [<server>] <name>
+    /// [key=value ...]`, which runs a prompt template one of them supplies.
+    ///
+    /// The subcommand lives here rather than as its own `/`-command because a
+    /// server-supplied prompt is not smith's own command: keeping it behind
+    /// `/mcp` says where it came from every time it is typed, and leaves the
+    /// top-level namespace to the frontend that owns it.
+    fn run_mcp_command(&mut self, args: &str) -> Option<Action> {
+        let mut tokens = args.split_whitespace();
+        match tokens.next() {
+            None => Some(Action::Mcp(McpCommand::Status)),
+            Some("prompt") => {
+                let mut positional: Vec<&str> = Vec::new();
+                let mut arguments: Vec<(String, String)> = Vec::new();
+                for token in tokens {
+                    match token.split_once('=') {
+                        Some((k, v)) => arguments.push((k.to_string(), v.to_string())),
+                        None => positional.push(token),
+                    }
+                }
+                // One bare word is a prompt name; two are a server and a
+                // prompt name. Guessing between them is only ambiguous if a
+                // prompt is named after a server, and then the two-word form
+                // is the way to say which you meant.
+                let (server, name) = match positional.as_slice() {
+                    [name] => (None, name.to_string()),
+                    [server, name] => (Some(server.to_string()), name.to_string()),
+                    _ => {
+                        self.lines.push(ChatLine::new(
+                            ChatRole::System,
+                            "usage: /mcp prompt [<server>] <name> [key=value ...]",
+                        ));
+                        return None;
+                    }
+                };
+                if self.waiting_on_assistant {
+                    self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        "can't run a prompt mid-turn — wait for the current turn to finish",
+                    ));
+                    return None;
+                }
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    match &server {
+                        Some(s) => format!("running MCP prompt `{name}` from `{s}`…"),
+                        None => format!("running MCP prompt `{name}`…"),
+                    },
+                ));
+                self.waiting_on_assistant = true;
+                self.phase = AgentPhase::Thinking;
+                self.in_flight_text = None;
+                self.turn_started_at = Some(Instant::now());
+                self.request_count += 1;
+                Some(Action::Mcp(McpCommand::Prompt {
+                    server,
+                    name,
+                    arguments,
+                }))
+            }
+            Some(other) => {
+                self.lines.push(ChatLine::new(
+                    ChatRole::System,
+                    format!(
+                        "unknown /mcp subcommand: {other} — try /mcp, or \
+                         /mcp prompt [<server>] <name> [key=value ...]"
+                    ),
                 ));
                 None
             }
@@ -1613,6 +1687,14 @@ impl App {
             AgentEvent::ResourceUsage(stats) => {
                 self.resources = Some(stats);
             }
+            AgentEvent::McpStatus(status) => {
+                // Rendered by `McpStatus::lines` rather than here, so the TUI
+                // and `stream-json` cannot describe the same servers
+                // differently. One ChatLine per row, like `/usage`.
+                for line in status.lines() {
+                    self.lines.push(ChatLine::new(ChatRole::System, line));
+                }
+            }
             AgentEvent::PlanGateChanged { gated } => {
                 // The command that triggered this (`/plan <task>` sets it,
                 // `/plan approve`/`/plan reject` clear it) already pushed its
@@ -2020,6 +2102,104 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.text.contains("permission mode: skip")));
+    }
+
+    #[test]
+    fn bare_mcp_asks_the_orchestrator_for_status() {
+        let mut app = test_app();
+        assert!(matches!(
+            app.run_slash_command("mcp"),
+            Some(Action::Mcp(McpCommand::Status))
+        ));
+    }
+
+    #[test]
+    fn the_mcp_status_event_renders_one_transcript_line_per_server() {
+        use smith_core::{McpHealth, McpServerStatus, McpStatus};
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::McpStatus(McpStatus {
+            servers: vec![
+                McpServerStatus {
+                    name: "docs".into(),
+                    transport: "sse".into(),
+                    health: McpHealth::Connected,
+                    tools: 4,
+                    resources: 1,
+                    prompts: 0,
+                    detail: None,
+                },
+                McpServerStatus {
+                    name: "ghost".into(),
+                    transport: "-".into(),
+                    health: McpHealth::Failed,
+                    tools: 0,
+                    resources: 0,
+                    prompts: 0,
+                    detail: Some("not on PATH".into()),
+                },
+            ],
+        }));
+        assert_eq!(app.lines.len(), 2);
+        assert!(app.lines[0].text.contains("docs [sse] connected"));
+        assert!(app.lines[1].text.contains("not on PATH"));
+    }
+
+    /// `/mcp prompt` takes one bare word as a prompt name and two as
+    /// server-then-name, and `key=value` tokens in any position.
+    #[test]
+    fn mcp_prompt_parses_its_optional_server_and_key_value_arguments() {
+        let mut app = test_app();
+        let Some(Action::Mcp(command)) = app.run_slash_command("mcp prompt review path=src/lib.rs")
+        else {
+            panic!("expected an Mcp action");
+        };
+        assert_eq!(
+            command,
+            McpCommand::Prompt {
+                server: None,
+                name: "review".into(),
+                arguments: vec![("path".into(), "src/lib.rs".into())],
+            }
+        );
+        // It runs a turn, so the frontend must be in the waiting state — an
+        // `Error` from the orchestrator is what releases it again.
+        assert!(app.waiting_on_assistant);
+
+        let mut app = test_app();
+        let Some(Action::Mcp(command)) =
+            app.run_slash_command("mcp prompt docs review path=x depth=2")
+        else {
+            panic!("expected an Mcp action");
+        };
+        assert_eq!(
+            command,
+            McpCommand::Prompt {
+                server: Some("docs".into()),
+                name: "review".into(),
+                arguments: vec![("path".into(), "x".into()), ("depth".into(), "2".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn a_malformed_mcp_command_explains_itself_instead_of_acting() {
+        let mut app = test_app();
+        assert!(app.run_slash_command("mcp prompt").is_none());
+        assert!(app
+            .lines
+            .last()
+            .unwrap()
+            .text
+            .contains("usage: /mcp prompt"));
+        assert!(!app.waiting_on_assistant);
+
+        assert!(app.run_slash_command("mcp wat").is_none());
+        assert!(app
+            .lines
+            .last()
+            .unwrap()
+            .text
+            .contains("unknown /mcp subcommand"));
     }
 
     #[test]

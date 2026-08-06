@@ -2738,8 +2738,12 @@ name = "smith-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
  "serde",
  "serde_json",
+ "smith-config",
  "smith-core",
  "thiserror 2.0.19",
  "tokio",
