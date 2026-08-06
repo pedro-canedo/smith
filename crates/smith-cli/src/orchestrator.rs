@@ -369,6 +369,7 @@ impl OrchestratorState {
         // database.
         let session_usage = self.agent.session_usage();
         let session_cost = self.agent.session_cost_usd();
+        let session_unpriced = self.agent.unpriced_turns();
         // Dropping this would silently disable `/rewind` for the rest of the
         // session — the least visible way to lose an undo buffer.
         let checkpointer = self.agent.checkpointer();
@@ -401,7 +402,7 @@ impl OrchestratorState {
         agent.seed_history(history);
         agent.seed_allowed_session_tools(allowed);
         agent.seed_tasks(tasks);
-        agent.seed_session_totals(session_usage, session_cost);
+        agent.seed_session_totals(session_usage, session_cost, session_unpriced);
 
         self.agent = agent;
         self.provider_kind = new_kind;
@@ -689,7 +690,17 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     // resumed session disagree with the one it resumed.
     if let Some(p) = persistence.as_ref() {
         let totals = p.turn_totals();
-        agent.seed_session_totals(totals.usage, totals.cost_usd);
+        agent.seed_session_totals(totals.usage, totals.cost_usd, totals.unpriced_turns);
+        // Announced now rather than at the first turn: a resumed session shows
+        // what it already spent from the moment it opens, which is the half of
+        // acceptance criterion #4 a frontend can get wrong by simply staying
+        // quiet until something new happens.
+        if totals.turns > 0 {
+            let _ = event_tx.send(AgentEvent::SessionCost {
+                usd: totals.cost_usd,
+                unpriced_turns: totals.unpriced_turns,
+            });
+        }
     }
     let state = Arc::new(Mutex::new(OrchestratorState {
         agent,

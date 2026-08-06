@@ -1,10 +1,13 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{format_thought, ActivityStatus, App, ChatLine, ChatRole, IdleHint, Modal};
+use crate::app::{
+    format_thought, ActivityStatus, App, ChatLine, ChatRole, IdleHint, Modal, Overlay, OverlayBody,
+    SidebarTab,
+};
 use crate::components::input::INPUT_MIN_ROWS;
 use crate::components::{chips, diff, panel, wrap};
 use crate::theme::Theme;
@@ -125,7 +128,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let is_idle = app.lines.is_empty() && app.in_flight_text.is_none();
     // The strip is the sidebar's understudy: it exists only when the sidebar
-    // does not, and only when it would actually say something.
+    // does not *fit*, and only when it would actually say something. A sidebar
+    // the user dismissed with `Ctrl+B` deliberately gets no stand-in — they
+    // asked for the rows back, and handing one straight back as a strip is
+    // the opposite of what the key means.
     let strip_wanted = !is_idle
         && frame.area().width < SIDEBAR_MIN_TERMINAL_WIDTH
         && (app.context.is_some() || !strip_extras(app).is_empty());
@@ -154,7 +160,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if is_idle {
         draw_idle(frame, &*app, message_area);
-    } else if message_area.width >= SIDEBAR_MIN_TERMINAL_WIDTH {
+    } else if message_area.width >= SIDEBAR_MIN_TERMINAL_WIDTH && app.sidebar_visible {
         let [chat_area, sidebar_area] =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)])
                 .areas(message_area);
@@ -186,11 +192,138 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_input(frame, app, clamp_width(input_area, MAX_CONTENT_WIDTH));
     draw_status_bar(frame, &*app, footer_area);
 
+    // The overlay yields to a real modal rather than stacking above it: a
+    // permission prompt is a question the agent is blocked on, and hiding it
+    // behind a table nobody asked to keep open is how a turn appears to hang.
     match &mut app.modal {
         Modal::Question(modal) => draw_question_modal(frame, modal, &theme, frame.area()),
         Modal::Plan(modal) => draw_plan_modal(frame, modal, &theme, frame.area()),
         Modal::Permission(modal) => draw_permission_modal(frame, modal, &theme, frame.area()),
-        Modal::None => {}
+        Modal::None => {
+            if let Some(overlay) = app.overlay.as_mut() {
+                draw_overlay(frame, overlay, &theme, frame.area());
+            }
+        }
+    }
+}
+
+/// A read-only panel: `/usage` and `/mcp` as a real `Table`, the `Ctrl+L` log
+/// as plain rows. Scroll is clamped here rather than in `App` because this is
+/// the only place that knows how many rows the panel actually got.
+fn draw_overlay(frame: &mut Frame, overlay: &mut Overlay, theme: &Theme, area: Rect) {
+    let width = (area.width.saturating_mul(9) / 10)
+        .clamp(30, 110)
+        .min(area.width);
+    let footer_rows = overlay.footer.len() as u16;
+    // Borders (2) + the footer and the blank row that separates it.
+    let chrome = 2 + if footer_rows > 0 { footer_rows + 1 } else { 0 };
+    let wanted = (overlay.row_count() as u16).saturating_add(chrome);
+    let height = wanted
+        .min(area.height.saturating_mul(4) / 5)
+        .max(5)
+        .min(area.height);
+
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.block_border_set())
+        .border_style(theme.ember())
+        .title(Span::styled(
+            format!(" {} ", overlay.title),
+            theme.ember_bold(),
+        ))
+        .style(theme.raised_bg());
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let [body_area, gap_area, footer_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(if footer_rows > 0 { 1 } else { 0 }),
+        Constraint::Length(footer_rows),
+    ])
+    .areas(inner);
+    let _ = gap_area;
+
+    // A table spends its first row on the header, which does not scroll.
+    let visible = match &overlay.body {
+        OverlayBody::Table { .. } => body_area.height.saturating_sub(1),
+        OverlayBody::Lines(_) => body_area.height,
+    } as usize;
+    let scrollable = match &overlay.body {
+        OverlayBody::Table { rows, .. } => rows.len(),
+        OverlayBody::Lines(lines) => lines.len(),
+    };
+    let max_scroll = scrollable.saturating_sub(visible) as u16;
+    overlay.scroll = overlay.scroll.min(max_scroll);
+    let offset = overlay.scroll as usize;
+
+    match &overlay.body {
+        OverlayBody::Table {
+            columns,
+            widths,
+            rows,
+        } => {
+            let header = Row::new(
+                columns
+                    .iter()
+                    .map(|c| Span::styled(c.clone(), theme.info_bold()))
+                    .collect::<Vec<_>>(),
+            );
+            let body: Vec<Row> = rows
+                .iter()
+                .skip(offset)
+                .take(visible.max(1))
+                .map(|r| {
+                    Row::new(
+                        r.iter()
+                            .map(|c| Span::styled(c.clone(), theme.text()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            let constraints: Vec<Constraint> =
+                widths.iter().map(|w| Constraint::Percentage(*w)).collect();
+            frame.render_widget(
+                Table::new(body, constraints)
+                    .header(header)
+                    .column_spacing(1),
+                body_area,
+            );
+        }
+        OverlayBody::Lines(lines) => {
+            let shown: Vec<Line<'static>> = lines
+                .iter()
+                .skip(offset)
+                .take(visible.max(1))
+                .map(|l| Line::from(Span::styled(l.clone(), theme.text())))
+                .collect();
+            frame.render_widget(Paragraph::new(shown), body_area);
+        }
+    }
+
+    if footer_rows > 0 {
+        let mut footer: Vec<Line<'static>> = overlay
+            .footer
+            .iter()
+            .map(|f| Line::from(Span::styled(f.clone(), theme.disabled())))
+            .collect();
+        // Only claimed when there is something below to reach: a scroll hint
+        // on a panel that fits is noise.
+        if max_scroll > 0 {
+            if let Some(first) = footer.first_mut() {
+                first
+                    .spans
+                    .push(Span::styled("  (scrollable)", theme.warning()));
+            }
+        }
+        frame.render_widget(Paragraph::new(footer), footer_area);
     }
 }
 
@@ -307,10 +440,8 @@ fn strip_extras(app: &App) -> String {
     // it that changes a decision (is the local model thrashing or thinking).
     if let Some(stats) = &app.resources {
         parts.push(format!("CPU {:.0}%", stats.cpu_percent));
-    } else if let Some(cost) =
-        crate::pricing::estimate_cost_usd(&app.provider_label, &app.model_label, &app.usage)
-    {
-        parts.push(format!("~${cost:.4}"));
+    } else if let Some((usd, _)) = app.session_cost {
+        parts.push(format!("~${usd:.4}"));
     }
     parts.join(sep)
 }
@@ -896,7 +1027,8 @@ fn fit_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// The sidebar, split around the one widget in it that isn't a `Line`.
+/// The sidebar: a tab strip, then the active tab's content, split around the
+/// one widget in it that isn't a `Line`.
 ///
 /// `above` ends with the `CONTEXT` header, the gauge goes in the row after it,
 /// and `below` is everything else. Both halves go through `fit_lines` instead
@@ -913,17 +1045,21 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
     let width = inner.width as usize;
 
+    let [tabs_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(sidebar_tabs(app, tabs_area.width), tabs_area);
+
     let (above, below) = sidebar_lines(app);
     let above = fit_lines(above, width);
     let below = fit_lines(below, width);
 
-    let gauge_rows = u16::from(app.context.is_some());
+    let gauge_rows = u16::from(app.context.is_some() && app.sidebar_tab == SidebarTab::Session);
     let [above_area, gauge_area, below_area] = Layout::vertical([
         Constraint::Length(above.len() as u16),
         Constraint::Length(gauge_rows),
         Constraint::Min(0),
     ])
-    .areas(inner);
+    .areas(body_area);
 
     frame.render_widget(Paragraph::new(above), above_area);
     if let Some((used, window, estimated)) = app.context {
@@ -937,29 +1073,77 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(below), below_area);
 }
 
-/// Sidebar content, split at the row the context gauge occupies.
-fn sidebar_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+/// The tab strip. Titles are abbreviated to their first four characters when
+/// the pane is too narrow for the full set — a clipped `Tabs` drops the last
+/// title entirely, which would make a tab the user can select but not see.
+fn sidebar_tabs(app: &App, width: u16) -> Tabs<'static> {
     let theme = &app.theme;
-    let head = |s: &str| {
-        Line::from(Span::styled(
-            s.to_string(),
-            theme.secondary().add_modifier(Modifier::BOLD),
-        ))
-    };
+    // `theme.separator()` is ` · ` — already padded, and with ratatui's own
+    // space on each side it costs five columns per divider. Three tabs would
+    // then need 28 in a pane that has 27, and every title would be clipped to
+    // four characters for the sake of two spaces. The bare rule glyph costs
+    // three, which is what makes the full titles fit.
+    let divider = theme.border_vertical();
+    let divider_cost = divider.chars().count() + 2;
+    let full: usize = SidebarTab::ALL
+        .iter()
+        .map(|t| t.title().chars().count())
+        .sum::<usize>()
+        + divider_cost * (SidebarTab::ALL.len() - 1);
+    let short = full > width as usize;
+
+    let titles: Vec<String> = SidebarTab::ALL
+        .iter()
+        .map(|t| {
+            if short {
+                t.title().chars().take(4).collect()
+            } else {
+                t.title().to_string()
+            }
+        })
+        .collect();
+
+    Tabs::new(titles)
+        .select(app.sidebar_tab.index())
+        .style(theme.disabled())
+        .highlight_style(theme.ember_bold())
+        .divider(divider)
+        // ratatui pads every title with a space on each side by default, which
+        // is six more columns than a 27-column pane can spare.
+        .padding("", "")
+}
+
+/// Sidebar content for the active tab, split at the row the context gauge
+/// occupies. Only the `Session` tab has a gauge, so for the other two the
+/// first half is empty and everything lands in the second.
+fn sidebar_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    match app.sidebar_tab {
+        SidebarTab::Session => session_tab_lines(app),
+        SidebarTab::Tasks => (Vec::new(), tasks_tab_lines(app)),
+        SidebarTab::Vitals => (Vec::new(), vitals_tab_lines(app)),
+    }
+}
+
+fn sidebar_head(theme: &Theme, s: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        s.to_string(),
+        theme.secondary().add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn session_tab_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let theme = &app.theme;
     let total_tokens = app.usage.input_tokens + app.usage.output_tokens;
 
-    let mut lines = vec![
-        head("SESSION"),
-        Line::from(Span::styled(
-            format!(
-                "{}{}{}",
-                app.provider_label,
-                theme.separator(),
-                app.model_label
-            ),
-            theme.text(),
-        )),
-    ];
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "{}{}{}",
+            app.provider_label,
+            theme.separator(),
+            app.model_label
+        ),
+        theme.text(),
+    ))];
 
     if app.in_plan_mode() {
         lines.push(Line::from(Span::styled("PLAN MODE", theme.plan_bold())));
@@ -979,11 +1163,14 @@ fn sidebar_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
         )));
     }
 
+    // A count, not the checklist: the list itself has its own tab now, and a
+    // long one used to be what pushed `CONTEXT` off the bottom of the pane.
     if !app.tasks.is_empty() {
-        lines.extend(task_lines(&app.tasks, theme));
+        lines.push(Line::from(""));
+        lines.push(task_summary_line(&app.tasks, theme));
     }
 
-    lines.extend([Line::from(""), head("CONTEXT")]);
+    lines.extend([Line::from(""), sidebar_head(theme, "CONTEXT")]);
 
     // --- the gauge's row goes here ---
 
@@ -1015,20 +1202,54 @@ fn sidebar_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
         )));
     }
 
-    below.push(Line::from(""));
+    (lines, below)
+}
+
+fn tasks_tab_lines(app: &App) -> Vec<Line<'static>> {
+    let theme = &app.theme;
+    if app.tasks.is_empty() {
+        return vec![Line::from(Span::styled("no tasks yet", theme.disabled()))];
+    }
+    task_lines(&app.tasks, theme)
+}
+
+fn vitals_tab_lines(app: &App) -> Vec<Line<'static>> {
+    let theme = &app.theme;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
     if let Some(stats) = &app.resources {
-        below.extend(resource_lines(stats, theme));
-    } else if let Some(cost) =
-        crate::pricing::estimate_cost_usd(&app.provider_label, &app.model_label, &app.usage)
-    {
-        below.push(head("COST"));
-        below.push(Line::from(Span::styled(
-            format!("~${cost:.4} (est.)"),
-            theme.text(),
-        )));
+        lines.extend(resource_lines(stats, theme));
+        lines.push(Line::from(""));
     }
 
-    (lines, below)
+    lines.push(sidebar_head(theme, "COST"));
+    match app.session_cost {
+        Some((usd, unpriced)) => {
+            lines.push(Line::from(Span::styled(
+                format!("~${usd:.4} (est.)"),
+                theme.text(),
+            )));
+            // "$0.00" and "we have no price for this model" are different
+            // claims, and only one of them is about money.
+            if unpriced > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("+{unpriced} turns unpriced"),
+                    theme.warning(),
+                )));
+            }
+        }
+        None => lines.push(Line::from(Span::styled("n/a", theme.disabled()))),
+    }
+    lines.push(Line::from(Span::styled(
+        format!("{} requests", app.request_count),
+        theme.secondary(),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("{} tool calls", app.tool_call_count),
+        theme.secondary(),
+    )));
+
+    lines
 }
 
 /// Checklist section for the sidebar: a "3/8" count, a filled/unfilled
@@ -1038,7 +1259,9 @@ fn sidebar_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
 fn task_lines(tasks: &[smith_core::Task], theme: &Theme) -> Vec<Line<'static>> {
     use smith_core::TaskStatus;
 
-    const MAX_SHOWN: usize = 6;
+    // The checklist owns a whole tab now, so it can show far more than the
+    // six rows it got when every section shared one column.
+    const MAX_SHOWN: usize = 20;
     const BAR_WIDTH: usize = 20;
 
     let total = tasks.len();
@@ -1047,13 +1270,7 @@ fn task_lines(tasks: &[smith_core::Task], theme: &Theme) -> Vec<Line<'static>> {
         .filter(|t| t.status == TaskStatus::Completed)
         .count();
 
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("TASKS", theme.secondary().add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {done}/{total}"), theme.disabled()),
-        ]),
-    ];
+    let mut lines = vec![task_summary_line(tasks, theme)];
 
     // Progress bar — filled segment ember, unfilled disabled.
     if let Some(bar) = progress_bar_line(done, total, BAR_WIDTH, theme) {
@@ -1089,6 +1306,19 @@ fn task_lines(tasks: &[smith_core::Task], theme: &Theme) -> Vec<Line<'static>> {
         ]));
     }
     lines
+}
+
+/// `TASKS 3/8` — the checklist compressed to the one row the `Session` tab
+/// can spare, and the header row of the `Tasks` tab.
+fn task_summary_line(tasks: &[smith_core::Task], theme: &Theme) -> Line<'static> {
+    let done = tasks
+        .iter()
+        .filter(|t| t.status == smith_core::TaskStatus::Completed)
+        .count();
+    Line::from(vec![
+        Span::styled("TASKS", theme.secondary().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {done}/{}", tasks.len()), theme.disabled()),
+    ])
 }
 
 /// Filled/unfilled progress bar for the task checklist; `None` when there
@@ -1965,6 +2195,7 @@ mod tests {
             goal: None,
             tasks: Vec::new(),
             commands: crate::slash::SlashRegistry::builtin(),
+            logs: crate::logbuf::LogBuffer::default(),
         })
     }
 
@@ -2799,5 +3030,130 @@ mod tests {
             .push(ChatLine::new(ChatRole::Assistant, "mais uma resposta"));
         buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
         assert!(app.scroll > bottom);
+    }
+
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn rendered(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_sidebar_shows_its_tab_strip_and_switching_changes_what_is_under_it() {
+        let mut app = app_with_context(100);
+        let session = rendered(&mut app, 100, 30);
+        assert!(session.contains("Session"), "no tab strip: {session}");
+        assert!(
+            session.contains("CONTEXT"),
+            "the Session tab lost its gauge header: {session}"
+        );
+
+        app.sidebar_tab = crate::app::SidebarTab::Vitals;
+        let vitals = rendered(&mut app, 100, 30);
+        assert!(vitals.contains("COST"), "no cost section: {vitals}");
+        assert!(
+            !vitals.contains("CONTEXT"),
+            "the Session tab's content leaked into Vitals: {vitals}"
+        );
+    }
+
+    /// `Ctrl+B` is worth a key only if it actually hands the columns back.
+    #[test]
+    fn hiding_the_sidebar_gives_its_columns_to_the_transcript() {
+        let mut app = app_with_context(100);
+        assert!(rendered(&mut app, 100, 30).contains("Session"));
+        app.sidebar_visible = false;
+        let hidden = rendered(&mut app, 100, 30);
+        assert!(!hidden.contains("Session"), "sidebar still drawn: {hidden}");
+        assert!(
+            !hidden.contains("CONTEXT"),
+            "and no strip stood in for it: {hidden}"
+        );
+    }
+
+    #[test]
+    fn an_overlay_table_draws_its_header_and_rows_inside_a_titled_box() {
+        let mut app = app_with_context(100);
+        app.request_count = 7;
+        app.on_agent_event(smith_core::AgentEvent::SessionCost {
+            usd: 1.5,
+            unpriced_turns: 0,
+        });
+        app.run_slash_command("usage");
+
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("session usage"), "no panel title: {text}");
+        assert!(text.contains("metric"), "no column header: {text}");
+        assert!(text.contains("requests"), "no metric row: {text}");
+        assert!(text.contains("~$1.5000"), "cost not shown: {text}");
+    }
+
+    /// A permission prompt is a question the turn is blocked on; a panel the
+    /// user left open must not cover it.
+    #[test]
+    fn a_modal_takes_the_screen_back_from_an_open_overlay() {
+        let mut app = app_with_context(100);
+        app.run_slash_command("usage");
+        app.on_agent_event(smith_core::AgentEvent::PermissionPromptNeeded(
+            smith_core::PermissionRequest {
+                tool_call_id: "1".into(),
+                tool_name: "run_bash".into(),
+                detail: "rm -rf /tmp/x".into(),
+            },
+        ));
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("rm -rf /tmp/x"), "modal not drawn: {text}");
+        assert!(
+            !text.contains("session usage"),
+            "the overlay covered the prompt: {text}"
+        );
+    }
+
+    #[test]
+    fn the_log_panel_is_reachable_and_renders_what_was_logged() {
+        let mut app = app_with_context(100);
+        app.logs.push(crate::logbuf::LogLine {
+            level: crate::logbuf::LogLevel::Warn,
+            target: "smith_mcp::transport".into(),
+            message: "unparseable frame".into(),
+        });
+        app.on_key(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let text = rendered(&mut app, 100, 30);
+        assert!(text.contains("diagnostics"), "no panel: {text}");
+        assert!(text.contains("unparseable frame"), "no log line: {text}");
+    }
+
+    /// The 80x24 contract from `docs/design-system.md` §3 covers the panels
+    /// too: a table that overflows its box is worse than no table.
+    #[test]
+    fn an_overlay_stays_inside_the_frame_at_80x24() {
+        let mut app = app_with_context(80);
+        app.theme = Theme::ansi().ascii_glyphs();
+        app.run_slash_command("usage");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        // `TestBackend` panics on an out-of-bounds write, so reaching here is
+        // most of the assertion; the rest is that the panel is actually there.
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("session usage"), "{text}");
+        assert!(text.is_ascii(), "non-ASCII glyph under an ASCII theme");
     }
 }

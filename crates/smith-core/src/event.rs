@@ -216,6 +216,22 @@ pub enum AgentEvent {
     /// Coarse status for the activity line / chrome.
     PhaseChanged(AgentPhase),
     TokenUsage(Usage),
+    /// Money spent by this session so far, in USD.
+    ///
+    /// Emitted rather than left to the frontend to compute, and that is the
+    /// whole point: on `--resume` this figure is seeded from the `turns`
+    /// table, where each row carries the cost recorded *when that turn ran*.
+    /// A frontend with its own pricing table would recompute it from today's
+    /// prices and report a number the session never showed — which is exactly
+    /// what acceptance criterion #4 forbids.
+    ///
+    /// `unpriced_turns` is the honest gap: rounds billed against a model with
+    /// no known price. A frontend can then say "$4.20 + 3 turns of unknown
+    /// cost" instead of implying $4.20 is all of it.
+    SessionCost {
+        usd: f64,
+        unpriced_turns: u32,
+    },
     /// How full the model's context window is, recomputed after every provider
     /// round and after a compaction.
     ///

@@ -395,6 +395,10 @@ pub struct Agent {
     /// restored from a resumed one via `seed_session_totals`.
     session_usage: Usage,
     session_cost_usd: f64,
+    /// Rounds billed against a model with no price in the table. Reported
+    /// beside the total so "$0.00" and "we have no idea" stay distinguishable
+    /// — the former is a claim about money, the latter about our own data.
+    unpriced_turns: u32,
     /// Accounting for the turn currently running (or the last one that did).
     last_turn: Option<TurnAccounting>,
     /// Snapshots files before a mutating tool overwrites them, so `/rewind`
@@ -485,6 +489,7 @@ impl Agent {
             counted_messages: 0,
             session_usage: Usage::default(),
             session_cost_usd: 0.0,
+            unpriced_turns: 0,
             last_turn: None,
             checkpointer: None,
             turn_seq: None,
@@ -655,12 +660,18 @@ impl Agent {
         self.session_cost_usd
     }
 
+    /// Turns billed against a model this build has no price for.
+    pub fn unpriced_turns(&self) -> u32 {
+        self.unpriced_turns
+    }
+
     /// Restores the running totals for a resumed session, from the numbers the
     /// session store recorded when those turns actually ran. Also used by a
     /// `/model` switch, which rebuilds the whole `Agent`.
-    pub fn seed_session_totals(&mut self, usage: Usage, cost_usd: f64) {
+    pub fn seed_session_totals(&mut self, usage: Usage, cost_usd: f64, unpriced_turns: u32) {
         self.session_usage = usage;
         self.session_cost_usd = cost_usd;
+        self.unpriced_turns = unpriced_turns;
     }
 
     /// How full the context window is for the *next* request.
@@ -746,8 +757,9 @@ impl Agent {
 
         let provider = self.provider.id().to_string();
         let cost = crate::pricing::cost_usd(&provider, &self.model, &usage);
-        if let Some(cost) = cost {
-            self.session_cost_usd += cost;
+        match cost {
+            Some(cost) => self.session_cost_usd += cost,
+            None => self.unpriced_turns = self.unpriced_turns.saturating_add(1),
         }
 
         // One `TurnAccounting` spans every round of a turn: the model cannot
@@ -1142,6 +1154,10 @@ impl Agent {
             // After the push, so `counted_messages` marks the exact point up
             // to which the provider's own token count is authoritative.
             self.note_usage(usage);
+            let _ = events.send(AgentEvent::SessionCost {
+                usd: self.session_cost_usd,
+                unpriced_turns: self.unpriced_turns,
+            });
             self.emit_context(&events);
             let _ = events.send(AgentEvent::AssistantTurnComplete {
                 message: assistant_message.clone(),
@@ -6195,6 +6211,7 @@ mod tests {
                 ..Usage::default()
             },
             41.5,
+            0,
         );
 
         run_collect(&mut agent, "hi", CancellationToken::new()).await;

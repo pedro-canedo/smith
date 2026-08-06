@@ -1,5 +1,6 @@
 mod doctor;
 mod headless;
+mod logging;
 mod orchestrator;
 mod prompts;
 mod resources;
@@ -183,6 +184,11 @@ enum SetupResource {
 #[tokio::main]
 async fn main() -> ExitCode {
     restore_default_sigpipe();
+    // First, so the crates below can be diagnosed while they start up. The
+    // file sink goes under `~/.smith/logs/` rather than the project's
+    // `.smith/`: a provider timeout or a broken MCP command is a property of
+    // this machine's setup, not of the repository you happened to run in.
+    let logs = logging::install(smith_config::config_dir().ok().map(|d| d.join("logs")));
     let mut cli = Cli::parse();
     let command = cli.command.take();
 
@@ -251,7 +257,7 @@ async fn main() -> ExitCode {
     if headless {
         ExitCode::from(run_headless(cli).await)
     } else {
-        run_tui(cli).await
+        run_tui(cli, logs).await
     }
 }
 
@@ -576,7 +582,7 @@ fn channels() -> (
     )
 }
 
-async fn run_tui(cli: Cli) -> ExitCode {
+async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
     if let Err(e) = color_eyre::install() {
         eprintln!("smith: {e}");
         return ExitCode::from(EXIT_TURN_FAILED);
@@ -627,6 +633,7 @@ async fn run_tui(cli: Cli) -> ExitCode {
         goal: startup.initial_goal.clone(),
         tasks: last_write_tasks_call(&startup.initial_messages),
         commands: smith_tui::slash::SlashRegistry::new(commands),
+        logs,
     };
 
     let (action_tx, chans, event_rx, permission_rx, question_rx) = channels();

@@ -3,8 +3,8 @@
 pub mod app;
 pub mod banner;
 pub mod components;
+pub mod logbuf;
 pub mod markdown;
-pub mod pricing;
 pub mod slash;
 pub mod terminal;
 pub mod theme;
@@ -19,6 +19,7 @@ use smith_core::{Action, AgentEvent, PermissionAsk, QuestionAsk};
 use tokio::sync::{mpsc, oneshot};
 
 pub use app::{App, ChatLine, ChatRole, IdleHint, TuiConfig};
+pub use logbuf::{LogBuffer, LogLevel, LogLine};
 pub use theme::Theme;
 
 const SPINNER_INTERVAL: Duration = Duration::from_millis(app::SPINNER_INTERVAL_MS as u64);

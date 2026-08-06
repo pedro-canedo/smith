@@ -7,6 +7,7 @@ use smith_core::{
 };
 
 use crate::components::input::TextInput;
+use crate::logbuf::LogBuffer;
 use crate::slash::SlashRegistry;
 use crate::theme::Theme;
 use crate::transcript::TranscriptCache;
@@ -462,6 +463,128 @@ pub struct TuiConfig {
     /// Custom slash commands discovered under `.smith/commands/` and
     /// `~/.smith/commands/`. Empty for a frontend that does not load them.
     pub commands: SlashRegistry,
+    /// Shared ring the `tracing` subscriber writes into; `Ctrl+L` reads it.
+    /// Default-constructed for a frontend that installs no subscriber, in
+    /// which case the panel simply reports that it is empty.
+    pub logs: LogBuffer,
+}
+
+/// Title of the `Ctrl+L` panel. A constant because the key toggles on it:
+/// pressing `Ctrl+L` with `/usage` open should replace it, not close it.
+pub const LOG_PANEL_TITLE: &str = "diagnostics";
+
+/// One table row from string-ish cells.
+fn row<const N: usize>(cells: [&str; N]) -> Vec<String> {
+    cells.iter().map(|c| c.to_string()).collect()
+}
+
+/// A read-only panel over the transcript: `/usage`, `/mcp`, the `Ctrl+L` log.
+///
+/// **Deliberately not a `Modal` variant.** `Modal` is a sum type precisely
+/// because each of its variants owns a `oneshot` the agent loop is blocked on;
+/// making this a fourth variant would mean `/usage` could replace a pending
+/// permission prompt and strand the turn forever. An overlay owns nothing and
+/// answers nobody, so it lives in its own field and yields to any real modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overlay {
+    pub title: String,
+    pub body: OverlayBody,
+    /// Footer rows, rendered under the body and never scrolled off — the key
+    /// hints belong to the panel, not to its contents.
+    pub footer: Vec<String>,
+    pub scroll: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayBody {
+    /// Column headers and rows. Widths are percentages of the inner width and
+    /// are expected to sum to 100.
+    Table {
+        columns: Vec<String>,
+        widths: Vec<u16>,
+        rows: Vec<Vec<String>>,
+    },
+    /// Pre-formatted lines, for content that isn't a grid.
+    Lines(Vec<String>),
+}
+
+impl Overlay {
+    pub fn table(
+        title: impl Into<String>,
+        columns: &[&str],
+        widths: &[u16],
+        rows: Vec<Vec<String>>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            body: OverlayBody::Table {
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+                widths: widths.to_vec(),
+                rows,
+            },
+            footer: Vec::new(),
+            scroll: 0,
+        }
+    }
+
+    pub fn lines(title: impl Into<String>, lines: Vec<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: OverlayBody::Lines(lines),
+            footer: Vec::new(),
+            scroll: 0,
+        }
+    }
+
+    pub fn with_footer(mut self, footer: Vec<String>) -> Self {
+        self.footer = footer;
+        self
+    }
+
+    /// Rows the body wants, so the panel can size itself and clamp scrolling.
+    pub fn row_count(&self) -> usize {
+        match &self.body {
+            // +1 for the header row.
+            OverlayBody::Table { rows, .. } => rows.len() + 1,
+            OverlayBody::Lines(lines) => lines.len(),
+        }
+    }
+}
+
+/// Which section of the sidebar is on screen.
+///
+/// The sidebar used to stack every section at once, which is what made it the
+/// first thing to overflow at 80x24: `SESSION`, the task checklist, `CONTEXT`
+/// and the vitals together want more rows than a 24-row terminal has left
+/// after the prompt and the status bar. Tabs trade "see everything, truncated"
+/// for "see one thing, whole" — the right trade for a pane 28 columns wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarTab {
+    #[default]
+    Session,
+    Tasks,
+    Vitals,
+}
+
+impl SidebarTab {
+    /// Tab order, which is also the `Tabs` widget's index order.
+    pub const ALL: [SidebarTab; 3] = [SidebarTab::Session, SidebarTab::Tasks, SidebarTab::Vitals];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            SidebarTab::Session => "Session",
+            SidebarTab::Tasks => "Tasks",
+            SidebarTab::Vitals => "Vitals",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
+    fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
 }
 
 pub struct App {
@@ -510,6 +633,27 @@ pub struct App {
     /// Latest local-machine resource snapshot (Ollama only; `None` for
     /// token-billed providers, which show a cost estimate instead).
     pub resources: Option<ResourceStats>,
+    /// The read-only panel on screen, if any — see `Overlay`. Yields to a
+    /// real `Modal`, which is why both can be set without ambiguity.
+    pub overlay: Option<Overlay>,
+    /// Diagnostics from the whole workspace, shown by `Ctrl+L`. Shared with
+    /// the `tracing` subscriber `smith-cli` installs.
+    pub logs: LogBuffer,
+    /// Money spent this session, as the agent reports it: `(usd, unpriced
+    /// turns)`. `None` until the first `SessionCost` event.
+    ///
+    /// **Never computed here.** The TUI used to carry its own price table and
+    /// multiply it by the running token count, which meant a resumed session
+    /// displayed today's prices applied to last month's tokens. The agent
+    /// sums the cost recorded at the time of each turn, seeded on `--resume`
+    /// from the `turns` table; this field just holds what it says.
+    pub session_cost: Option<(f64, u32)>,
+    /// Whether the sidebar is on screen. `Ctrl+B` toggles it; hiding it hands
+    /// its 28 columns back to the transcript, which is what you want while
+    /// reading a wide diff.
+    pub sidebar_visible: bool,
+    /// Section of the sidebar currently shown — cycled with `Shift+Tab`.
+    pub sidebar_tab: SidebarTab,
     pub permission_policy: PermissionPolicy,
     /// User messages submitted this session — for `/usage`.
     pub request_count: u32,
@@ -579,6 +723,11 @@ impl App {
             usage: Usage::default(),
             context: None,
             resources: None,
+            overlay: None,
+            logs: config.logs,
+            session_cost: None,
+            sidebar_visible: true,
+            sidebar_tab: SidebarTab::default(),
             permission_policy: config.permission_policy,
             request_count: 0,
             tool_call_count: 0,
@@ -995,8 +1144,66 @@ impl App {
             };
         }
 
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('l') {
+            self.toggle_log_panel();
+            return None;
+        }
+
+        // The overlay is a pager, not a prompt: it claims the navigation keys
+        // and `Esc`, and *anything else* dismisses it and is then handled
+        // normally. A panel that swallowed the first keystroke of the next
+        // message would be a panel you have to remember to close.
+        if self.overlay.is_some() {
+            match code {
+                KeyCode::Esc => {
+                    self.overlay = None;
+                    return None;
+                }
+                KeyCode::Up => {
+                    self.scroll_overlay(-1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.scroll_overlay(1);
+                    return None;
+                }
+                KeyCode::PageUp => {
+                    self.scroll_overlay(-10);
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    self.scroll_overlay(10);
+                    return None;
+                }
+                KeyCode::Home => {
+                    if let Some(o) = self.overlay.as_mut() {
+                        o.scroll = 0;
+                    }
+                    return None;
+                }
+                _ => self.overlay = None,
+            }
+        }
+
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('o') {
             self.toggle_card_focus();
+            return None;
+        }
+
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('b') {
+            self.sidebar_visible = !self.sidebar_visible;
+            return None;
+        }
+
+        // `Shift+Tab` arrives as its own key code, so it never competes with
+        // the `Tab` that accepts a slash completion. Cycling a hidden sidebar
+        // would be a keystroke with no visible effect, so it reveals it first.
+        if code == KeyCode::BackTab {
+            if self.sidebar_visible {
+                self.sidebar_tab = self.sidebar_tab.next();
+            } else {
+                self.sidebar_visible = true;
+            }
             return None;
         }
 
@@ -1165,7 +1372,7 @@ impl App {
     /// Built-ins are matched first and custom commands only reach the fallback
     /// arm, so a file in a cloned repository cannot change what `/clear` does
     /// however the registry was built. See `crate::slash`.
-    fn run_slash_command(&mut self, command: &str) -> Option<Action> {
+    pub(crate) fn run_slash_command(&mut self, command: &str) -> Option<Action> {
         let mut parts = command.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("");
         let args = parts.next().unwrap_or("").trim();
@@ -1548,42 +1755,89 @@ impl App {
         ));
     }
 
+    /// `/usage` — the session's accounting, as a table.
+    ///
+    /// The cost row is whatever the agent last reported and is never derived
+    /// from `self.usage`: those tokens are a running total across the whole
+    /// session, while the cost is a sum of per-turn figures priced when each
+    /// turn ran. Multiplying today's price by the lifetime token count is the
+    /// bug acceptance criterion #4 exists to catch.
     fn show_usage(&mut self) {
         let total_tokens = self.usage.input_tokens + self.usage.output_tokens;
-        self.lines.push(ChatLine::new(
-            ChatRole::System,
-            format!(
-                "requests: {}   tools invoked: {}",
-                self.request_count, self.tool_call_count
-            ),
-        ));
-        self.lines.push(ChatLine::new(
-            ChatRole::System,
-            format!(
-                "tokens: {} in / {} out ({total_tokens} total)",
-                self.usage.input_tokens, self.usage.output_tokens
-            ),
-        ));
-        match crate::pricing::estimate_cost_usd(
-            &self.provider_label,
-            &self.model_label,
-            &self.usage,
-        ) {
-            Some(cost) => {
-                self.lines.push(ChatLine::new(
-                    ChatRole::System,
-                    format!("estimated cost: ~${cost:.4} (est.)"),
-                ));
-            }
-            None => {
-                self.lines.push(ChatLine::new(
-                    ChatRole::System,
-                    format!(
-                        "estimated cost: n/a (no pricing data for {}/{})",
-                        self.provider_label, self.model_label
-                    ),
-                ));
-            }
+        let cost = match self.session_cost {
+            Some((usd, _)) => format!("~${usd:.4}"),
+            None => "n/a".to_string(),
+        };
+
+        let mut rows = vec![
+            row(["requests", &self.request_count.to_string()]),
+            row(["tool calls", &self.tool_call_count.to_string()]),
+            row(["input tokens", &self.usage.input_tokens.to_string()]),
+            row(["output tokens", &self.usage.output_tokens.to_string()]),
+            row(["total tokens", &total_tokens.to_string()]),
+            row(["cost (est.)", &cost]),
+        ];
+        if self.usage.cache_read > 0 || self.usage.cache_write > 0 {
+            rows.insert(4, row(["cache read", &self.usage.cache_read.to_string()]));
+            rows.insert(5, row(["cache write", &self.usage.cache_write.to_string()]));
+        }
+
+        let mut footer = vec![format!("{}/{}", self.provider_label, self.model_label)];
+        match self.session_cost {
+            Some((_, unpriced)) if unpriced > 0 => footer.push(format!(
+                "{unpriced} turn(s) ran on a model with no known price and are not in the total"
+            )),
+            None => footer.push(format!(
+                "no pricing data for {}/{}",
+                self.provider_label, self.model_label
+            )),
+            _ => {}
+        }
+
+        self.overlay = Some(
+            Overlay::table("session usage", &["metric", "value"], &[60, 40], rows)
+                .with_footer(footer),
+        );
+    }
+
+    /// `Ctrl+L` — open the diagnostics panel, or close it if it is already up.
+    fn toggle_log_panel(&mut self) {
+        if self
+            .overlay
+            .as_ref()
+            .is_some_and(|o| o.title == LOG_PANEL_TITLE)
+        {
+            self.overlay = None;
+            return;
+        }
+
+        let lines: Vec<String> = self
+            .logs
+            .snapshot()
+            .into_iter()
+            .map(|l| format!("{:<5} {} — {}", l.level.label(), l.target, l.message))
+            .collect();
+        let empty = lines.is_empty();
+        let body = if empty {
+            vec!["nothing logged yet".to_string()]
+        } else {
+            lines
+        };
+        // Opened at the bottom: the interesting line in a log is the last one.
+        let mut overlay = Overlay::lines(LOG_PANEL_TITLE, body).with_footer(vec![
+            "Esc closes  ·  up/down and PgUp/PgDn scroll".to_string(),
+        ]);
+        overlay.scroll = u16::MAX;
+        self.overlay = Some(overlay);
+    }
+
+    /// Move the overlay by `delta` rows. Clamping to the *end* is left to the
+    /// renderer, which is the only place that knows the panel's height; here
+    /// we only keep it off the top.
+    fn scroll_overlay(&mut self, delta: i32) {
+        if let Some(o) = self.overlay.as_mut() {
+            let next = (o.scroll as i32).saturating_add(delta).max(0);
+            o.scroll = next.min(u16::MAX as i32) as u16;
         }
     }
 
@@ -1984,15 +2238,48 @@ impl App {
                 // Adding one to the other would be meaningless.
                 self.context = Some((used, window, estimated));
             }
+            AgentEvent::SessionCost {
+                usd,
+                unpriced_turns,
+            } => {
+                self.session_cost = Some((usd, unpriced_turns));
+            }
             AgentEvent::ResourceUsage(stats) => {
                 self.resources = Some(stats);
             }
             AgentEvent::McpStatus(status) => {
-                // Rendered by `McpStatus::lines` rather than here, so the TUI
-                // and `stream-json` cannot describe the same servers
-                // differently. One ChatLine per row, like `/usage`.
-                for line in status.lines() {
-                    self.lines.push(ChatLine::new(ChatRole::System, line));
+                if status.servers.is_empty() {
+                    // A panel whose only row says "nothing here" is worse than
+                    // a line saying the same thing — `McpStatus::lines` already
+                    // phrases it as the actionable hint it should be.
+                    for line in status.lines() {
+                        self.lines.push(ChatLine::new(ChatRole::System, line));
+                    }
+                } else {
+                    let rows: Vec<Vec<String>> = status
+                        .servers
+                        .iter()
+                        .map(|s| {
+                            vec![
+                                s.name.clone(),
+                                s.transport.to_string(),
+                                s.health.as_str().to_string(),
+                                format!("{}/{}/{}", s.tools, s.resources, s.prompts),
+                                s.detail.clone().unwrap_or_default(),
+                            ]
+                        })
+                        .collect();
+                    self.overlay = Some(
+                        Overlay::table(
+                            "MCP servers",
+                            &["server", "transport", "health", "t/r/p", "detail"],
+                            &[24, 14, 12, 12, 38],
+                            rows,
+                        )
+                        .with_footer(vec![
+                            "t/r/p = tools / resources / prompts  ·  Esc closes".to_string(),
+                        ]),
+                    );
                 }
             }
             AgentEvent::PlanGateChanged { gated } => {
@@ -2286,6 +2573,7 @@ mod tests {
             goal: None,
             tasks: Vec::new(),
             commands,
+            logs: LogBuffer::default(),
         })
     }
 
@@ -2598,7 +2886,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mcp_status_event_renders_one_transcript_line_per_server() {
+    fn the_mcp_status_event_opens_a_table_with_one_row_per_server() {
         use smith_core::{McpHealth, McpServerStatus, McpStatus};
         let mut app = test_app();
         app.on_agent_event(AgentEvent::McpStatus(McpStatus {
@@ -2623,9 +2911,32 @@ mod tests {
                 },
             ],
         }));
-        assert_eq!(app.lines.len(), 2);
-        assert!(app.lines[0].text.contains("docs [sse] connected"));
-        assert!(app.lines[1].text.contains("not on PATH"));
+        // The transcript stays clean — the report is a panel, not history.
+        assert!(app.lines.is_empty(), "{:?}", app.lines);
+        let overlay = app.overlay.as_ref().expect("an overlay should be open");
+        let OverlayBody::Table { rows, columns, .. } = &overlay.body else {
+            panic!("expected a table, got {:?}", overlay.body);
+        };
+        assert_eq!(columns.len(), 5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "docs");
+        assert_eq!(rows[0][2], "connected");
+        assert_eq!(rows[0][3], "4/1/0");
+        assert_eq!(rows[1][4], "not on PATH");
+    }
+
+    /// With nothing configured, a table of zero rows says less than the hint
+    /// does — so that case stays a transcript line.
+    #[test]
+    fn no_mcp_servers_stays_a_transcript_line_rather_than_an_empty_table() {
+        use smith_core::McpStatus;
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::McpStatus(McpStatus {
+            servers: Vec::new(),
+        }));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.lines.len(), 1);
+        assert!(app.lines[0].text.contains("no MCP servers configured"));
     }
 
     /// `/mcp prompt` takes one bare word as a prompt name and two as
@@ -2686,6 +2997,20 @@ mod tests {
             .contains("unknown /mcp subcommand"));
     }
 
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// Reads one cell out of the `/usage` table by its metric name.
+    fn usage_cell(app: &App, metric: &str) -> String {
+        let overlay = app.overlay.as_ref().expect("usage should open a panel");
+        let OverlayBody::Table { rows, .. } = &overlay.body else {
+            panic!("expected a table");
+        };
+        rows.iter()
+            .find(|r| r[0] == metric)
+            .unwrap_or_else(|| panic!("no `{metric}` row in {rows:?}"))[1]
+            .clone()
+    }
+
     #[test]
     fn usage_reports_requests_tools_and_tokens() {
         let mut app = test_app();
@@ -2696,38 +3021,151 @@ mod tests {
 
         let action = app.run_slash_command("usage");
         assert!(action.is_none());
-        assert!(app
-            .lines
-            .iter()
-            .any(|l| l.text.contains("requests: 2") && l.text.contains("tools invoked: 3")));
-        assert!(app
-            .lines
-            .iter()
-            .any(|l| l.text.contains("1000 in / 500 out (1500 total)")));
+        assert_eq!(usage_cell(&app, "requests"), "2");
+        assert_eq!(usage_cell(&app, "tool calls"), "3");
+        assert_eq!(usage_cell(&app, "input tokens"), "1000");
+        assert_eq!(usage_cell(&app, "output tokens"), "500");
+        assert_eq!(usage_cell(&app, "total tokens"), "1500");
     }
 
+    /// The cost shown is the one the agent reported, **not** one recomputed
+    /// from `usage` and a local price table. That is the whole reason the TUI
+    /// no longer carries a price table: a resumed session's cost is a sum of
+    /// per-turn figures priced when those turns ran, and multiplying today's
+    /// price by the lifetime token count would silently disagree with it.
     #[test]
-    fn usage_shows_cost_estimate_for_known_model() {
-        let mut app = test_app(); // anthropic/claude-sonnet-5, has pricing data
+    fn usage_shows_the_cost_the_agent_reported_not_a_local_recomputation() {
+        let mut app = test_app();
+        // Tokens that any price table would turn into a large number…
         app.usage.input_tokens = 1_000_000;
         app.usage.output_tokens = 1_000_000;
+        // …while the authoritative figure, from the `turns` table, is small.
+        app.on_agent_event(AgentEvent::SessionCost {
+            usd: 0.25,
+            unpriced_turns: 0,
+        });
         app.run_slash_command("usage");
-        assert!(app
-            .lines
-            .iter()
-            .any(|l| l.text.starts_with("estimated cost: ~$")));
+        assert_eq!(usage_cell(&app, "cost (est.)"), "~$0.2500");
     }
 
     #[test]
-    fn usage_shows_na_for_unknown_pricing() {
+    fn usage_shows_na_before_any_cost_has_been_reported() {
         let mut app = test_app();
         app.provider_label = "ollama".to_string();
         app.model_label = "qwen2.5".to_string();
         app.run_slash_command("usage");
-        assert!(app
-            .lines
-            .iter()
-            .any(|l| l.text.contains("estimated cost: n/a")));
+        assert_eq!(usage_cell(&app, "cost (est.)"), "n/a");
+        let footer = &app.overlay.as_ref().unwrap().footer;
+        assert!(
+            footer.iter().any(|f| f.contains("no pricing data")),
+            "{footer:?}"
+        );
+    }
+
+    /// "$0.00" and "we have no price for that model" are different claims.
+    #[test]
+    fn unpriced_turns_are_reported_beside_the_total_not_folded_into_it() {
+        let mut app = test_app();
+        app.on_agent_event(AgentEvent::SessionCost {
+            usd: 4.20,
+            unpriced_turns: 3,
+        });
+        app.run_slash_command("usage");
+        assert_eq!(usage_cell(&app, "cost (est.)"), "~$4.2000");
+        let footer = &app.overlay.as_ref().unwrap().footer;
+        assert!(footer.iter().any(|f| f.contains("3 turn(s)")), "{footer:?}");
+    }
+
+    #[test]
+    fn ctrl_l_opens_the_log_panel_and_closes_it_again() {
+        let mut app = test_app();
+        app.logs.push(crate::logbuf::LogLine {
+            level: crate::logbuf::LogLevel::Warn,
+            target: "smith_mcp::transport".to_string(),
+            message: "unparseable frame".to_string(),
+        });
+
+        app.on_key(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        let overlay = app.overlay.as_ref().expect("panel should be open");
+        assert_eq!(overlay.title, LOG_PANEL_TITLE);
+        let OverlayBody::Lines(lines) = &overlay.body else {
+            panic!("expected lines");
+        };
+        assert!(lines[0].contains("WARN"), "{lines:?}");
+        assert!(lines[0].contains("unparseable frame"), "{lines:?}");
+
+        app.on_key(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(app.overlay.is_none(), "the same key closes it");
+    }
+
+    /// `Ctrl+L` over an open `/usage` table replaces it rather than closing
+    /// it — otherwise the key would do nothing visible and need pressing twice.
+    #[test]
+    fn ctrl_l_replaces_a_different_panel_instead_of_closing_it() {
+        let mut app = test_app();
+        app.run_slash_command("usage");
+        assert_eq!(app.overlay.as_ref().unwrap().title, "session usage");
+        app.on_key(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.overlay.as_ref().unwrap().title, LOG_PANEL_TITLE);
+    }
+
+    #[test]
+    fn esc_closes_an_overlay_and_any_other_key_dismisses_it_and_still_types() {
+        let mut app = test_app();
+        app.run_slash_command("usage");
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.overlay.is_none());
+
+        app.run_slash_command("usage");
+        app.on_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(app.overlay.is_none(), "any other key dismisses it");
+        assert_eq!(app.input.text(), "h", "and the keystroke still lands");
+    }
+
+    #[test]
+    fn the_arrow_keys_scroll_an_overlay_rather_than_the_transcript() {
+        let mut app = test_app();
+        app.run_slash_command("usage");
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.overlay.as_ref().unwrap().scroll, 2);
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.overlay.as_ref().unwrap().scroll, 1);
+        // Never off the top.
+        app.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(app.overlay.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn ctrl_b_hides_and_restores_the_sidebar() {
+        let mut app = test_app();
+        assert!(app.sidebar_visible);
+        app.on_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(!app.sidebar_visible);
+        app.on_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(app.sidebar_visible);
+    }
+
+    #[test]
+    fn shift_tab_cycles_the_sidebar_tabs_and_wraps() {
+        let mut app = test_app();
+        assert_eq!(app.sidebar_tab, SidebarTab::Session);
+        app.on_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.sidebar_tab, SidebarTab::Tasks);
+        app.on_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.sidebar_tab, SidebarTab::Vitals);
+        app.on_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.sidebar_tab, SidebarTab::Session);
+    }
+
+    /// Cycling a hidden sidebar would be a keystroke with no visible effect.
+    #[test]
+    fn shift_tab_reveals_a_hidden_sidebar_before_it_cycles_anything() {
+        let mut app = test_app();
+        app.sidebar_visible = false;
+        app.on_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(app.sidebar_visible);
+        assert_eq!(app.sidebar_tab, SidebarTab::Session, "nothing cycled yet");
     }
 
     #[test]
