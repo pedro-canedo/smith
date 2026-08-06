@@ -1,5 +1,6 @@
 use super::*;
 use crate::app::ChatRole;
+use crate::testkit::test_app;
 
 /// Rows the input box actually *gets* once `vertical_layout` has protected
 /// the transcript's floor. `draw` composes the two itself (it also has a
@@ -345,7 +346,7 @@ fn transcript_renders_bubble_borders_in_the_right_column() {
     use ratatui::layout::Position;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     app.lines.push(ChatLine::new(
         ChatRole::User,
         "uma mensagem bem longa que precisa quebrar em varias linhas dentro da bolha".to_string(),
@@ -378,26 +379,6 @@ fn transcript_renders_bubble_borders_in_the_right_column() {
 
 use crate::components::input::INPUT_MAX_ROWS;
 
-fn app_for_input_tests() -> App {
-    App::new(crate::app::TuiConfig {
-        banner: String::new(),
-        provider_label: "ollama".into(),
-        model_label: "qwen2.5".into(),
-        cwd_display: "~/smith".into(),
-        git_branch: None,
-        idle_hint: IdleHint::Tip(String::new()),
-        initial_lines: Vec::new(),
-        permission_policy: smith_core::PermissionPolicy::default(),
-        theme: Theme::ansi(),
-        goal: None,
-        tasks: Vec::new(),
-        commands: crate::slash::SlashRegistry::builtin(),
-        keys: Default::default(),
-        history: Vec::new(),
-        logs: crate::logbuf::LogBuffer::default(),
-    })
-}
-
 fn frame(width: u16, height: u16) -> Rect {
     Rect {
         x: 0,
@@ -409,13 +390,13 @@ fn frame(width: u16, height: u16) -> Rect {
 
 #[test]
 fn input_box_starts_at_the_minimum_height() {
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     assert_eq!(input_height(&mut app, frame(80, 30)), INPUT_MIN_ROWS);
 }
 
 #[test]
 fn input_box_grows_with_content_then_caps() {
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     app.input.set(&"palavra ".repeat(12));
     let grown = input_height(&mut app, frame(60, 30));
     assert!(
@@ -429,7 +410,7 @@ fn input_box_grows_with_content_then_caps() {
 
 #[test]
 fn input_box_never_crowds_out_a_short_terminal() {
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     app.input.set(&"palavra ".repeat(400));
     // 8 rows tall: the prompt must leave room for transcript + status bar.
     let height = input_height(&mut app, frame(60, 8));
@@ -441,7 +422,7 @@ fn long_input_renders_its_tail_and_places_the_caret_in_the_box() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     app.input.set(&"palavra ".repeat(60));
 
     let backend = TestBackend::new(60, 20);
@@ -487,7 +468,7 @@ fn screen_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> S
 }
 
 fn app_with_long_permission_request() -> App {
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     let detail = (0..40)
         .map(|i| format!("echo line-{i:02}"))
         .collect::<Vec<_>>()
@@ -576,7 +557,7 @@ fn a_pending_quit_announces_itself_in_the_status_bar() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
     assert!(!screen_text(&terminal).contains(QUIT_HINT));
@@ -716,9 +697,9 @@ fn buffer_of(width: u16, height: u16, mut render: impl FnMut(&mut Frame, Rect)) 
 #[test]
 fn caching_does_not_change_a_single_cell() {
     for (follow, scroll) in [(true, 0u16), (false, 0), (false, 37), (false, 9_999)] {
-        let mut cached = app_for_input_tests();
+        let mut cached = test_app();
         long_transcript(&mut cached, 200);
-        let mut legacy = app_for_input_tests();
+        let mut legacy = test_app();
         long_transcript(&mut legacy, 200);
         for app in [&mut cached, &mut legacy] {
             app.follow_bottom = follow;
@@ -738,9 +719,9 @@ fn caching_does_not_change_a_single_cell() {
 
 #[test]
 fn caching_does_not_change_a_single_cell_while_streaming() {
-    let mut cached = app_for_input_tests();
+    let mut cached = test_app();
     long_transcript(&mut cached, 40);
-    let mut legacy = app_for_input_tests();
+    let mut legacy = test_app();
     long_transcript(&mut legacy, 40);
     for app in [&mut cached, &mut legacy] {
         app.in_flight_text = Some("resposta **parcial** ainda chegando…".repeat(4));
@@ -756,7 +737,7 @@ fn a_settled_transcript_parses_no_markdown_at_all_on_a_redraw() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     long_transcript(&mut app, 200);
     let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
 
@@ -785,7 +766,7 @@ fn resizing_mid_stream_never_leaves_a_row_wider_than_the_pane() {
     use ratatui::layout::Position;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     long_transcript(&mut app, 30);
 
     // Each resize both invalidates the memo and grows the stream, which is
@@ -885,7 +866,7 @@ fn a_tiny_terminal_still_gets_a_prompt_and_a_status_bar() {
 }
 
 fn app_with_context(width: u16) -> App {
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     app.lines
         .push(ChatLine::new(ChatRole::Assistant, "uma resposta"));
     app.on_agent_event(smith_core::AgentEvent::ContextUsage {
@@ -985,7 +966,7 @@ fn every_row_fits_the_pane_at_80x24_in_ascii() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     app.theme = app.theme.clone().ascii_glyphs();
     long_transcript(&mut app, 60);
     app.on_agent_event(smith_core::AgentEvent::ContextUsage {
@@ -1105,7 +1086,7 @@ fn enter_expands_one_card_without_touching_the_global_default() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     app.on_agent_event(smith_core::AgentEvent::ToolCallStarted {
         id: "call_1".into(),
         tool_name: "read_file".into(),
@@ -1135,7 +1116,7 @@ fn enter_expands_one_card_without_touching_the_global_default() {
 fn expanding_a_card_rebuilds_only_that_card() {
     // The reason `expanded` is a `ChatLine` field: joining `LayoutKey`
     // would invalidate the whole memo on every `Enter`.
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     long_transcript(&mut app, 60);
     buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
 
@@ -1151,7 +1132,7 @@ fn expanding_a_card_rebuilds_only_that_card() {
 
 #[test]
 fn selecting_a_card_scrolls_it_into_view() {
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     long_transcript(&mut app, 120);
     buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
     let bottom = app.scroll;
@@ -1182,7 +1163,7 @@ fn card_focus_publishes_its_keymap_in_the_status_bar() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     app.on_agent_event(smith_core::AgentEvent::ToolCallStarted {
         id: "call_1".into(),
         tool_name: "read_file".into(),
@@ -1207,7 +1188,7 @@ fn card_focus_publishes_its_keymap_in_the_status_bar() {
 
 #[test]
 fn follow_bottom_pins_to_the_live_edge_and_a_manual_scroll_holds() {
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     long_transcript(&mut app, 60);
 
     buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
@@ -1261,7 +1242,7 @@ fn a_grouped_search_card_shows_one_row_per_query_under_one_header() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     for (i, query) in ["rust 1.97 release", "rust release schedule"]
         .iter()
         .enumerate()
@@ -1299,7 +1280,7 @@ fn scrolling_a_modal_to_the_end_leaves_no_dead_space_under_it() {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut app = app_for_input_tests();
+    let mut app = test_app();
     let body: String = (0..60).map(|i| format!("plan line {i}\n")).collect();
     app.modal = crate::app::Modal::Plan(crate::app::PlanModal {
         text: format!("{body}THE-LAST-LINE"),

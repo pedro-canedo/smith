@@ -1,6 +1,8 @@
 use super::*;
 use smith_core::TaskStatus;
 
+use crate::testkit::{app_with_cards, app_with_command_files, test_app};
+
 #[test]
 fn tool_labels_cover_the_builtin_lifecycles() {
     let search = tool_labels("web_search");
@@ -26,51 +28,6 @@ fn tool_labels_prettify_mcp_names_and_pass_unknowns_through() {
 
     let unknown = tool_labels("frobnicate");
     assert_eq!(unknown.running, "Calling frobnicate…");
-}
-
-fn test_app() -> App {
-    app_with_commands(SlashRegistry::builtin())
-}
-
-fn app_with_commands(commands: SlashRegistry) -> App {
-    App::new(TuiConfig {
-        banner: String::new(),
-        provider_label: "anthropic".to_string(),
-        model_label: "claude-sonnet-5".to_string(),
-        cwd_display: "~/proj".to_string(),
-        git_branch: None,
-        idle_hint: IdleHint::Tip("test".to_string()),
-        initial_lines: Vec::new(),
-        permission_policy: PermissionPolicy::default(),
-        theme: Theme::ansi(),
-        goal: None,
-        tasks: Vec::new(),
-        commands,
-        keys: Default::default(),
-        history: Vec::new(),
-        logs: LogBuffer::default(),
-    })
-}
-
-/// An app whose custom commands were loaded from real files under a temp
-/// project — the `TempDir` has to outlive the `App`, hence the pair.
-fn app_with_command_files(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
-    let tmp = tempfile::tempdir().unwrap();
-    let project = tmp.path().join("project");
-    let global = tmp.path().join("global");
-    std::fs::create_dir_all(&project).unwrap();
-    std::fs::create_dir_all(&global).unwrap();
-    for (rel, body) in files {
-        let path = project.join(".smith/commands").join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
-    let set = smith_config::CommandSet::discover_in(
-        Some(&global),
-        &project,
-        &crate::slash::builtin_names(),
-    );
-    (tmp, app_with_commands(SlashRegistry::new(set)))
 }
 
 #[test]
@@ -1362,25 +1319,6 @@ fn tool_result_restarts_the_thinking_gap() {
 
 /// A transcript with `count` tool cards separated by assistant replies,
 /// so navigation has to actually skip non-card lines.
-fn app_with_cards(count: usize) -> App {
-    let mut app = test_app();
-    for i in 0..count {
-        app.on_agent_event(AgentEvent::ToolCallStarted {
-            id: format!("call_{i}"),
-            tool_name: "read_file".into(),
-            input: serde_json::json!({ "path": format!("src/f{i}.rs") }),
-        });
-        app.on_agent_event(AgentEvent::ToolCallResult {
-            id: format!("call_{i}"),
-            output: "ok".into(),
-            is_error: false,
-        });
-        app.lines
-            .push(ChatLine::new(ChatRole::Assistant, format!("resposta {i}")));
-    }
-    app
-}
-
 #[test]
 fn ctrl_o_focuses_the_newest_card_and_releases_it() {
     use crossterm::event::{KeyCode, KeyModifiers};

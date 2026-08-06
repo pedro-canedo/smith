@@ -14,6 +14,11 @@ pub mod theme;
 pub mod transcript;
 pub mod ui;
 
+/// The `App` this crate's tests build from. Not a feature, unlike
+/// `smith_core::testkit` — nothing outside this crate consumes it.
+#[cfg(test)]
+mod testkit;
+
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
