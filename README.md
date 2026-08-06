@@ -1,240 +1,188 @@
 <div align="center">
 
-```
+<pre>
 ███████╗███╗   ███╗██╗████████╗██╗  ██╗
 ██╔════╝████╗ ████║██║╚══██╔══╝██║  ██║
 ███████╗██╔████╔██║██║   ██║   ███████║
 ╚════██║██║╚██╔╝██║██║   ██║   ██╔══██║
 ███████║██║ ╚═╝ ██║██║   ██║   ██║  ██║
 ╚══════╝╚═╝     ╚═╝╚═╝   ╚═╝   ╚═╝  ╚═╝
-```
+</pre>
 
-**A terminal AI coding agent, written in Rust.**
+# Smith
 
-Chat with an LLM in a fast, richly styled TUI while it reads and writes your
-files, runs shell commands, searches the web, and calls MCP servers — with a
-permission prompt before anything touches your machine.
+### A terminal AI coding agent built in Rust
 
-[![CI](https://github.com/pedro-canedo/smith/actions/workflows/ci.yml/badge.svg)](https://github.com/pedro-canedo/smith/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+Read your codebase, make a plan, edit files, run commands, and keep you in
+control of every consequential action — directly from your terminal.
+
+<p>
+  <a href="https://github.com/pedro-canedo/smith/actions/workflows/ci.yml"><img src="https://github.com/pedro-canedo/smith/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/pedro-canedo/smith/releases"><img src="https://img.shields.io/github/v/release/pedro-canedo/smith?display_name=tag&sort=semver" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/built_with-Rust-orange.svg" alt="Built with Rust"></a>
+</p>
 
 </div>
 
----
+> **Early development.** Smith is useful today, but its interfaces are still
+> evolving. Expect breaking changes while the project settles.
 
-> **Status: early development.** The agent loop, tools, providers, persistence,
-> and MCP all work day to day, but interfaces still change between commits.
-> See the [Roadmap](#roadmap).
+## Why Smith?
 
-## Features
+Smith is a local-first coding agent for people who want the leverage of an LLM
+without giving up the terminal, the filesystem, or the final say.
 
-- **Bring your own model** — Anthropic, OpenAI, or anything local through
-  [Ollama](https://ollama.com). Switch provider or model mid-conversation with
-  `/model`; history carries over.
-- **Real tools** — read, write, and edit files, list directories, glob, run
-  shell commands, search the web, and keep a live task checklist.
-- **Permission model you control** — every tool is classified read-only,
-  mutating, or dangerous. Nothing above read-only runs without your `y`/`a`/`n`.
-- **Plan before you build** — `/plan <task>` makes the agent propose steps,
-  risks, and affected files. Until you approve, *every* mutating tool is
-  blocked outright.
-- **MCP support** — bridge any stdio-transport MCP server's tools in as
-  first-class tools.
-- **Persistent sessions** — conversations are saved per project; resume with
-  `--resume`. `/goal` keeps a long-lived objective in the system prompt.
-- **Undo what it wrote** — every turn's file writes are checkpointed before
-  they happen, and `/rewind` puts them back after showing you exactly what it
-  would change. Shell commands are the one thing it cannot cover, and it says
-  so rather than pretending otherwise.
-- **Built for the terminal** — live markdown rendering while streaming,
-  wrap-aware scrollback, a per-step activity widget, and a sidebar with token
-  usage plus live CPU/RAM/VRAM stats (local models) or a cost estimate
-  (token-billed providers).
+- **Plan before changing code** — `/plan` creates an explicit plan and blocks
+  mutating tools until you approve it.
+- **Permission-aware tools** — read-only, mutating, and dangerous actions have
+  different policies, with a prompt before anything consequential runs.
+- **Undo file edits** — checkpoints let `/rewind` restore a turn's file changes;
+  shell commands are clearly called out because they cannot be safely undone.
+- **Interactive and scriptable** — use the full TUI, plain screen-reader output,
+  or text/JSON/JSONL output in automation.
+- **Bring your own model** — Anthropic, OpenAI, or a local Ollama server.
+- **Extensible by design** — MCP servers, hooks, commands, skills, personas,
+  and subagents are all project- or user-configurable.
+- **Terminal-native** — streaming Markdown, session history, task tracking,
+  model switching, ASCII mode, and no browser or desktop app required.
 
-## Installation
+## Install
 
-### Prebuilt binaries
-
-Grab the archive for your platform from the
-[latest release](https://github.com/pedro-canedo/smith/releases/latest) and put
-`smith` somewhere on your `PATH`.
-
-<details>
-<summary><strong>Linux</strong> (x86_64 / arm64)</summary>
+### Linux, macOS, and WSL2
 
 ```sh
-# pick one: x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu
-TARGET=x86_64-unknown-linux-gnu
-VERSION=$(curl -fsSL https://api.github.com/repos/pedro-canedo/smith/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
-
-curl -fsSL "https://github.com/pedro-canedo/smith/releases/download/${VERSION}/smith-${VERSION#v}-${TARGET}.tar.gz" | tar xz
-sudo install "smith-${VERSION#v}-${TARGET}/smith" /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/pedro-canedo/smith/main/scripts/install.sh | sh
 ```
 
-</details>
-
-<details>
-<summary><strong>macOS</strong> (Apple Silicon / Intel)</summary>
-
-```sh
-# pick one: aarch64-apple-darwin (M1+) | x86_64-apple-darwin (Intel)
-TARGET=aarch64-apple-darwin
-VERSION=$(curl -fsSL https://api.github.com/repos/pedro-canedo/smith/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
-
-curl -fsSL "https://github.com/pedro-canedo/smith/releases/download/${VERSION}/smith-${VERSION#v}-${TARGET}.tar.gz" | tar xz
-sudo install "smith-${VERSION#v}-${TARGET}/smith" /usr/local/bin/
-```
-
-The binaries are unsigned, so Gatekeeper will quarantine them on first run:
-
-```sh
-xattr -d com.apple.quarantine /usr/local/bin/smith
-```
-
-</details>
-
-<details>
-<summary><strong>Windows</strong> (x86_64)</summary>
+### Windows (PowerShell)
 
 ```powershell
-$version = (Invoke-RestMethod https://api.github.com/repos/pedro-canedo/smith/releases/latest).tag_name
-$name    = "smith-$($version.TrimStart('v'))-x86_64-pc-windows-msvc"
-
-Invoke-WebRequest "https://github.com/pedro-canedo/smith/releases/download/$version/$name.zip" -OutFile "$name.zip"
-Expand-Archive "$name.zip" -DestinationPath .
-# then move $name\smith.exe somewhere on your PATH
+irm https://raw.githubusercontent.com/pedro-canedo/smith/main/scripts/install.ps1 | iex
 ```
 
-Use Windows Terminal — the legacy console host doesn't render the TUI correctly.
+The installers download a published archive, verify its SHA-256 checksum, and
+install Smith without Rust. The Unix installer uses `~/.local/bin` by default;
+the PowerShell installer uses `%LOCALAPPDATA%\smith\bin` and updates the user
+`PATH`.
 
-</details>
-
-Each archive ships with a `.sha256` file next to it if you want to verify the
-download.
-
-### With cargo (any OS)
-
-Requires a [stable Rust toolchain](https://rustup.rs):
+To install a specific version or directory:
 
 ```sh
-cargo install --git https://github.com/pedro-canedo/smith smith-cli
+curl -fsSL https://raw.githubusercontent.com/pedro-canedo/smith/main/scripts/install.sh \
+  | SMITH_VERSION=v0.1.0 SMITH_INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
+See the [release checklist](docs/release.md) for artifact verification and
+package-manager templates.
+
 ### From source
+
+Requires [Rust stable](https://rustup.rs):
 
 ```sh
 git clone https://github.com/pedro-canedo/smith
 cd smith
 cargo build --release --workspace
-# binary at ./target/release/smith
 ```
 
 ## Quick start
 
-```sh
-smith setup     # interactive provider + model wizard
-smith           # start the TUI in the current project
-```
-
-The wizard walks you through picking a provider (Anthropic, OpenAI, or a local
-model via Ollama), entering an API key or choosing a model, and — for Ollama —
-making sure `ollama serve` is running and pulling the model for you. It saves
-to `~/.smith/config.toml`, locked to your user.
-
-Override per run without touching the config:
+Configure a provider and model, then start Smith in a project:
 
 ```sh
-smith --provider ollama --model qwen2.5
-smith --resume <session-id>
+smith setup
+smith
 ```
 
-Accessibility and plain terminal modes:
+The setup wizard supports Anthropic, OpenAI, and Ollama. Configuration is saved
+to `~/.smith/config.toml`; environment variables take precedence for API keys:
 
 ```sh
-smith --ascii                 # TUI with ASCII glyphs only
-smith --plain -p "summarize"  # linear stdout, no TUI chrome, no colour
-TERM=dumb smith -p "task"     # automatically uses the non-interactive frontend
+export ANTHROPIC_API_KEY=...
+smith --provider anthropic
 ```
 
-## Usage
+Run one turn without opening the TUI:
 
-### Keys
+```sh
+smith --print "Explain the architecture of this project"
+cat issue.md | smith --print "Implement this issue"
+smith --output-format json --print "List the risky parts of this change"
+```
 
-| Key | Action |
-| --- | --- |
-| `Enter` | send the message |
-| `Esc` | cancel the in-flight response |
-| `↑` `↓` `PageUp` `PageDown` | scroll the transcript (snaps back to follow-latest at the bottom) |
-| `Tab` | autocomplete a slash command |
-| `Ctrl+C` | quit |
+For accessibility, CI, or narrow terminals:
 
-When the agent wants to write a file or run a shell command, a modal asks:
-`[y]` allow once, `[a]` allow for the rest of the session, `[n]` deny.
+```sh
+smith --plain --print "Summarize the current project"
+smith --ascii
+TERM=dumb smith --print "Check the tests"
+```
 
-### Slash commands
+## How it works
 
-| Command | What it does |
-| --- | --- |
-| `/help` | list available commands |
-| `/model` | show or switch provider/model — `/model ollama/qwen2.5`, `--save` to persist |
-| `/permission` | tool permission policy: `ask` (default), `session`, `skip` |
-| `/plan <task>` | propose a plan first; `approve`/`reject` to unblock tools |
-| `/goal <text>` | persistent session objective, stored in `.smith/goal.md` |
-| `/loop [N] <task>` | repeat a task until done, N iterations, or `Esc` (`/loop goal` reuses the goal) |
-| `/usage` | session requests, tool calls, tokens, and estimated cost |
-| `/rewind [turn] [confirm] [--force]` | undo a turn's file writes — shows the plan first, and **does not cover `run_bash`** |
-| `/clear` | clear the visible transcript |
+```text
+your prompt
+    │
+    ▼
+Smith agent loop ── provider stream ── Anthropic / OpenAI / Ollama
+    │
+    ├── read-only tools run automatically
+    ├── mutating and dangerous tools ask for permission
+    ├── an approved plan can gate all changes
+    └── events return to the TUI or headless output
+```
 
-#### `/rewind`, and what it cannot undo
+Smith keeps project sessions in `.smith/sessions.db` and global settings in
+`~/.smith/`. The project directory is the boundary for file tools; shell
+commands are intentionally not sandboxed because a fake shell jail would give
+you a false sense of safety.
 
-Before `write_file` or `edit_file` touches a file, smith copies the current
-bytes into `.smith/checkpoints/` (content-addressed, so an unchanged file costs
-nothing to re-snapshot). `/rewind` puts them back: files the turn modified are
-restored, files the turn *created* are deleted.
+## Everyday workflow
 
-It is deliberately two steps. `/rewind` on its own only prints what it would
-do; `/rewind confirm` applies it. If a file has changed since that turn —
-because you edited it by hand, or a later turn rewrote it — the rewind is
-refused outright, with the file named, and `--force` is the only way past it.
-Applying also checkpoints the current state first, so an unwanted rewind can
-itself be rewound.
+### Plan and execute
 
-**It does not undo anything `run_bash` did.** A shell command can write, move
-or delete anything at all, and smith has no way to know what it touched, so
-none of it is snapshotted. `/rewind` names every `run_bash` call in the turn
-it is undoing and says so — but a turn that did its real work through the shell
-is not meaningfully undoable here. The same applies to MCP-bridged tools.
+```text
+/plan migrate the authentication layer to the new API
+```
 
-Checkpoints are kept for 14 days and swept in the background at startup;
-deleting `.smith/checkpoints/` at any time is safe and loses only undo history.
-Nothing here goes near git: your index, stash, refs and worktree are never
-touched, which is also why it works in a submodule, a bare checkout, or a
-directory that is not a repository at all.
+Review the proposed steps, then approve them. While a plan is pending, Smith
+will not run mutating or dangerous tools — even if the permission policy would
+otherwise allow them.
 
-### Built-in tools
+### Sessions and goals
 
-| Tool | Permission |
-| --- | --- |
-| `read_file`, `list_dir`, `glob`, `web_search`, `write_tasks`, `ask_user` | read-only — never prompts |
-| `write_file`, `edit_file` | mutating — prompts unless session-allowed |
-| `run_bash`, all MCP-bridged tools | dangerous — always prompts unless session-allowed |
+```text
+/goal Make the test suite deterministic
+/continue
+/usage
+```
 
-`/permission skip` (alias `yolo`) auto-allows everything, including shell
-commands — smith prints an explicit warning the moment you enable it. A pending
-`/plan` blocks every mutating and dangerous tool regardless of policy, even
-under `skip`.
+The goal is stored with the session, not in a project file. From the shell,
+`smith sessions list`, `smith sessions export`, and `smith sessions fork` help
+you inspect or branch conversation history.
 
-## Configuration
+### Undo file changes
 
-Global config and secrets live in `~/.smith/config.toml`. Per-project state —
-session history (`sessions.db`), the current goal, and staged edits — lives in
-`.smith/` inside the project (add it to your `.gitignore`).
+```text
+/rewind
+/rewind confirm
+```
+
+Smith checkpoints files before `write_file` and `edit_file`. A rewind is
+conservative: if a file changed after the original turn, Smith refuses to
+overwrite it unless you explicitly use `--force`. It never claims to undo
+`run_bash` or MCP side effects.
+
+## Providers and configuration
+
+The interactive wizard is the recommended starting point. For manual setup,
+`~/.smith/config.toml` can contain:
 
 ```toml
 [general]
 provider = "anthropic"          # anthropic | openai | ollama
-model = "claude-sonnet-5"
+model = "your-model-name"
 permission_policy = "ask"       # ask | session | skip
 
 [anthropic]
@@ -246,66 +194,130 @@ api_key = "sk-..."
 [ollama]
 base_url = "http://127.0.0.1:11434/v1"
 
-# Optional web_search backends. SearXNG is tried first when configured.
 [search]
+# Optional: pin web_search to one backend.
+backend = "searxng"
 searxng_url = "https://searx.example.com"
-# backend = "searxng"          # optional pin: searxng | exa | tavily | bing | bing-browser | google-news | duckduckgo
+market = "pt-BR"
 
-[exa]
-api_key = "..."
-
-[tavily]
-api_key = "..."
-
-# Any stdio-transport MCP server. Its tools are pulled in at startup and, like
-# run_bash, always require a permission prompt.
 [[mcp_servers]]
 name = "filesystem"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allow"]
 ```
 
-`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` take priority over whatever is saved
-in the config file.
+API keys from `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` override saved values.
+Run `smith doctor` to check credentials, connectivity, directory permissions,
+MCP servers, and optional runtimes without starting a session.
+
+## Tools and safety
+
+| Tool | Default class | Behavior |
+| --- | --- | --- |
+| `read_file`, `list_dir`, `glob`, `web_search`, `write_tasks`, `ask_user` | Read-only | Runs without a permission prompt |
+| `write_file`, `edit_file` | Mutating | Prompts unless allowed for the session |
+| `run_bash`, MCP tools | Dangerous | Requires explicit permission by default |
+
+Use `/permission` to inspect or change the policy for the current session:
+
+```text
+/permission       # show the current policy
+/permission ask
+/permission session
+/permission skip  # explicitly enables unrestricted tool approval
+```
+
+For non-interactive runs, allowed mutating tools must be named explicitly:
+
+```sh
+smith --print "Format the changed Rust files" \
+  --allowed-tools write_file,edit_file,run_bash
+```
+
+Read the [authorization model](docs/authorization.md) for the interaction
+between permissions, plans, hooks, and MCP tools.
+
+## Customize Smith
+
+Smith loads project extensions from `.smith/` and user extensions from
+`~/.smith/`:
+
+| Extension | Purpose | Documentation |
+| --- | --- | --- |
+| Commands | Reusable `/commands` with arguments | [extensions](docs/extensions.md) |
+| Skills | On-demand instructions for recurring work | [extensions](docs/extensions.md) |
+| Personas | Output styles selected with `--persona` | [extensions](docs/extensions.md) |
+| Subagents | Specialized model roles | [extensions](docs/extensions.md) |
+| Hooks | JSON-in/JSON-out policy and lifecycle hooks | [hooks](docs/hooks.md) |
+| SearXNG | Self-hosted web search | [extensions](docs/extensions.md) |
+
+Example command:
+
+```text
+.smith/commands/review.md
+```
+
+Then run it as:
+
+```text
+/review
+```
+
+## CLI reference
+
+```text
+smith [OPTIONS] [COMMAND]
+```
+
+| Option | Description |
+| --- | --- |
+| `--provider <NAME>` | Override the configured provider |
+| `--model <NAME>` | Override the configured model |
+| `--resume <ID>` / `--continue` | Resume a saved session |
+| `-p, --print <PROMPT>` | Run one non-interactive turn |
+| `--output-format <text\|json\|stream-json>` | Select headless output |
+| `--plain` | Screen-reader-friendly linear output |
+| `--ascii` | Force ASCII UI glyphs |
+| `--cwd <DIR>` | Run against another project directory |
+| `--allowed-tools <LIST>` | Allow named tools in headless mode |
+| `--persona <NAME>` | Select an output style |
+| `setup` | Configure provider, key, and model |
+| `remember` | Add a standing instruction to `SMITH.md` |
+| `sessions` | List, export, fork, or inspect sessions |
+| `doctor` | Validate the local installation and configuration |
+
+Run `smith --help` or `smith <command> --help` for the complete reference.
 
 ## Architecture
 
-A Cargo workspace of 7 crates, with dependencies flowing one way toward
-`smith-core` — which is pure traits and types and knows nothing about HTTP,
-SQLite, or `ratatui`.
+Smith is an eight-crate Rust workspace with a one-way dependency flow toward
+`smith-core`:
 
 | Crate | Responsibility |
 | --- | --- |
-| `smith-core` | Domain types, the `LlmProvider`/`Tool` traits, and the agent loop (`agent.rs`) |
-| `smith-provider` | Provider adapters (Anthropic, OpenAI, Ollama) including SSE stream parsing |
-| `smith-tools` | Built-in tools and the `ToolRegistry` |
-| `smith-mcp` | Hand-rolled JSON-RPC-over-stdio MCP client |
-| `smith-store` | Global config and per-project SQLite session history |
-| `smith-tui` | The `ratatui`/`crossterm` UI — chat pane, input box, modals, sidebar |
-| `smith-cli` | Binary entry point: CLI flags, system prompt, orchestrator loop |
+| `smith-core` | Agent loop, domain types, provider and tool traits |
+| `smith-provider` | Anthropic, OpenAI, and Ollama adapters |
+| `smith-tools` | Built-in tools and permissions registry |
+| `smith-mcp` | JSON-RPC-over-stdio MCP client |
+| `smith-store` | SQLite session persistence |
+| `smith-config` | Layered config, memory, and extensions |
+| `smith-tui` | `ratatui`/`crossterm` interface |
+| `smith-cli` | CLI, orchestration, prompts, and headless mode |
 
-The TUI never talks to providers or tools directly — only through `Action` and
-`AgentEvent` channels. [`CLAUDE.md`](CLAUDE.md) has the long-form narrative;
-[`AGENTS.md`](AGENTS.md) is the short version.
+The TUI communicates with the agent through `Action` and `AgentEvent` channels;
+it never talks directly to providers or tools. See [CLAUDE.md](CLAUDE.md) for
+the long-form architecture and [AGENTS.md](AGENTS.md) for contributor rules.
 
-User extension points are documented in [`docs/extensions.md`](docs/extensions.md):
-subagents, slash commands, skills, personas, hooks, and SearXNG setup.
-
-## Contributing
-
-Issues and pull requests are welcome — especially bug reports with a
-reproduction, and small, focused PRs.
-
-**Setup**
+## Development
 
 ```sh
 git clone https://github.com/pedro-canedo/smith
 cd smith
 cargo build --workspace
-cargo run -p smith-cli          # run the TUI in dev
+cargo run -p smith-cli
 ```
 
-**Before you open a PR**, all three must pass — CI runs exactly these:
+Before opening a pull request, run the same gates as CI:
 
 ```sh
 cargo fmt --all -- --check
@@ -313,17 +325,25 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-**Conventions**
+Tests live inline in `#[cfg(test)] mod tests` blocks. Keep changes focused and
+follow the architecture notes before adding a capability that crosses the TUI
+and agent loop.
 
-- Tests are inline `#[cfg(test)] mod tests { ... }` at the bottom of the file
-  they cover. There are no separate test files.
-- Run a single crate or test with `cargo test -p smith-tui` /
-  `cargo test -p smith-tui app::tests::some_test`.
-- Keep changes scoped. This is early-stage; architectural changes are much
-  easier to review in small pieces — open an issue to discuss first.
-- Adding a capability that reaches the UI means three edits: a new `AgentEvent`
-  variant in `smith-core/src/event.rs`, an emitter in `agent.rs` or `main.rs`,
-  and a handler arm in `smith-tui/src/app.rs::on_agent_event`.
+## Roadmap and status
+
+Smith is currently focused on making the core loop, safety model, provider
+adapters, terminal accessibility, and release workflow dependable. Planned
+work includes broader provider coverage, richer diagnostics, and continued
+hardening of native Windows and macOS behavior.
+
+See [CHANGELOG.md](CHANGELOG.md) for shipped work and [docs/release.md](docs/release.md)
+for the release process.
+
+## Contributing
+
+Bug reports, focused pull requests, and documentation improvements are
+welcome. For security-sensitive issues, please avoid posting credentials or
+reproduction data that contains secrets in a public issue.
 
 ## License
 
