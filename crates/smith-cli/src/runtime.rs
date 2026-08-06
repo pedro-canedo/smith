@@ -499,7 +499,7 @@ pub async fn provision_chromium(
     let integrity = verify_archive(&archive, downloaded.bytes, downloaded.md5_base64.as_deref())?;
     let _ = writeln!(out, "Checked: {}", integrity.describe());
 
-    let staging = install_root.join(format!("{STAGING_PREFIX}{}", std::process::id()));
+    let staging = install_root.join(staging_dir_name());
     let _ = std::fs::remove_dir_all(&staging);
     let unpacked = (|| {
         let _ = writeln!(out, "Extracting...");
@@ -561,17 +561,38 @@ pub async fn provision_chromium(
     })
 }
 
+/// A staging directory name unique to *this call*, not just this process.
+///
+/// The pid alone is not enough: two `provision_chromium` calls in one process
+/// would share a name, and the callee wipes the directory before extracting —
+/// so one call would delete the other's half-unpacked archive. That is not
+/// hypothetical, it is a test suite running its provisioning cases in
+/// parallel threads.
+fn staging_dir_name() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}{}-{n}", STAGING_PREFIX, std::process::id())
+}
+
+/// The prefix every staging directory of *this* process shares.
+fn staging_prefix_for_this_process() -> String {
+    format!("{}{}-", STAGING_PREFIX, std::process::id())
+}
+
 /// Removes `.staging-*` directories from earlier runs. Best effort: one still
 /// in use by a concurrent `smith setup` will refuse to go, and that is fine.
+///
+/// Everything belonging to this process is skipped as a group — a sibling call
+/// may be extracting into one of them right now.
 fn sweep_stale_staging(install_root: &Path) {
     let Ok(entries) = std::fs::read_dir(install_root) else {
         return;
     };
-    let mine = format!("{STAGING_PREFIX}{}", std::process::id());
+    let mine = staging_prefix_for_this_process();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(STAGING_PREFIX) && name != mine {
+        if name.starts_with(STAGING_PREFIX) && !name.starts_with(&mine) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }

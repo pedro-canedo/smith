@@ -6,6 +6,16 @@ pub mod memory;
 
 pub use memory::{MemoryCache, MemoryScope, MEMORY_FILE_NAME};
 
+// --- user-authored extension files ----------------------------------------
+// Custom slash commands, skills and personas. All three are markdown on disk
+// discovered in a project directory and a global one; see `extend`.
+pub mod extend;
+
+pub use extend::commands::{CommandSet, CustomCommand};
+pub use extend::persona::{Persona, PersonaMode};
+pub use extend::skills::{Skill, SkillCatalog};
+pub use extend::Origin;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("could not determine the home directory")]

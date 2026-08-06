@@ -69,6 +69,13 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     cwd: Option<std::path::PathBuf>,
 
+    /// Output style to run under: a file in `.smith/personas/` or
+    /// `~/.smith/personas/`. Defaults to `default` if such a file exists;
+    /// `--persona none` disables it. Read once at startup, deliberately —
+    /// see `prompts::system_prompt_with`.
+    #[arg(long, value_name = "NAME")]
+    persona: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -416,6 +423,13 @@ struct Startup {
     initial_messages: Vec<Message>,
     idle_hint: IdleHint,
     initial_goal: Option<String>,
+    /// The output style this session runs under. Resolved here rather than in
+    /// the orchestrator because `--persona` is a CLI flag, and both frontends
+    /// have to agree about it.
+    persona: Option<smith_config::Persona>,
+    /// Custom slash commands. Discovered here so a broken file is reported
+    /// once at startup, like a broken subagent definition.
+    commands: smith_config::CommandSet,
 }
 
 impl Startup {
@@ -445,6 +459,21 @@ impl Startup {
             .and_then(smith_core::PermissionPolicy::parse)
             .unwrap_or_default();
 
+        // A named persona that is missing is a usage error — the user typed a
+        // name and got a different agent than they asked for, silently. The
+        // implicit `default` is absent for almost everyone, so its absence is
+        // not reported at all.
+        let explicit = cli.persona.is_some();
+        let persona = smith_config::extend::persona::load_in(
+            None,
+            &cwd,
+            cli.persona
+                .as_deref()
+                .unwrap_or(smith_config::extend::persona::DEFAULT_PERSONA),
+            explicit,
+        )?;
+        let commands = smith_config::CommandSet::discover(&cwd, &smith_tui::slash::builtin_names());
+
         let session_store = SessionStore::open(&cwd).ok();
         let (session_id, initial_messages, idle_hint, initial_goal) =
             resolve_session(session_store.as_ref(), cli.resume.as_deref(), cli.continue_)?;
@@ -460,6 +489,8 @@ impl Startup {
             initial_messages,
             idle_hint,
             initial_goal,
+            persona,
+            commands,
         })
     }
 
@@ -515,6 +546,30 @@ async fn run_tui(cli: Cli) -> ExitCode {
         }
     };
 
+    let commands = std::mem::take(&mut startup.commands);
+    // A command file that would not load is announced at startup. A `/deploy`
+    // that silently does not exist is indistinguishable from one the user
+    // mistyped, and the file it was shadowed by or refused for is the only
+    // useful thing to say about it — same reasoning as the subagent loader's
+    // problem lines.
+    let mut initial_lines = messages_to_chat_lines(&startup.initial_messages);
+    for problem in &commands.problems {
+        initial_lines.push(ChatLine::new(
+            ChatRole::System,
+            format!("custom command {problem}"),
+        ));
+    }
+    if let Some(persona) = &startup.persona {
+        initial_lines.push(ChatLine::new(
+            ChatRole::System,
+            format!(
+                "output style: {} ({})",
+                persona.name,
+                persona.source.display()
+            ),
+        ));
+    }
+
     let tui_config = TuiConfig {
         banner: smith_tui::banner::banner(),
         provider_label: startup.provider_kind.label().to_string(),
@@ -522,10 +577,11 @@ async fn run_tui(cli: Cli) -> ExitCode {
         cwd_display: display_path(&startup.cwd),
         git_branch: detect_git_branch(&startup.cwd),
         idle_hint: std::mem::replace(&mut startup.idle_hint, IdleHint::Tip(String::new())),
-        initial_lines: messages_to_chat_lines(&startup.initial_messages),
+        initial_lines,
         permission_policy: startup.permission_policy,
         goal: startup.initial_goal.clone(),
         tasks: last_write_tasks_call(&startup.initial_messages),
+        commands: smith_tui::slash::SlashRegistry::new(commands),
     };
 
     let (action_tx, chans, event_rx, permission_rx, question_rx) = channels();
@@ -540,6 +596,7 @@ async fn run_tui(cli: Cli) -> ExitCode {
     opts.permission_policy = startup.permission_policy;
     opts.initial_goal = startup.initial_goal.clone();
     opts.initial_messages = std::mem::take(&mut startup.initial_messages);
+    opts.persona = startup.persona.take();
     if let Some(max_turns) = cli.max_turns {
         opts.limits.max_turns = max_turns;
     }
@@ -610,6 +667,11 @@ async fn run_headless(cli: Cli) -> u8 {
     opts.persistence = startup.persistence();
     opts.initial_goal = startup.initial_goal.clone();
     opts.initial_messages = std::mem::take(&mut startup.initial_messages);
+    // A persona applies headless too: it is how the run writes, and a CI job
+    // that wants smith's default voice simply does not pass `--persona`. Its
+    // invariant half is not up for negotiation either way — see
+    // `prompts::PROMPT_INVARIANTS`.
+    opts.persona = startup.persona.take();
     // Deliberately *not* `startup.permission_policy`. A saved `skip` (or
     // `session`) would auto-allow tools before they ever reach the permission
     // channel, which is the only place `--allowed-tools` can see them — a

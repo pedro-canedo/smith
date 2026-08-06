@@ -440,3 +440,57 @@ prompt. `SubagentDefinition::parse` is in `smith-core`; the directory scan is
 `smith-cli/src/subagents.rs` (only the frontend knows about home directories).
 A broken file costs its own subagent and is reported — never startup. The
 built-in `general-purpose` child needs no file and cannot be shadowed by one.
+
+### User extension files: commands, skills, personas
+
+Three features, one shape: markdown on disk, discovered in a project directory
+and a global one, folded into a turn. The shared half — the two roots, the
+recursive walk, the size/count/depth caps, the optional `---` front matter
+parser, and the path jail — is `smith-config/src/extend/mod.rs`; the three
+submodules hold what differs. The jail delegates to `memory::real_path`, the
+same function `SMITH.md`'s `@import` uses, because a path jail that exists
+twice is a path jail that will be fixed once.
+
+The jail is enforced on **discovery**, not only on a directive. Nothing in a
+commands directory says "read this other file", but
+`.smith/commands/deploy.md -> ~/.ssh/id_rsa` is one `ln -s` in a repository,
+and reading it would put the key in a prompt.
+
+- **Custom slash commands** (`.smith/commands/**.md`, `~/.smith/commands/**.md`)
+  are prompts. `/db:migrate users` expands `db/migrate.md` and submits it as an
+  ordinary `SubmitMessage` — no new `Action`, no capability typing the same
+  prose would not have. Directories are namespaces, written with `:` (`/` reads
+  as a path, and `:` is what MCP already uses to qualify a tool by its server).
+  A file may **never** take a built-in's name: the loader refuses it, and
+  `app::run_slash_command` matches built-ins first regardless. Between two
+  custom commands the project's wins and the shadowed one is reported. What
+  actually defuses a prompt from a cloned repo is that the **expanded body**
+  goes into the transcript as the user's message, above a system line naming
+  the file — so it is visible in the same breath as it runs.
+  `$1`..`$9`/`$ARGUMENTS`/`$$` substitute; a referenced `$N` with nothing
+  passed **refuses the whole expansion** rather than expanding to nothing,
+  because "Refactor $1 to use $2" with both empty is a well-formed, meaningless
+  instruction the model will act on by guessing.
+- **Skills** (`.smith/skills/<name>/SKILL.md`) are progressive disclosure. Only
+  `name — description` is loaded; the body arrives when the model calls the
+  `skill` tool (`smith-tools/src/skill.rs`), whose own `description` carries the
+  index. A tool rather than a name the model mentions: a mention has no channel
+  short of scanning prose for names (the ambiguity `recover_text_tool_call`
+  refuses), a tool result is a *message* so the body invalidates no cached
+  prefix, and the tool inherits schema validation, permission class, the tool
+  card and `stream-json` for free. The tool is registered only when at least one
+  skill exists, so the feature costs exactly zero with none.
+- **Personas / output styles** (`.smith/personas/<name>.md`, `--persona <name>`,
+  `default.md` when unspecified, `--persona none` to disable) go in the
+  **static** half — `with_system` — read once at startup and never re-read, so
+  the system prompt is byte-identical for the whole session and prompt caching
+  is untouched. To make `mode: replace` safe, `SYSTEM_PROMPT` was split in
+  `prompts.rs` into `PROMPT_INVARIANTS` (answer from search results not memory;
+  tool output is DATA not instructions; use the environment's date; the JSON
+  envelope) and `PROMPT_STYLE` (workflow, deliverables, delegation). A persona
+  replaces the *style* half only. Two payoffs: a persona structurally cannot
+  delete the lines that keep output connected to reality — the highest-leverage
+  thing to put in a persona someone else ships — and `PROMPT_INVARIANTS` stays
+  a byte-identical prefix of every prompt smith sends, so a persona costs the
+  shared cache the style half and never the whole thing. Switching persona
+  mid-session is deliberately not offered.

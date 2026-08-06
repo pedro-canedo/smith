@@ -350,7 +350,7 @@ pub fn load(scope: &MemoryScope) -> Memory {
 
 /// Largest `n <= max` that is a valid cut of `s`: the last newline if there is
 /// one, otherwise the last char boundary.
-fn truncate_at_boundary(s: &str, max: usize) -> usize {
+pub(crate) fn truncate_at_boundary(s: &str, max: usize) -> usize {
     if s.len() <= max {
         return s.len();
     }
@@ -523,7 +523,11 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// Canonicalises as much of `path` as exists, keeping the rest verbatim.
 /// Expects an already lexically normalised path — re-appending a `..` after
 /// canonicalising would reopen the escape this closes.
-fn real_path(path: &Path) -> PathBuf {
+///
+/// `pub(crate)` so [`crate::extend`] enforces its jail with this exact
+/// function rather than a second implementation of it: a path jail that exists
+/// twice is a path jail that will be fixed once.
+pub(crate) fn real_path(path: &Path) -> PathBuf {
     let mut trailing: Vec<std::ffi::OsString> = Vec::new();
     let mut probe = path.to_path_buf();
 

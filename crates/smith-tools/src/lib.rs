@@ -11,6 +11,7 @@ pub mod schema_validate;
 pub mod scratch;
 pub mod searxng;
 pub mod shell_tool;
+pub mod skill;
 pub mod staging;
 pub mod task;
 pub mod web_fetch;

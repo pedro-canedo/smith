@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 smith-core = { workspace = true }
+# Custom slash commands: their discovery, jail and argument substitution live
+# in smith-config (a leaf crate — no SQLite, no HTTP), so the TUI only has to
+# hold the loaded set and ask it to render.
+smith-config = { workspace = true }
 smith-store = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
@@ -19,3 +23,6 @@ similar = { workspace = true }
 tui-markdown = { version = "0.3.9", default-features = false }
 tui-textarea = { workspace = true }
 unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

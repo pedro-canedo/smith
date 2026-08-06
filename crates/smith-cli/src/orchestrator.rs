@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::prompts::{
     build_approved_plan_prompt, build_loop_task_prompt, context_provider, last_assistant_plan_text,
-    loop_turn_is_done, LOOP_CONTINUE_PROMPT, SYSTEM_PROMPT,
+    loop_turn_is_done, system_prompt_with, LOOP_CONTINUE_PROMPT,
 };
 
 /// Iteration cap applied when `/loop` is given no explicit count — a safety
@@ -306,6 +306,12 @@ struct OrchestratorState {
     /// every SMITH.md on the next request for no reason, and would drop the
     /// warm state a long session has built up.
     memory: MemoryCache,
+    /// The composed static system prompt — built-in halves plus whatever
+    /// persona was selected. Held rather than recomputed so `switch_model`
+    /// rebuilds the agent with the *same bytes*: a persona re-read here would
+    /// take effect on `/model` and nowhere else, and a recomposition that
+    /// differed by a byte would silently cost the session its prefix cache.
+    system: String,
     /// The undo buffer `/rewind` reads. Held here as the concrete type rather
     /// than the `Checkpointer` trait the agent uses, because planning and
     /// applying a rewind happen outside the turn loop and there is nothing
@@ -364,7 +370,7 @@ impl OrchestratorState {
 
         let scratch_dir = tool_ctx.scratch_dir();
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
-            .with_system(SYSTEM_PROMPT)
+            .with_system(self.system.clone())
             .with_context_provider(context_provider(self.memory.clone(), scratch_dir))
             .with_subagent_definitions(subagents)
             .with_limits(limits)
@@ -484,6 +490,10 @@ pub struct OrchestratorOptions {
     /// front so a missing API key is a clean exit-2 before any channel work
     /// starts, rather than an `Error` event racing the first turn.
     pub provider: Option<Arc<dyn LlmProvider>>,
+    /// Output style for this session, already loaded. `None` is the built-in
+    /// prompt. Resolved by the frontend (it owns `--persona`) and never
+    /// re-read here — see `prompts::system_prompt_with`.
+    pub persona: Option<smith_config::Persona>,
 }
 
 impl OrchestratorOptions {
@@ -498,6 +508,7 @@ impl OrchestratorOptions {
             initial_goal: None,
             limits: TurnLimits::default(),
             provider: None,
+            persona: None,
         }
     }
 }
@@ -522,6 +533,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         initial_goal,
         limits,
         provider: provider_override,
+        persona,
     } = opts;
     let OrchestratorChannels {
         mut action_rx,
@@ -554,6 +566,27 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     tools.replace(Arc::new(
         smith_tools::web_search::WebSearchTool::with_settings(web_search_settings(&config)),
     ));
+    // Skills, and the `skill` tool that discloses them. Registered *only* when
+    // there is at least one, so a user with no skills pays nothing at all —
+    // not even a tool definition. A broken SKILL.md costs its own skill and is
+    // reported, exactly like a broken subagent definition.
+    let project_dir = std::env::current_dir().unwrap_or_default();
+    let skills = smith_config::SkillCatalog::discover(&project_dir);
+    for problem in &skills.problems {
+        let _ = event_tx.send(AgentEvent::Error(format!("skill {problem}")));
+    }
+    if !skills.is_empty() {
+        let entries = skills
+            .skills()
+            .iter()
+            .map(|s| smith_tools::skill::SkillEntry {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                body: s.rendered(),
+            })
+            .collect();
+        tools.register(Arc::new(smith_tools::skill::SkillTool::new(entries)));
+    }
 
     // Allocate a stable session id up front for staging (and reuse a resumed
     // id). The DB row is still created lazily on first persist via ensure_session.
@@ -616,10 +649,14 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     register_mcp_tools(&mcp, &mut tools, &event_tx);
     let tools = Arc::new(tools);
 
+    // Composed once, here, and held on the state: read-once is what keeps the
+    // static prompt byte-identical for the whole session.
+    let system = system_prompt_with(persona.as_ref());
+
     let scratch_dir = tool_ctx.scratch_dir();
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_checkpointer(checkpoints.clone())
-        .with_system(SYSTEM_PROMPT)
+        .with_system(system.clone())
         .with_context_provider(context_provider(memory.clone(), scratch_dir))
         .with_subagent_definitions(subagents)
         // Set explicitly (rather than left to `Agent`'s own default) so
@@ -652,6 +689,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         provider_kind,
         tools,
         memory,
+        system,
         checkpoints,
     }));
 

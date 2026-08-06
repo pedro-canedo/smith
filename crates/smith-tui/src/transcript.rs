@@ -307,6 +307,7 @@ mod tests {
             permission_policy: smith_core::PermissionPolicy::default(),
             goal: None,
             tasks: Vec::new(),
+            commands: crate::slash::SlashRegistry::builtin(),
         })
     }
 
