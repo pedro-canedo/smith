@@ -740,7 +740,29 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         || config.fallback.providers.iter().any(|p| p == "9router");
     let ninerouter_starting = uses_ninerouter.then(|| {
         let config = config.clone();
-        tokio::spawn(async move { crate::node_runtime::ensure_ninerouter_running(&config).await })
+        tokio::spawn(async move {
+            crate::node_runtime::ensure_ninerouter_running(&config).await?;
+            // Running is not ready. A gateway with no upstreams answers every
+            // health probe and then 404s on the first message — the one place
+            // a user cannot do anything about it. Saying so before the turn
+            // costs one request and turns a mid-conversation failure into a
+            // sentence at startup.
+            let base_url = config
+                .nine_router
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
+            match crate::node_runtime::ninerouter_upstreams(&base_url).await {
+                Ok(models) if models.is_empty() => Err(format!(
+                    "the 9router gateway on {base_url} is running but routes to nothing \
+                     — open http://localhost:20128 and add a provider under `Providers`, \
+                     or every request will fail with `No active credentials`"
+                )),
+                // A list smith could not read is not evidence of a problem;
+                // the gateway is up, and the turn will report its own failure.
+                _ => Ok(()),
+            }
+        })
     });
 
     let provider = match provider_override {

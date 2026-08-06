@@ -345,10 +345,20 @@ async fn setup_openrouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
     println!("Free-tier limits: 20 req/min; 50 free-model requests/day, or 1000/day after a");
     println!("one-time $10 top-up. smith falls back automatically when the day runs out.\n");
 
-    let existing_key = config.openrouter.api_key.clone();
-    let prompt = match &existing_key {
-        Some(_) => "OpenRouter API key (already set — blank keeps it)".to_string(),
-        None => "OpenRouter API key".to_string(),
+    // `build_provider` prefers `OPENROUTER_API_KEY` over anything saved, so
+    // prompting for a key that would be ignored is worse than not asking: the
+    // user types a secret and smith uses a different one.
+    let from_env = std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let existing_key = config.openrouter.api_key.clone().or(from_env.clone());
+    let prompt = match (&from_env, &existing_key) {
+        (Some(_), _) => {
+            println!("Using OPENROUTER_API_KEY from the environment; it outranks anything saved.");
+            "OpenRouter API key (env is in use — blank keeps it)".to_string()
+        }
+        (None, Some(_)) => "OpenRouter API key (already set — blank keeps it)".to_string(),
+        (None, None) => "OpenRouter API key".to_string(),
     };
     let entered: String = Password::with_theme(theme)
         .with_prompt(prompt)
@@ -419,28 +429,26 @@ async fn setup_openrouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
     config.general.provider = Some("openrouter".to_string());
     config.general.model = Some(primary);
 
-    // The second layer: where smith itself goes when the *account* quota
-    // dies. Offered, not imposed — but defaulted on, because the account
-    // limit is the one failure the server-side chain cannot absorb.
-    let wants_fallback = Confirm::with_theme(theme)
-        .with_prompt(
-            "Also fall back to other providers automatically when the daily quota runs out?",
-        )
-        .default(true)
-        .interact_opt()?
-        .unwrap_or(false);
-    if wants_fallback {
-        let mut providers = Vec::new();
-        if config.nine_router.api_key.is_some() {
-            providers.push("9router".to_string());
-        }
+    // The second layer: where smith itself goes when the *account* quota dies.
+    // This used to be a `Confirm` defaulted to yes, which is a prompt that is
+    // not asking anything. It is computed now, from what is actually on the
+    // machine — and only entries that could work are written, because an
+    // unusable entry is a hard error at startup, not a skip.
+    let mut providers = Vec::new();
+    if config.nine_router.api_key.is_some() {
+        providers.push("9router".to_string());
+    }
+    if ollama_model_count().await.is_some_and(|n| n > 0) {
         providers.push("ollama".to_string());
+    }
+    if providers.is_empty() {
+        println!("No local fallback available yet — set up Ollama or 9Router to add one.");
+    } else {
         config.fallback.providers = providers;
         println!(
-            "[fallback] providers = {:?} — entries without a working setup are skipped with an",
-            config.fallback.providers
+            "Falling back to {} when the daily quota runs out; change with `smith setup`.",
+            config.fallback.providers.join(", ")
         );
-        println!("error naming what to configure. The 9Router section adds the local gateway.");
     }
     Ok(true)
 }
@@ -523,8 +531,49 @@ async fn setup_ninerouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
             .map_err(color_eyre::eyre::Error::msg)?;
     }
     println!("Gateway answering on {base_url}.");
-    println!("Open http://localhost:20128 in a browser, configure your upstream providers");
-    println!("there, and copy an API key from its dashboard.\n");
+
+    // A gateway with no upstreams answers `200 {"data":[]}` and is "healthy"
+    // by every check smith had. It then 404s on the first message with
+    // `No active credentials for provider: openai`, in the middle of a
+    // conversation, which is the worst possible place to learn it. So the
+    // section waits here until the dashboard has something in it.
+    let upstreams = loop {
+        match crate::node_runtime::ninerouter_upstreams(&base_url).await {
+            Ok(models) if !models.is_empty() => break models,
+            Ok(_) => {
+                println!("The gateway is running but routes to nothing yet.");
+                println!("Open http://localhost:20128, add a provider under `Providers`,");
+                println!("then come back — smith will check again.");
+            }
+            Err(e) => println!("Could not read the gateway's model list: {e}"),
+        }
+        let again = Confirm::with_theme(theme)
+            .with_prompt("Check again?")
+            .default(true)
+            .interact_opt()?;
+        if again != Some(true) {
+            println!("Section left unchanged — a gateway with no providers cannot answer.");
+            return Ok(false);
+        }
+    };
+    println!(
+        "{} models available through the gateway.\n",
+        upstreams.len()
+    );
+
+    // Offer them. `auto` used to be written unconditionally, and this gateway
+    // does not have a model by that name: it was resolved to a provider called
+    // `openai` with no credentials, which is where the 404 came from. It is
+    // still offered when the gateway itself lists it.
+    let Some(model) = select_model(
+        theme,
+        &upstreams.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?
+    else {
+        return Ok(false);
+    };
+
+    println!("Copy an API key from the dashboard at http://localhost:20128.\n");
 
     let existing_key = config.nine_router.api_key.clone();
     let prompt = match &existing_key {
@@ -549,13 +598,11 @@ async fn setup_ninerouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
         config.nine_router.base_url = Some(base_url);
     }
     config.general.provider = Some("9router".to_string());
-    config.general.model = Some(
-        config
-            .nine_router
-            .model
-            .clone()
-            .unwrap_or_else(|| "auto".to_string()),
-    );
+    // Both, because `[9router] model` is what a *fallback* chain entry reads
+    // and `[general] model` is what the primary uses — writing only one left
+    // the chain asking for something else.
+    config.nine_router.model = Some(model.clone());
+    config.general.model = Some(model);
     Ok(true)
 }
 

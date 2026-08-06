@@ -255,7 +255,49 @@ async fn check_ninerouter(config: &Config) -> Check {
         .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
 
     if crate::node_runtime::ninerouter_healthy(&base_url).await {
-        return Check::ok("9router", format!("gateway answering on {base_url}"));
+        // Answering is not the same as being able to serve. A gateway with no
+        // upstreams returns `200 {"data":[]}` and used to be reported OK here
+        // — for exactly the state that 404s on the first message.
+        return match crate::node_runtime::ninerouter_upstreams(&base_url).await {
+            Ok(models) if !models.is_empty() => {
+                // The catalogue is in hand, so the configured model can be
+                // checked against it rather than assumed. This is the actual
+                // 404: smith shipped `auto` as the only 9router model, and no
+                // gateway has one by that name — it resolved to a provider
+                // with no credentials, mid-conversation.
+                let configured = config
+                    .nine_router
+                    .model
+                    .as_deref()
+                    .or(config.general.model.as_deref());
+                match configured {
+                    Some(model) if !models.iter().any(|m| m == model) => Check::fail(
+                        "9router",
+                        format!("`{model}` is not one of the {} models this gateway routes to", models.len()),
+                        format!(
+                            "run `smith setup` and pick one it has, e.g. `{}` — an unknown model \
+                             is refused as `No active credentials` rather than as `no such model`",
+                            models.first().map(String::as_str).unwrap_or("<none>")
+                        ),
+                    ),
+                    _ => Check::ok(
+                        "9router",
+                        format!("{} models via the gateway on {base_url}", models.len()),
+                    ),
+                }
+            }
+            Ok(_) => Check::fail(
+                "9router",
+                "gateway is running but routes to nothing",
+                "open http://localhost:20128 and add a provider under `Providers` — \
+                 until then every request 404s with `No active credentials`",
+            ),
+            Err(e) => Check::warn(
+                "9router",
+                format!("gateway answering, but its model list did not parse: {e}"),
+                "check the gateway's own logs at ~/.smith/runtime/9router/node_modules/9router/gateway.log",
+            ),
+        };
     }
 
     let node = crate::node_runtime::find_node(&config.runtime);
