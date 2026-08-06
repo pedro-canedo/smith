@@ -36,7 +36,12 @@ const OPENAI_MODEL_LIMITS: &[(&str, u32, u32)] = &[
     ("o3", 200_000, 100_000),
 ];
 
-/// Ollama's own default `num_ctx`.
+/// Ollama's own default `num_ctx`, for a **local** model.
+///
+/// A cloud model (`:cloud`, proxied to ollama.com) is the exception and is
+/// handled in `warm_capabilities`: it has no local allocation to be truncated
+/// by, and `/api/tags` advertises its real window — 262144 for
+/// `nemotron-3-super:cloud`, which this constant would understate sixtyfold.
 ///
 /// The real window is whatever the *local* server allocates, which depends on
 /// the Modelfile, the `num_ctx` override, and how much VRAM the box has — none
@@ -405,6 +410,35 @@ impl LlmProvider for OpenAiProvider {
         if self.flavor != Flavor::Ollama {
             return;
         }
+
+        // A cloud model is proxied to ollama.com, so there is no local
+        // `num_ctx` allocation to be truncated by — the reason
+        // `OLLAMA_CONTEXT_WINDOW` is deliberately pessimistic does not apply
+        // to it. `/api/show` also does not answer for one, so probing it can
+        // only produce the 4096 guess: `nemotron-3-super:cloud` really has
+        // 262144, and reporting 4096 makes the gauge and auto-compaction both
+        // wrong by a factor of sixty.
+        //
+        // The catalogue is the one place that says so, and it says it for
+        // every model at once, so one call warms them all.
+        if let Ok(models) = crate::ollama::ollama_tags(&self.base_url).await {
+            if let Ok(mut known) = self.known_windows.write() {
+                for entry in models.iter().filter(|m| m.is_cloud) {
+                    if let Some(window) = entry.context_window {
+                        known.insert(entry.name.clone(), window);
+                    }
+                }
+            }
+            // A cloud model needs nothing further; the local probe below is
+            // about an allocation it does not have.
+            if models
+                .iter()
+                .any(|m| m.name == model && m.is_cloud && m.context_window.is_some())
+            {
+                return;
+            }
+        }
+
         let Some(window) = self.probe_ollama_window(model).await else {
             // Left unset on purpose: `known_window` then answers with the
             // conservative default, which is the right way to be wrong.

@@ -566,21 +566,47 @@ async fn setup_ollama(theme: &ColorfulTheme, config: &mut Config) -> color_eyre:
         return Ok(false);
     }
 
-    let Some(model) = select_model(theme, known_models("ollama"))? else {
+    // The daemon has to be up before it can be asked what it has.
+    ensure_ollama_running().await?;
+
+    let base_url = config
+        .ollama
+        .base_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string());
+    let live = smith_provider::ollama_tags(&base_url)
+        .await
+        .unwrap_or_default();
+
+    let Some(model) = pick_ollama_model(theme, &live)? else {
         return Ok(false);
     };
 
-    ensure_ollama_running().await?;
+    // A cloud model is proxied to ollama.com; there are no weights to fetch,
+    // and `ollama pull` on one is either a no-op or an error depending on the
+    // version. A local one still needs its gigabytes.
+    let is_cloud = live
+        .iter()
+        .find(|m| m.name == model)
+        .map(|m| m.is_cloud)
+        .unwrap_or_else(|| model.ends_with(":cloud"));
 
-    println!("Pulling {model} (this can take a while)...");
-    let status = tokio::process::Command::new("ollama")
-        .arg("pull")
-        .arg(&model)
-        .stdin(Stdio::null())
-        .status()
-        .await?;
-    if !status.success() {
-        color_eyre::eyre::bail!("`ollama pull {model}` failed");
+    if !is_cloud {
+        println!("Pulling {model} (this can take a while)...");
+        let status = tokio::process::Command::new("ollama")
+            .arg("pull")
+            .arg(&model)
+            .stdin(Stdio::null())
+            .status()
+            .await?;
+        if !status.success() {
+            // Not fatal, deliberately: a four-gigabyte download that failed
+            // should not throw away a wizard section, the same way a failed
+            // browser provision does not. Same treatment as `section_browser`.
+            println!("`ollama pull {model}` failed — section left unchanged.");
+            println!("Fix the pull (disk space? network?) and re-run `smith setup`.");
+            return Ok(false);
+        }
     }
 
     config.general.provider = Some("ollama".to_string());
@@ -589,6 +615,50 @@ async fn setup_ollama(theme: &ColorfulTheme, config: &mut Config) -> color_eyre:
         config.ollama.base_url = Some(DEFAULT_OLLAMA_BASE_URL.to_string());
     }
     Ok(true)
+}
+
+/// Offers what the daemon actually has, cloud first.
+///
+/// The wizard used to show nine hardcoded names, so a machine's own models
+/// were invisible and one keypress picked something it had never pulled. The
+/// static list survives as the fallback for a daemon that did not answer —
+/// and says that it is a fallback, the way the OpenRouter section already
+/// does when its catalogue call fails.
+fn pick_ollama_model(
+    theme: &ColorfulTheme,
+    live: &[smith_provider::OllamaModel],
+) -> color_eyre::Result<Option<String>> {
+    if live.is_empty() {
+        println!("Could not read the local model list — showing the built-in one.");
+        return select_model(theme, known_models("ollama"));
+    }
+
+    // Cloud first: those are the ones that need no VRAM and no download, so
+    // they are what a machine that just installed ollama can actually run.
+    // Within each group, a model that cannot call tools sorts last — it is
+    // offered, but it is not what the cursor lands on.
+    let mut ordered: Vec<&smith_provider::OllamaModel> = live.iter().collect();
+    ordered.sort_by_key(|m| (!m.is_cloud, !m.supports_tools));
+
+    let mut items: Vec<String> = ordered.iter().map(|m| m.summary()).collect();
+    items.push("Other (type a model name)".to_string());
+
+    let Some(idx) = Select::with_theme(theme)
+        .with_prompt("Model")
+        .items(&items)
+        .default(0)
+        .interact_opt()?
+    else {
+        return Ok(None);
+    };
+    if idx == ordered.len() {
+        let custom: String = Input::with_theme(theme)
+            .with_prompt("Model name")
+            .interact_text()?;
+        let custom = custom.trim().to_string();
+        return Ok((!custom.is_empty()).then_some(custom));
+    }
+    Ok(Some(ordered[idx].name.clone()))
 }
 
 // ---- section: web search ----------------------------------------------------

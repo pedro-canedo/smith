@@ -25,7 +25,12 @@ pub const OPENROUTER_MODELS: &[&str] = &[
 /// which is the mode its own docs lead with.
 const NINEROUTER_MODELS: &[&str] = &["auto"];
 const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3"];
+/// Only the fallback for a daemon that did not answer — the wizard reads
+/// `/api/tags` first, because what a machine has pulled is a fact and this is
+/// a guess. Cloud models lead: they need no VRAM and no download, so they are
+/// what a fresh install can actually run.
 const OLLAMA_MODELS: &[&str] = &[
+    "nemotron-3-super:cloud",
     "llama3.3",
     "llama3.2",
     "qwen2.5",
