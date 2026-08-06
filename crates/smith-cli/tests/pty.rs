@@ -17,6 +17,11 @@
 //!
 //! `--panic-now` is `cfg(debug_assertions)` and hidden, so this apparatus does
 //! not exist in a release build.
+//!
+//! Like `headless_cli.rs` next door, this is one of the two justified
+//! exceptions to the repository's inline-tests rule: the property under test
+//! belongs to the process and its terminal, not to any function inside the
+//! crate.
 
 /// Alternate screen off (`CSI ? 1049 l`).
 const LEAVE_ALT_SCREEN: &str = "\x1b[?1049l";

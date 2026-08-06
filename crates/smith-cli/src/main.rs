@@ -764,7 +764,11 @@ async fn run_headless(cli: Cli) -> u8 {
         prompt,
         format: cli.output_format.unwrap_or_default(),
         allowed_tools: cli.allowed_tools.iter().cloned().collect::<BTreeSet<_>>(),
-        color: use_color() && !cli.plain,
+        color: headless_color(
+            std::env::var_os("NO_COLOR").as_deref(),
+            std::io::stderr().is_terminal(),
+            cli.plain,
+        ),
         provider: startup.provider_kind.label().to_string(),
         model: startup.model.clone(),
     };
@@ -781,13 +785,6 @@ async fn run_headless(cli: Cli) -> u8 {
     .await;
     orchestrator.abort();
     code
-}
-
-fn use_color() -> bool {
-    color_enabled(
-        std::env::var_os("NO_COLOR").as_deref(),
-        std::io::stderr().is_terminal(),
-    )
 }
 
 /// The palette this run paints in.
@@ -830,6 +827,17 @@ fn term_is_dumb(term: Option<&std::ffi::OsStr>) -> bool {
 fn color_enabled(no_color: Option<&std::ffi::OsStr>, stderr_is_tty: bool) -> bool {
     let disabled = no_color.is_some_and(|v| !v.is_empty());
     !disabled && stderr_is_tty
+}
+
+/// Whether a headless run styles its chrome.
+///
+/// Split out of the `HeadlessOptions` literal so `--plain`'s promise is a
+/// testable function rather than an `&&` nobody can reach. It matters because
+/// the flag's whole point is the case a redirected run cannot exercise: on a
+/// real terminal `color_enabled` is already true, so `--plain` is the only
+/// thing standing between a screen reader and a stream of escape sequences.
+fn headless_color(no_color: Option<&std::ffi::OsStr>, stderr_is_tty: bool, plain: bool) -> bool {
+    color_enabled(no_color, stderr_is_tty) && !plain
 }
 
 /// Everything piped in, or `None` when stdin is a terminal (nobody piped
@@ -1246,6 +1254,37 @@ mod tests {
             Some(OutputFormat::StreamJson)
         );
         assert_eq!(cli(&["-p", "x"]).output_format, None);
+    }
+
+    /// `--plain` promises a screen reader "no chrome, no colour escapes".
+    ///
+    /// The case that matters is the one a redirected run cannot reach: on a
+    /// real terminal `color_enabled` is already true, so the flag is the only
+    /// thing suppressing the escapes. A test that only ever saw a pipe would
+    /// pass for a `--plain` that did nothing at all.
+    #[test]
+    fn plain_suppresses_colour_on_a_real_terminal() {
+        let tty = true;
+        assert!(
+            headless_color(None, tty, false),
+            "a terminal is styled by default"
+        );
+        assert!(
+            !headless_color(None, tty, true),
+            "--plain is the whole promise of the flag"
+        );
+    }
+
+    /// The two ways to ask for the same thing must not disagree.
+    #[test]
+    fn no_color_and_plain_each_suffice_and_compose() {
+        let one = std::ffi::OsString::from("1");
+        assert!(!headless_color(Some(&one), true, false), "NO_COLOR alone");
+        assert!(!headless_color(None, false, false), "a pipe alone");
+        assert!(!headless_color(Some(&one), true, true), "both together");
+        // An *empty* NO_COLOR is not a request: the spec is presence-with-value.
+        let empty = std::ffi::OsString::new();
+        assert!(headless_color(Some(&empty), true, false));
     }
 
     #[test]
