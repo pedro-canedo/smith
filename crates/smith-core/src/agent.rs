@@ -440,6 +440,13 @@ pub struct Agent {
     /// How many agents deep this one is: 0 for the one the user talks to, 1
     /// for a child it spawned via `task`. See [`subagent::MAX_DEPTH`].
     subagent_depth: u32,
+    /// Messages the user typed while this turn was already running.
+    ///
+    /// Shared with whoever drives the agent, because the driver cannot reach
+    /// the `Agent` mid-turn: the orchestrator holds it behind a `Mutex` that
+    /// stays locked for the whole of `run_turn`. Same shape as the cancel
+    /// token, and for the same reason.
+    interjections: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// True when no human is watching — a headless run. See the two places
     /// that read it: the scratch-write exemption and the `task` gate, both of
     /// which are justified by interactive friction that does not exist here.
@@ -510,6 +517,7 @@ impl Agent {
             reasoning_tags_stripped: 0,
             subagent_depth: 0,
             unattended: false,
+            interjections: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             subagent_definitions: Vec::new(),
             subagent_tool_budget: 0,
             turn_deadline: None,
@@ -562,6 +570,27 @@ impl Agent {
     }
 
     /// 0 for the agent the user talks to; 1 inside a subagent.
+    /// The queue a driver pushes mid-turn user messages onto.
+    ///
+    /// Handed out rather than written through, because `run_turn` borrows the
+    /// agent mutably for its whole duration — a caller holding a clone of this
+    /// can speak to a turn that is already in flight.
+    pub fn interjection_queue(&self) -> Arc<std::sync::Mutex<std::collections::VecDeque<String>>> {
+        self.interjections.clone()
+    }
+
+    /// Takes whatever the user said since the last round, if anything.
+    ///
+    /// A poisoned lock yields nothing rather than panicking: losing an
+    /// interjection is recoverable — the user can say it again — and killing
+    /// the turn is not.
+    fn take_interjections(&self) -> Vec<String> {
+        let Ok(mut queue) = self.interjections.lock() else {
+            return Vec::new();
+        };
+        queue.drain(..).collect()
+    }
+
     /// Marks this agent as running with nobody at the terminal.
     pub fn with_unattended(mut self, unattended: bool) -> Self {
         self.unattended = unattended;
@@ -1071,6 +1100,24 @@ impl Agent {
                 let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::Idle));
                 let _ = events.send(AgentEvent::Error("cancelled".into()));
                 return false;
+            }
+
+            // Anything the user typed since the last round joins the
+            // conversation here, as an ordinary user message.
+            //
+            // At a round boundary specifically: the messages list has just
+            // been left consistent (assistant message pushed, every `tool_use`
+            // answered), so inserting one cannot strand a tool call. Injecting
+            // mid-stream would.
+            //
+            // It is a plain user message, with no wrapper telling the model
+            // what to do with it. Whether "also handle the errors" changes the
+            // job in flight or adds a new one is exactly the judgement a model
+            // is for, and a framing that pre-decided it would be wrong half
+            // the time — the user knows which they meant and wrote it that way.
+            for text in self.take_interjections() {
+                let _ = events.send(AgentEvent::UserInterjected(text.clone()));
+                self.messages.push(Message::user_text(text));
             }
 
             // Checked here, at a round boundary, because that is the only
@@ -6576,6 +6623,110 @@ mod tests {
 
     /// What `--resume` does: the restored total is whatever the store recorded,
     /// and this turn's freshly computed cost accumulates on top of it.
+    /// A message typed mid-turn reaches the model *during* that turn, at the
+    /// next round boundary — not after it, by which point the work it was
+    /// meant to redirect is already done.
+    #[tokio::test]
+    async fn an_interjection_joins_the_turn_it_was_typed_into() {
+        let provider = Arc::new(
+            ScriptedProvider::tool_call_then_text(
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "a.txt"}),
+                "done",
+            )
+            .with_id("anthropic"),
+        );
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(
+            provider.clone(),
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            tool_ctx,
+        )
+        .with_permission_policy(PermissionPolicy::Skip);
+
+        // Queued before the turn starts, which is the same thing the driver
+        // does mid-turn — the point is that `run_turn` reads it per round.
+        agent
+            .interjection_queue()
+            .lock()
+            .unwrap()
+            .push_back("also handle the errors".to_string());
+
+        run_collect(&mut agent, "fix the parser", CancellationToken::new()).await;
+
+        let sent = provider.last_request().unwrap();
+        assert!(
+            sent.messages
+                .iter()
+                .any(|m| m.text() == "also handle the errors"),
+            "the interjection never reached the model: {:?}",
+            sent.messages.iter().map(|m| m.text()).collect::<Vec<_>>()
+        );
+        // As a plain user message, with nothing wrapped around it telling the
+        // model what to conclude: whether it redirects the work or adds to it
+        // is the judgement the model is there to make.
+        assert!(agent
+            .history()
+            .iter()
+            .any(|m| m.role == Role::User && m.text() == "also handle the errors"));
+    }
+
+    /// It is announced, so a frontend can show *when* it landed rather than
+    /// leaving the user wondering whether it was seen.
+    #[tokio::test]
+    async fn an_interjection_is_announced_when_it_lands() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply("ok")]).with_id("anthropic"));
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(
+            provider,
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            tool_ctx,
+        );
+        agent
+            .interjection_queue()
+            .lock()
+            .unwrap()
+            .push_back("one more thing".to_string());
+
+        let (_, events) = run_collect(&mut agent, "go", CancellationToken::new()).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::UserInterjected(t) if t == "one more thing")),
+            "no announcement: {events:?}"
+        );
+    }
+
+    /// The queue drains completely: two messages typed in quick succession
+    /// must not leave one behind for a turn that may never come.
+    #[tokio::test]
+    async fn every_pending_interjection_lands_in_the_same_round() {
+        let provider = Arc::new(ScriptedProvider::streams([text_reply("ok")]).with_id("anthropic"));
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(
+            provider.clone(),
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            tool_ctx,
+        );
+        {
+            let queue = agent.interjection_queue();
+            let mut queue = queue.lock().unwrap();
+            queue.push_back("first".to_string());
+            queue.push_back("second".to_string());
+        }
+
+        run_collect(&mut agent, "go", CancellationToken::new()).await;
+
+        let sent = provider.last_request().unwrap();
+        let texts: Vec<String> = sent.messages.iter().map(|m| m.text()).collect();
+        assert!(texts.contains(&"first".to_string()), "{texts:?}");
+        assert!(texts.contains(&"second".to_string()), "{texts:?}");
+    }
+
     #[tokio::test]
     async fn a_resumed_session_keeps_accumulating_from_its_restored_total() {
         let provider = Arc::new(

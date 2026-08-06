@@ -1423,8 +1423,15 @@ impl App {
                     let text = self.input.take();
                     self.slash_selected = 0;
                     self.remember_prompt(&text);
-                    self.queued.push_back(text);
-                    return None;
+                    // Held here *and* sent. The queue is the record of what
+                    // has not landed yet: the agent folds an interjection in
+                    // at its next round boundary, and a turn already on its
+                    // last round has no next boundary — so anything still
+                    // waiting when the turn ends is sent as its own turn
+                    // instead. Without the fallback, speaking to a turn that
+                    // was about to finish would drop the message silently.
+                    self.queued.push_back(text.clone());
+                    return Some(Action::Interject(text));
                 }
                 // A highlighted path is accepted rather than submitted — the
                 // list is on screen precisely because the caret is mid-token,
@@ -2611,6 +2618,15 @@ impl App {
                 // is the occupancy of a single window that compaction resets.
                 // Adding one to the other would be meaningless.
                 self.context = Some((used, window, estimated));
+            }
+            AgentEvent::UserInterjected(text) => {
+                // It is part of the conversation now, so it becomes a real
+                // user bubble and leaves the pending list.
+                if let Some(at) = self.queued.iter().position(|q| *q == text) {
+                    self.queued.remove(at);
+                }
+                self.lines.push(ChatLine::new(ChatRole::User, text));
+                self.request_count += 1;
             }
             AgentEvent::SessionCost {
                 usd,

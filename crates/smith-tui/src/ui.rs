@@ -1465,7 +1465,7 @@ fn draw_queue(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         lines.push(Line::from(Span::styled(
             format!(
-                "  {} queued — sent when this turn ends  \u{b7}  /queue clear to drop",
+                "  {} waiting — the agent picks it up between steps  \u{b7}  /queue clear",
                 app.queued.len()
             ),
             theme.disabled(),

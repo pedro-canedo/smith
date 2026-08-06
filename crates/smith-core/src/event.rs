@@ -109,6 +109,12 @@ pub struct ResourceStats {
 pub enum Action {
     SubmitMessage(String),
     CancelGeneration,
+    /// A message typed while a turn was already running. Delivered *into* that
+    /// turn at its next round boundary, so the model can decide whether it
+    /// changes the job in flight or adds a new one — rather than waiting for
+    /// the turn to end, by which point the work it was meant to redirect is
+    /// already done.
+    Interject(String),
     PermissionResponse(PermissionDecision),
     /// `provider: None` keeps the current provider and just changes the
     /// model; `Some(p)` rebuilds the agent against a different provider
@@ -215,6 +221,11 @@ pub enum AgentEvent {
     UserQuestionNeeded(UserQuestion),
     /// Coarse status for the activity line / chrome.
     PhaseChanged(AgentPhase),
+    /// A message the user typed while the turn was already running, now
+    /// folded into it. Emitted so a frontend can show *when* it landed —
+    /// between rounds — rather than leaving the user guessing whether it was
+    /// seen at all.
+    UserInterjected(String),
     TokenUsage(Usage),
     /// Money spent by this session so far, in USD.
     ///

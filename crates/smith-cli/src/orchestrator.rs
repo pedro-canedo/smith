@@ -727,6 +727,13 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         checkpoints,
     }));
 
+    // Taken before the loop, because `state` is locked for the duration of
+    // every turn and this has to be reachable while one is running.
+    let interjections = {
+        let guard = state.lock().await;
+        guard.agent.interjection_queue()
+    };
+
     let mut current_cancel: Option<CancellationToken> = None;
 
     while let Some(action) = action_rx.recv().await {
@@ -753,6 +760,15 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
             Action::CancelGeneration => {
                 if let Some(cancel) = current_cancel.take() {
                     cancel.cancel();
+                }
+            }
+            Action::Interject(text) => {
+                // Pushed onto the shared queue rather than through the agent:
+                // `run_turn` holds the state lock for the whole turn, so the
+                // only way to reach a turn in flight is a handle taken before
+                // it started — the same reason the cancel token lives here.
+                if let Ok(mut queue) = interjections.lock() {
+                    queue.push_back(text);
                 }
             }
             Action::SwitchModel {
