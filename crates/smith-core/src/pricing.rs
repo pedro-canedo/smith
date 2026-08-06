@@ -87,6 +87,19 @@ const PRICES: &[(&str, &str, ModelPrice)] = &[
 /// nothing per token but whose electricity we are not going to invent a
 /// number for.
 pub fn price_for(provider: &str, model: &str) -> Option<ModelPrice> {
+    // OpenRouter's `:free` variants are genuinely $0 — a fact, not a gap.
+    // Without this rule every free turn would land in `unpriced_turns` and
+    // the UI would report "N turns of unknown cost" for a cost that is
+    // exactly known. Scoped to the provider id: a `:free` suffix elsewhere
+    // is somebody's naming scheme, not OpenRouter's price contract.
+    if provider == "openrouter" && model.ends_with(":free") {
+        return Some(ModelPrice {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        });
+    }
     PRICES
         .iter()
         .find(|(p, m, _)| *p == provider && model.starts_with(m))
@@ -111,6 +124,27 @@ pub fn cost_usd(provider: &str, model: &str, usage: &Usage) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    /// `:free` on OpenRouter is a price contract, not a naming scheme.
+    #[test]
+    fn openrouter_free_models_price_to_exactly_zero() {
+        let usage = one_million_each();
+        assert_eq!(
+            cost_usd(
+                "openrouter",
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+                &usage
+            ),
+            Some(0.0)
+        );
+        // A paid OpenRouter model has no row: unknown, not zero.
+        assert_eq!(
+            cost_usd("openrouter", "anthropic/claude-sonnet-5", &usage),
+            None
+        );
+        // The suffix elsewhere is somebody's naming scheme, not a price.
+        assert_eq!(cost_usd("ollama", "something:free", &usage), None);
+    }
+
     use super::*;
 
     fn one_million_each() -> Usage {

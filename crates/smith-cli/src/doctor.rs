@@ -186,25 +186,12 @@ pub async fn run() -> u8 {
 
 /// Every credential this process can see, so none can reach stdout.
 ///
-/// Mirrors `orchestrator::secret_redactor`, which is private to that module.
+/// The one in `orchestrator` — no longer a hand-kept mirror. The mirror
+/// existed because that function was private, and the moment a new provider
+/// key joined one list but not the other, a doctor report would have printed
+/// it. Deleting the copy is what makes that impossible.
 fn redactor_for(config: &Config) -> Redactor {
-    let from_env = [
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "EXA_API_KEY",
-        "TAVILY_API_KEY",
-    ]
-    .into_iter()
-    .filter_map(|k| std::env::var(k).ok());
-    let from_config = [
-        config.anthropic.api_key.clone(),
-        config.openai.api_key.clone(),
-        config.exa.api_key.clone(),
-        config.tavily.api_key.clone(),
-    ]
-    .into_iter()
-    .flatten();
-    Redactor::new(from_env.chain(from_config))
+    crate::orchestrator::secret_redactor(config)
 }
 
 /// The full check list, in the order it prints.
@@ -218,6 +205,11 @@ pub async fn diagnose(cwd: &Path, config: &Config) -> Report {
     let key = resolve_api_key(config, provider);
     report.push(check_api_key(provider, &key));
     report.push(check_provider_reachable(config, provider, key.value()).await);
+    if provider == ProviderKind::Openrouter {
+        if let Some(key) = key.value() {
+            report.push(check_openrouter_quota(config, key).await);
+        }
+    }
 
     // Always run, not only when Ollama is the configured provider: it is the
     // zero-cost path someone falls back to, and "can I use it?" is worth
@@ -243,6 +235,83 @@ impl Report {
             self.push(check_mcp_server(server).await);
         }
     }
+}
+
+/// How much of the OpenRouter quota is left — the question a rate-limited
+/// user actually runs doctor to answer. `GET /api/v1/key` reports usage,
+/// limit and free-tier status for the key making the request.
+async fn check_openrouter_quota(config: &Config, key: &str) -> Check {
+    let base = config
+        .openrouter
+        .base_url
+        .clone()
+        .unwrap_or_else(|| smith_config::DEFAULT_OPENROUTER_BASE_URL.to_string());
+    let url = format!("{}/key", base.trim_end_matches('/'));
+
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    else {
+        return Check::warn(
+            "openrouter quota",
+            "could not build an HTTP client to ask with",
+            "This does not affect normal runs.",
+        );
+    };
+
+    let response = match client.get(&url).bearer_auth(key).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Check::warn(
+                "openrouter quota",
+                format!("{url} unreachable: {e}"),
+                "Quota could not be checked; requests may still work.",
+            )
+        }
+    };
+    if !response.status().is_success() {
+        return Check::warn(
+            "openrouter quota",
+            format!("{url} answered {}", response.status()),
+            "Quota could not be checked; requests may still work.",
+        );
+    }
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return Check::warn(
+            "openrouter quota",
+            "unparseable /key response",
+            "Quota could not be checked; requests may still work.",
+        );
+    };
+
+    Check::ok("openrouter quota", describe_openrouter_key(&body))
+}
+
+/// Renders `/api/v1/key`'s payload as one factual line. Pure, so the shapes
+/// OpenRouter actually returns can be pinned in tests.
+fn describe_openrouter_key(body: &serde_json::Value) -> String {
+    let data = body.get("data").unwrap_or(body);
+    let usage = data.get("usage").and_then(|v| v.as_f64());
+    let limit = data.get("limit").and_then(|v| v.as_f64());
+    let free_tier = data
+        .get("is_free_tier")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut parts: Vec<String> = Vec::new();
+    match (usage, limit) {
+        (Some(u), Some(l)) => parts.push(format!("${u:.2} used of ${l:.2} credit limit")),
+        (Some(u), None) => parts.push(format!("${u:.2} used, no credit limit set")),
+        _ => parts.push("usage not reported".to_string()),
+    }
+    if free_tier {
+        parts.push(
+            "free tier: 20 req/min and 50 free-model requests/day (1000/day after a one-time \
+             $10 top-up)"
+                .to_string(),
+        );
+    }
+    parts.join(" — ")
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +390,7 @@ fn check_provider_selected(config: &Config, provider: ProviderKind) -> Check {
         Some(name) if ProviderKind::from_config_str(name).is_none() => Check::fail(
             "provider",
             format!("config names an unknown provider `{name}`"),
-            "Set `provider` under [general] to one of: anthropic, openai, ollama — or re-run \
+            "Set `provider` under [general] to one of: anthropic, openai, openrouter, 9router, ollama — or re-run \
              `smith setup`. Until then smith silently falls back to anthropic.",
         ),
         Some(_) => Check::ok("provider", format!("{} / {model}", provider.label())),
@@ -381,6 +450,8 @@ pub fn resolve_api_key(config: &Config, provider: ProviderKind) -> ResolvedKey {
     let (var, from_config) = match provider {
         ProviderKind::Anthropic => ("ANTHROPIC_API_KEY", config.anthropic.api_key.clone()),
         ProviderKind::Openai => ("OPENAI_API_KEY", config.openai.api_key.clone()),
+        ProviderKind::Openrouter => ("OPENROUTER_API_KEY", config.openrouter.api_key.clone()),
+        ProviderKind::NineRouter => ("NINEROUTER_API_KEY", config.nine_router.api_key.clone()),
         // A local daemon has no credential; "no key" is the healthy state.
         ProviderKind::Ollama => {
             return ResolvedKey {
@@ -421,6 +492,8 @@ pub fn check_api_key(provider: ProviderKind, key: &ResolvedKey) -> Check {
             let var = match provider {
                 ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
                 ProviderKind::Openai => "OPENAI_API_KEY",
+                ProviderKind::Openrouter => "OPENROUTER_API_KEY",
+                ProviderKind::NineRouter => "NINEROUTER_API_KEY",
                 ProviderKind::Ollama => unreachable!("ollama resolves to NotNeeded above"),
             };
             Check::fail(
@@ -460,6 +533,32 @@ async fn check_provider_reachable(
         }
         ProviderKind::Openai => {
             let url = "https://api.openai.com/v1/models".to_string();
+            let mut req = client.get(&url);
+            if let Some(key) = key {
+                req = req.bearer_auth(key);
+            }
+            (url, req)
+        }
+        ProviderKind::Openrouter => {
+            let base = config
+                .openrouter
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_OPENROUTER_BASE_URL.to_string());
+            let url = format!("{}/models", base.trim_end_matches('/'));
+            let mut req = client.get(&url);
+            if let Some(key) = key {
+                req = req.bearer_auth(key);
+            }
+            (url, req)
+        }
+        ProviderKind::NineRouter => {
+            let base = config
+                .nine_router
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
+            let url = format!("{}/models", base.trim_end_matches('/'));
             let mut req = client.get(&url);
             if let Some(key) = key {
                 req = req.bearer_auth(key);
@@ -1187,7 +1286,7 @@ mod tests {
             .remedy
             .as_ref()
             .unwrap()
-            .contains("anthropic, openai, ollama"));
+            .contains("anthropic, openai, openrouter, 9router, ollama"));
     }
 
     #[test]

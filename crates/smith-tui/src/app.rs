@@ -1912,14 +1912,26 @@ impl App {
 
         let (provider, model) = match spec.split_once('/') {
             Some((p, m)) => {
-                if !smith_store::is_known_provider(p) {
+                if smith_store::is_known_provider(p) {
+                    (Some(p.to_string()), m.to_string())
+                } else if matches!(self.provider_label.as_str(), "openrouter" | "9router") {
+                    // Model ids on these providers contain slashes
+                    // (`qwen/qwen3-coder:free`), so under an active gateway
+                    // session an unknown prefix is a *namespace*, not a typo'd
+                    // provider — `/model qwen/qwen3-coder:free` must work.
+                    // Under any other provider the old strictness stands: a
+                    // typo must not silently become a model name.
+                    (None, spec.to_string())
+                } else {
                     self.lines.push(ChatLine::new(
                         ChatRole::System,
-                        format!("unknown provider: {p} (expected anthropic, openai, or ollama)"),
+                        format!(
+                            "unknown provider: {p} (expected anthropic, openai, openrouter, \
+                             9router, or ollama)"
+                        ),
                     ));
                     return None;
                 }
-                (Some(p.to_string()), m.to_string())
             }
             None => (None, spec.to_string()),
         };

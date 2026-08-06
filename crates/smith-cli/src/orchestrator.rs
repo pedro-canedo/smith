@@ -38,6 +38,16 @@ pub fn uuid_fallback() -> String {
 pub enum ProviderKind {
     Anthropic,
     Openai,
+    /// OpenRouter (openrouter.ai) — cloud aggregator with `:free` models.
+    Openrouter,
+    /// 9Router — a local gateway (localhost:20128) that fans out to 40+
+    /// upstream providers with its own internal fallback.
+    ///
+    /// The clap value name is pinned because identifiers cannot start with a
+    /// digit: without it the flag would accept `--provider nine-router`, a
+    /// spelling nothing else (config, docs, the gateway itself) uses.
+    #[value(name = "9router")]
+    NineRouter,
     Ollama,
 }
 
@@ -46,6 +56,10 @@ impl ProviderKind {
         match self {
             ProviderKind::Anthropic => "claude-sonnet-5",
             ProviderKind::Openai => "gpt-4.1",
+            // Head of the curated free chain — see `smith_store::models`.
+            ProviderKind::Openrouter => "nvidia/nemotron-3-ultra-550b-a55b:free",
+            // The gateway routes by its own prefixes; `auto` lets it pick.
+            ProviderKind::NineRouter => "auto",
             ProviderKind::Ollama => "llama3.2",
         }
     }
@@ -54,6 +68,8 @@ impl ProviderKind {
         match self {
             ProviderKind::Anthropic => "anthropic",
             ProviderKind::Openai => "openai",
+            ProviderKind::Openrouter => "openrouter",
+            ProviderKind::NineRouter => "9router",
             ProviderKind::Ollama => "ollama",
         }
     }
@@ -62,6 +78,8 @@ impl ProviderKind {
         match s {
             "anthropic" => Some(ProviderKind::Anthropic),
             "openai" => Some(ProviderKind::Openai),
+            "openrouter" => Some(ProviderKind::Openrouter),
+            "9router" => Some(ProviderKind::NineRouter),
             "ollama" => Some(ProviderKind::Ollama),
             _ => None,
         }
@@ -90,6 +108,45 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
                 })?;
             Ok(Arc::new(OpenAiProvider::new(key)))
         }
+        ProviderKind::Openrouter => {
+            let key = std::env::var("OPENROUTER_API_KEY")
+                .ok()
+                .or_else(|| config.openrouter.api_key.clone())
+                .ok_or_else(|| {
+                    "No OpenRouter API key found. Run `smith setup` (a free key takes a minute \
+                     at https://openrouter.ai/keys), or export OPENROUTER_API_KEY."
+                        .to_string()
+                })?;
+            let base_url = config
+                .openrouter
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_OPENROUTER_BASE_URL.to_string());
+            Ok(Arc::new(
+                OpenAiProvider::openrouter(key, base_url)
+                    .with_fallback_models(config.openrouter.fallback_models.clone()),
+            ))
+        }
+        ProviderKind::NineRouter => {
+            // The dashboard key is required by the gateway; unlike Ollama
+            // there is no keyless path, so a missing one fails naming where
+            // the key lives rather than sending a placeholder that would
+            // bounce with a confusing 401.
+            let key = std::env::var("NINEROUTER_API_KEY")
+                .ok()
+                .or_else(|| config.nine_router.api_key.clone())
+                .ok_or_else(|| {
+                    "No 9Router API key found. Run `smith setup`, or copy one from the local \
+                     dashboard (http://localhost:20128) and export NINEROUTER_API_KEY."
+                        .to_string()
+                })?;
+            let base_url = config
+                .nine_router
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
+            Ok(Arc::new(OpenAiProvider::nine_router(key, base_url)))
+        }
         ProviderKind::Ollama => {
             let base_url = config
                 .ollama
@@ -107,10 +164,12 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
 /// Both the environment and the config file are read, because either can be
 /// the live one for a given provider (`build_provider` prefers the env var)
 /// and a stale value in the other is still a real secret worth hiding.
-fn secret_redactor(config: &Config) -> Redactor {
+pub(crate) fn secret_redactor(config: &Config) -> Redactor {
     let from_env = [
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "NINEROUTER_API_KEY",
         "EXA_API_KEY",
         "TAVILY_API_KEY",
     ]
@@ -120,6 +179,8 @@ fn secret_redactor(config: &Config) -> Redactor {
     let from_config = [
         config.anthropic.api_key.clone(),
         config.openai.api_key.clone(),
+        config.openrouter.api_key.clone(),
+        config.nine_router.api_key.clone(),
         config.exa.api_key.clone(),
         config.tavily.api_key.clone(),
     ]
@@ -1081,6 +1142,56 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
 
 #[cfg(test)]
 mod tests {
+    /// The clap value name is pinned because identifiers cannot start with a
+    /// digit — without `#[value(name = "9router")]` the flag would demand
+    /// `--provider nine-router`, a spelling nothing else uses.
+    #[test]
+    fn provider_labels_round_trip_including_the_digit_led_one() {
+        use clap::ValueEnum;
+        for kind in [
+            ProviderKind::Anthropic,
+            ProviderKind::Openai,
+            ProviderKind::Openrouter,
+            ProviderKind::NineRouter,
+            ProviderKind::Ollama,
+        ] {
+            assert_eq!(
+                ProviderKind::from_config_str(kind.label()),
+                Some(kind),
+                "label {} does not round-trip",
+                kind.label()
+            );
+            assert_eq!(
+                ProviderKind::from_str(kind.label(), false),
+                Ok(kind),
+                "clap value name diverges from the config label for {}",
+                kind.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_openrouter_key_errs_naming_the_env_var_and_the_free_key_url() {
+        let config = Config::default();
+        std::env::remove_var("OPENROUTER_API_KEY");
+        let Err(err) = build_provider(ProviderKind::Openrouter, &config) else {
+            panic!("a keyless openrouter build must fail");
+        };
+        assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
+        assert!(err.contains("openrouter.ai/keys"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_ninerouter_key_errs_naming_the_dashboard() {
+        let config = Config::default();
+        std::env::remove_var("NINEROUTER_API_KEY");
+        let Err(err) = build_provider(ProviderKind::NineRouter, &config) else {
+            panic!("a keyless 9router build must fail");
+        };
+        assert!(err.contains("NINEROUTER_API_KEY"), "{err}");
+        assert!(err.contains("localhost:20128"), "{err}");
+    }
+
     use super::*;
     use crate::headless::{self, HeadlessOptions, OutputFormat, EXIT_LIMIT, EXIT_OK};
     use smith_core::testkit::{text_reply, tool_call_reply, ScriptedProvider, ScriptedResponse};

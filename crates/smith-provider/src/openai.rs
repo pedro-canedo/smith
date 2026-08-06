@@ -23,6 +23,8 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 enum Flavor {
     OpenAi,
     Ollama,
+    OpenRouter,
+    NineRouter,
 }
 
 /// Context window and max-output tokens per model, matched by prefix so dated
@@ -46,6 +48,12 @@ const OPENAI_MODEL_LIMITS: &[(&str, u32, u32)] = &[
 /// 128K here would let compaction sail past a limit that is really 4096 —
 /// exactly the failure this default exists to prevent.
 const OLLAMA_CONTEXT_WINDOW: u32 = 4096;
+/// Floor for OpenRouter/9Router models whose real window has not been probed
+/// yet. Higher than Ollama's because these are hosted models, never a local
+/// `num_ctx 4096` truncation — but still far below what most free models
+/// advertise, for the same reason Ollama's guess is low: overclaiming lets
+/// compaction sail past a real limit.
+const GATEWAY_CONTEXT_WINDOW: u32 = 32_768;
 /// Pulls `num_ctx` out of Ollama's flat `parameters` blob (`"num_ctx 8192"`,
 /// one setting per line).
 fn parse_num_ctx(parameters: &str) -> Option<u32> {
@@ -110,6 +118,12 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     base_url: String,
     flavor: Flavor,
+    /// OpenRouter's server-side fallback chain, injected into the request
+    /// body as `models` + `route: "fallback"`. Held on the provider rather
+    /// than on `CompletionRequest`: it is session configuration, and the
+    /// request structs are built in dozens of places that should not know
+    /// an OpenRouter-specific concept exists.
+    fallback_models: Vec<String>,
     /// Context windows learned from Ollama's own `/api/show`, keyed by model.
     ///
     /// A fact beats the constant below every time it is available. Empty until
@@ -125,8 +139,40 @@ impl OpenAiProvider {
             client: http_client(),
             base_url: DEFAULT_BASE_URL.to_string(),
             flavor: Flavor::OpenAi,
+            fallback_models: Vec::new(),
             known_windows: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// The server-side chain for OpenRouter's `route: "fallback"`. Ignored by
+    /// every other flavor.
+    pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {
+        self.fallback_models = models;
+        self
+    }
+
+    /// The wire body for one request: the shared OpenAI shape, plus — on the
+    /// OpenRouter flavor with a configured chain — the server-side fallback.
+    ///
+    /// `models[0]` is always the request's own model, deduplicated against
+    /// the chain, so what the agent asked for is what the server tries first
+    /// and a `/model` switch reorders the chain instead of fighting it.
+    fn request_body(&self, request: &CompletionRequest) -> serde_json::Value {
+        let mut body = build_request_body(request);
+        if self.flavor == Flavor::OpenRouter && !self.fallback_models.is_empty() {
+            let mut chain: Vec<&str> = vec![request.model.as_str()];
+            chain.extend(
+                self.fallback_models
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|m| *m != request.model),
+            );
+            if chain.len() > 1 {
+                body["models"] = serde_json::json!(chain);
+                body["route"] = serde_json::json!("fallback");
+            }
+        }
+        body
     }
 
     /// The window `/api/show` reported for this model, or the conservative
@@ -196,12 +242,37 @@ impl OpenAiProvider {
         provider.flavor = Flavor::Ollama;
         provider
     }
+
+    /// OpenRouter — the same wire format on a different host, plus the
+    /// attribution headers and the `models`/`route` fallback body.
+    pub fn openrouter(api_key: String, base_url: impl Into<String>) -> Self {
+        let mut provider = Self::new(api_key).with_base_url(base_url);
+        provider.flavor = Flavor::OpenRouter;
+        provider
+    }
+
+    /// 9Router — a local gateway speaking the OpenAI wire format.
+    pub fn nine_router(api_key: String, base_url: impl Into<String>) -> Self {
+        let mut provider = Self::new(api_key).with_base_url(base_url);
+        provider.flavor = Flavor::NineRouter;
+        provider
+    }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     fn id(&self) -> &'static str {
-        "openai"
+        // Flavor-driven, and that is a bug fix rather than plumbing: this id
+        // is what `Agent::note_usage` prices against and what lands in the
+        // `turns.provider` column, so the old hardcoded "openai" recorded
+        // every Ollama session as an OpenAI one. The dollars were right (no
+        // price row matched either way); the label was not.
+        match self.flavor {
+            Flavor::OpenAi => "openai",
+            Flavor::Ollama => "ollama",
+            Flavor::OpenRouter => "openrouter",
+            Flavor::NineRouter => "9router",
+        }
     }
 
     async fn warm_capabilities(&self, model: &str) {
@@ -222,6 +293,17 @@ impl LlmProvider for OpenAiProvider {
         match self.flavor {
             Flavor::OpenAi => openai_capabilities(model),
             Flavor::Ollama => ollama_capabilities(self.known_window(model)),
+            // Same shape as Ollama: a probed window when we have one (the
+            // OpenRouter catalogue warm lands in a later phase), else a
+            // conservative floor. Conservative is the safe way to be wrong —
+            // it only costs an early compaction until the warm answers.
+            Flavor::OpenRouter | Flavor::NineRouter => ollama_capabilities(
+                self.known_windows
+                    .read()
+                    .ok()
+                    .and_then(|known| known.get(model).copied())
+                    .unwrap_or(GATEWAY_CONTEXT_WINDOW),
+            ),
         }
     }
 
@@ -230,7 +312,7 @@ impl LlmProvider for OpenAiProvider {
         request: CompletionRequest,
         _cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let body = build_request_body(&request);
+        let body = self.request_body(&request);
 
         let resp = self
             .client
@@ -477,6 +559,75 @@ fn messages_to_wire(messages: &[Message], system: Option<&str>) -> Vec<serde_jso
 
 #[cfg(test)]
 mod tests {
+    /// Pins the id fix: this string prices turns and labels the
+    /// `turns.provider` column, and it used to say "openai" for everyone.
+    #[test]
+    fn every_flavor_reports_its_own_id() {
+        assert_eq!(OpenAiProvider::new("k".into()).id(), "openai");
+        assert_eq!(OpenAiProvider::ollama("http://x/v1").id(), "ollama");
+        assert_eq!(
+            OpenAiProvider::openrouter("k".into(), "http://x/v1").id(),
+            "openrouter"
+        );
+        assert_eq!(
+            OpenAiProvider::nine_router("k".into(), "http://x/v1").id(),
+            "9router"
+        );
+    }
+
+    /// The chain rides the body only on OpenRouter, only when configured,
+    /// and always with the request's own model first.
+    #[test]
+    fn the_fallback_chain_is_serialized_the_openrouter_way() {
+        let request = CompletionRequest {
+            model: "nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+            system: None,
+            messages: vec![Message::user_text("hi")],
+            tools: Vec::new(),
+            max_tokens: 128,
+            temperature: None,
+        };
+
+        let chained =
+            OpenAiProvider::openrouter("k".into(), "http://x/v1").with_fallback_models(vec![
+                // Includes the primary on purpose: it must be deduplicated,
+                // not sent twice.
+                "nvidia/nemotron-3-ultra-550b-a55b:free".into(),
+                "poolside/laguna-s-2.1:free".into(),
+            ]);
+        let body = chained.request_body(&request);
+        assert_eq!(body["route"], "fallback");
+        let models: Vec<&str> = body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            models,
+            [
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "poolside/laguna-s-2.1:free"
+            ]
+        );
+
+        // No chain -> no OpenRouter-specific keys at all.
+        let plain = OpenAiProvider::openrouter("k".into(), "http://x/v1");
+        let body = plain.request_body(&request);
+        assert!(body.get("models").is_none());
+        assert!(body.get("route").is_none());
+
+        // Another flavor with a chain configured (nonsensical, but cheap to
+        // defend): the body stays plain OpenAI.
+        let ollama = {
+            let mut p = OpenAiProvider::ollama("http://x/v1");
+            p.fallback_models = vec!["whatever".into()];
+            p
+        };
+        let body = ollama.request_body(&request);
+        assert!(body.get("models").is_none());
+    }
+
     /// Exercises the real `/api/show` against a running Ollama. Ignored, like
     /// the other live tests: it needs a server and a pulled model.
     ///

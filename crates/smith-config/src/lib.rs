@@ -39,6 +39,17 @@ pub struct Config {
     #[serde(default)]
     pub openai: ProviderSecrets,
     #[serde(default)]
+    pub openrouter: OpenRouterSettings,
+    /// TOML section `[9router]` — a bare key may start with a digit, but a
+    /// Rust identifier may not, hence the rename.
+    #[serde(default, rename = "9router")]
+    pub nine_router: NineRouterSettings,
+    /// Where smith itself goes when the active provider's *account* quota
+    /// exhausts mid-session. Distinct from `[openrouter] fallback_models`,
+    /// which is OpenRouter's own server-side chain between its models.
+    #[serde(default)]
+    pub fallback: FallbackSettings,
+    #[serde(default)]
     pub ollama: OllamaSettings,
     /// API key for Exa (https://dashboard.exa.ai), the primary `web_search`
     /// backend. Optional — without it, `web_search` still tries Exa's
@@ -132,6 +143,34 @@ pub struct General {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderSecrets {
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenRouterSettings {
+    pub api_key: Option<String>,
+    /// Override of the public endpoint, for proxies.
+    pub base_url: Option<String>,
+    /// Server-side per-request chain (`models` + `route: "fallback"` in the
+    /// request body). First entry is the model smith drives; the rest are
+    /// OpenRouter's own fallbacks. Empty = plain single-model requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NineRouterSettings {
+    pub api_key: Option<String>,
+    /// Defaults to the gateway's own default port on localhost.
+    pub base_url: Option<String>,
+    /// Model id to request through the gateway.
+    pub model: Option<String>,
+}
+
+/// `[fallback] providers = ["9router", "ollama"]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FallbackSettings {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -258,6 +297,8 @@ pub struct McpServerConfig {
 }
 
 pub const OLLAMA_HOST: &str = "http://127.0.0.1:11434";
+pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub const DEFAULT_NINEROUTER_BASE_URL: &str = "http://localhost:20128/v1";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 
 /// `~/.smith` — the only place secrets live. Session history is stored
@@ -360,6 +401,33 @@ impl Config {
         }
         self.ollama.base_url = other.ollama.base_url.or(self.ollama.base_url.take());
 
+        let OpenRouterSettings {
+            api_key,
+            base_url,
+            fallback_models,
+        } = other.openrouter;
+        self.openrouter.api_key = api_key.or(self.openrouter.api_key.take());
+        self.openrouter.base_url = base_url.or(self.openrouter.base_url.take());
+        // Wholesale when stated: a chain is an ordered whole, and merging two
+        // orders element-wise would produce one nobody wrote.
+        if !fallback_models.is_empty() {
+            self.openrouter.fallback_models = fallback_models;
+        }
+
+        let NineRouterSettings {
+            api_key,
+            base_url,
+            model,
+        } = other.nine_router;
+        self.nine_router.api_key = api_key.or(self.nine_router.api_key.take());
+        self.nine_router.base_url = base_url.or(self.nine_router.base_url.take());
+        self.nine_router.model = model.or(self.nine_router.model.take());
+
+        let FallbackSettings { providers } = other.fallback;
+        if !providers.is_empty() {
+            self.fallback.providers = providers;
+        }
+
         let SearchSettings {
             backend,
             searxng_url,
@@ -437,6 +505,63 @@ fn set_permissions(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Pins the serde rename: the section is `[9router]` (a TOML bare key may
+    /// start with a digit), not `[nine_router]`.
+    #[test]
+    fn the_9router_section_round_trips_under_its_digit_led_name() {
+        let mut config = Config::default();
+        config.nine_router.api_key = Some("k".into());
+        config.nine_router.model = Some("auto".into());
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[9router]"), "{text}");
+        assert!(!text.contains("[nine_router]"), "{text}");
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.nine_router.api_key.as_deref(), Some("k"));
+    }
+
+    /// The TOML ordering trap: a config carrying the new sections *and* an
+    /// array-of-tables must serialize to something this same struct reads
+    /// back — a plain table emitted after `[[mcp_servers]]` would not.
+    #[test]
+    fn new_sections_survive_alongside_mcp_servers() {
+        let mut config = Config::default();
+        config.openrouter.api_key = Some("or".into());
+        config.openrouter.fallback_models = vec!["a:free".into(), "b:free".into()];
+        config.fallback.providers = vec!["9router".into(), "ollama".into()];
+        config.mcp_servers.push(McpServerConfig {
+            name: "docs".into(),
+            command: "server".into(),
+            ..Default::default()
+        });
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.openrouter.fallback_models, ["a:free", "b:free"]);
+        assert_eq!(parsed.fallback.providers, ["9router", "ollama"]);
+        assert_eq!(parsed.mcp_servers.len(), 1);
+    }
+
+    /// A chain is an ordered whole: the project layer replaces it or leaves
+    /// it alone, never merges element-wise.
+    #[test]
+    fn fallback_chains_merge_wholesale_not_elementwise() {
+        let mut global = Config::default();
+        global.openrouter.fallback_models = vec!["g1".into(), "g2".into()];
+        global.fallback.providers = vec!["ollama".into()];
+
+        // Silent project keeps the global chain.
+        let mut merged = global.clone();
+        merged.merge_over(Config::default());
+        assert_eq!(merged.openrouter.fallback_models, ["g1", "g2"]);
+        assert_eq!(merged.fallback.providers, ["ollama"]);
+
+        // A stated project chain replaces it outright.
+        let mut project = Config::default();
+        project.openrouter.fallback_models = vec!["p1".into()];
+        let mut merged = global.clone();
+        merged.merge_over(project);
+        assert_eq!(merged.openrouter.fallback_models, ["p1"]);
+    }
+
     use super::*;
 
     #[test]
