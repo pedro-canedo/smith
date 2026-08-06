@@ -10,6 +10,7 @@ use crate::components::input::TextInput;
 use ratatui::layout::Rect;
 
 use crate::complete::{self, CompletionKind};
+use crate::keymap::{KeyAction, KeyMap};
 use crate::logbuf::LogBuffer;
 use crate::slash::SlashRegistry;
 use crate::theme::Theme;
@@ -466,6 +467,9 @@ pub struct TuiConfig {
     /// Custom slash commands discovered under `.smith/commands/` and
     /// `~/.smith/commands/`. Empty for a frontend that does not load them.
     pub commands: SlashRegistry,
+    /// Key bindings for the remappable commands. `KeyMap::default()` is the
+    /// set that used to be hardcoded.
+    pub keys: KeyMap,
     /// Prompts already submitted in this project, most recent first. Empty
     /// for a fresh session; on `--resume` it is the resumed conversation's
     /// own user messages.
@@ -644,6 +648,9 @@ pub struct App {
     /// Latest local-machine resource snapshot (Ollama only; `None` for
     /// token-billed providers, which show a cost estimate instead).
     pub resources: Option<ResourceStats>,
+    /// Which key runs which discretionary command. Defaults to what used to
+    /// be hardcoded; `[keys]` in the config moves any of them.
+    pub keys: KeyMap,
     /// Where the transcript was drawn last frame, so a click can be turned
     /// into a row in it. Recorded by `ui::draw_messages`, which is the only
     /// place that knows the rect.
@@ -757,6 +764,7 @@ impl App {
             usage: Usage::default(),
             context: None,
             resources: None,
+            keys: config.keys,
             message_area: Rect::default(),
             file_index: None,
             completion_kind: CompletionKind::default(),
@@ -1199,7 +1207,9 @@ impl App {
             };
         }
 
-        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('l') {
+        let bound = self.keys.action_for(code, modifiers);
+
+        if bound == Some(KeyAction::ToggleLogs) {
             self.toggle_log_panel();
             return None;
         }
@@ -1240,20 +1250,21 @@ impl App {
             }
         }
 
-        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('o') {
+        if bound == Some(KeyAction::ToggleCardFocus) {
             self.toggle_card_focus();
             return None;
         }
 
-        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('b') {
+        if bound == Some(KeyAction::ToggleSidebar) {
             self.sidebar_visible = !self.sidebar_visible;
             return None;
         }
 
-        // `Shift+Tab` arrives as its own key code, so it never competes with
-        // the `Tab` that accepts a slash completion. Cycling a hidden sidebar
-        // would be a keystroke with no visible effect, so it reveals it first.
-        if code == KeyCode::BackTab {
+        // Bound to `Shift+Tab` by default, which arrives as its own key code
+        // and so never competes with the `Tab` that accepts a slash
+        // completion. Cycling a hidden sidebar would be a keystroke with no
+        // visible effect, so it reveals it first.
+        if bound == Some(KeyAction::CycleSidebarTab) {
             if self.sidebar_visible {
                 self.sidebar_tab = self.sidebar_tab.next();
             } else {
@@ -1333,9 +1344,7 @@ impl App {
                 self.input.insert_newline();
                 None
             }
-            KeyCode::Char('j')
-                if modifiers.contains(KeyModifiers::CONTROL) && !self.waiting_on_assistant =>
-            {
+            _ if bound == Some(KeyAction::InsertNewline) && !self.waiting_on_assistant => {
                 self.input.insert_newline();
                 None
             }
@@ -2808,6 +2817,7 @@ mod tests {
             goal: None,
             tasks: Vec::new(),
             commands,
+            keys: Default::default(),
             history: Vec::new(),
             logs: LogBuffer::default(),
         })
@@ -3511,6 +3521,20 @@ mod tests {
         });
         assert_eq!(app.overlay.as_ref().unwrap().scroll, 3);
         assert_eq!(app.scroll, 10, "the transcript stayed put");
+    }
+
+    /// The motivating case for remappable keys: tmux owns Ctrl+B by default,
+    /// so a tmux user cannot press it at all.
+    #[test]
+    fn a_remapped_key_takes_effect_and_the_old_one_goes_inert() {
+        let mut app = test_app();
+        app.keys = crate::keymap::KeyMap::from_overrides([("toggle_sidebar", "ctrl+t")]).unwrap();
+
+        app.on_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(app.sidebar_visible, "the old binding did nothing");
+
+        app.on_key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!app.sidebar_visible, "the new binding works");
     }
 
     #[test]

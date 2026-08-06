@@ -722,6 +722,41 @@ pub async fn probe_version(binary: &Path) -> Result<String, String> {
     if !binary.is_file() {
         return Err(format!("{} does not exist", binary.display()));
     }
+    // `ETXTBSY` here is a race, not a broken download, and retrying is the
+    // only fix there is.
+    //
+    // We have just written this file. If *any* process anywhere still holds a
+    // write descriptor to it, `execve` refuses. `O_CLOEXEC` — which Rust sets
+    // — does not close the window: between `fork` and `exec`, an unrelated
+    // child spawned by another thread holds an inherited copy of our write
+    // descriptor, and it is only dropped when that child reaches its own
+    // `exec`. A concurrent `run_bash`, an MCP server starting, or simply
+    // another test is enough.
+    //
+    // The window is microseconds, so a few short retries close it completely;
+    // a genuinely unrunnable binary still fails, just a few milliseconds later.
+    const ETXTBSY_RETRIES: usize = 5;
+    for attempt in 0..ETXTBSY_RETRIES {
+        match probe_version_once(binary).await {
+            Err(e) if is_text_file_busy(&e) && attempt + 1 < ETXTBSY_RETRIES => {
+                tokio::time::sleep(Duration::from_millis(20 * (attempt as u64 + 1))).await;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
+}
+
+/// Whether a `probe_version_once` failure was the `ETXTBSY` race above.
+///
+/// Matched on the raw errno rather than the message: the text is localised on
+/// a machine with a non-English locale, and a substring match would silently
+/// stop retrying there.
+fn is_text_file_busy(error: &str) -> bool {
+    error.contains("os error 26")
+}
+
+async fn probe_version_once(binary: &Path) -> Result<String, String> {
     let run = tokio::process::Command::new(binary)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -1569,6 +1604,24 @@ mod tests {
 
         let printed = String::from_utf8(out).unwrap();
         assert!(printed.contains("151.0.7922.76"), "{printed}");
+    }
+
+    /// `ETXTBSY` is a race against an unrelated `fork`, so it must be retried
+    /// rather than reported as a broken download.
+    #[test]
+    fn the_text_file_busy_race_is_recognised_by_errno_not_by_wording() {
+        assert!(is_text_file_busy(
+            "could not run /tmp/x: Text file busy (os error 26)"
+        ));
+        // The same errno with a localised message still has to be caught.
+        assert!(is_text_file_busy(
+            "could not run /tmp/x: Arquivo de texto ocupado (os error 26)"
+        ));
+        // A genuinely broken binary must not be retried forever.
+        assert!(!is_text_file_busy(
+            "could not run /tmp/x: Exec format error (os error 8)"
+        ));
+        assert!(!is_text_file_busy("--version exited with exit status: 127"));
     }
 
     /// Re-running setup must not re-download 100 MB, and must not disturb a

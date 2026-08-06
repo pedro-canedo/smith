@@ -1255,6 +1255,7 @@ mod tests {
                 goal: None,
                 tasks: Vec::new(),
                 commands: crate::slash::SlashRegistry::builtin(),
+                keys: Default::default(),
                 history: Vec::new(),
                 logs: crate::logbuf::LogBuffer::default(),
             });

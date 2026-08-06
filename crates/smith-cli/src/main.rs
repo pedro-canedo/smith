@@ -491,6 +491,10 @@ struct Startup {
     /// in `[theme.colors]` is reported by every invocation — including the
     /// headless one, which is where a CI config is usually first typed.
     theme: Theme,
+    /// Resolved key bindings. Like the theme, resolved for both frontends so
+    /// a typo in `[keys]` is reported even by a headless run that will never
+    /// press a key.
+    keys: smith_tui::KeyMap,
 }
 
 impl Startup {
@@ -535,6 +539,10 @@ impl Startup {
         )?;
         let commands = smith_config::CommandSet::discover(&cwd, &smith_tui::slash::builtin_names());
         let theme = tui_theme(cli.ascii, cli.theme.as_deref(), &config.theme)?;
+        let keys = smith_tui::KeyMap::from_overrides(
+            config.keys.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .map_err(|e| format!("smith: {e}"))?;
 
         let session_store = SessionStore::open(&cwd).ok();
         let (session_id, initial_messages, idle_hint, initial_goal) =
@@ -554,6 +562,7 @@ impl Startup {
             persona,
             commands,
             theme,
+            keys,
         })
     }
 
@@ -643,6 +652,7 @@ async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         initial_lines,
         permission_policy: startup.permission_policy,
         theme: startup.theme.clone(),
+        keys: startup.keys.clone(),
         goal: startup.initial_goal.clone(),
         tasks: last_write_tasks_call(&startup.initial_messages),
         history: prompt_history(&startup.initial_messages),

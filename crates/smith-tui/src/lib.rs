@@ -5,6 +5,7 @@ pub mod banner;
 pub mod complete;
 pub mod components;
 pub mod highlight;
+pub mod keymap;
 pub mod logbuf;
 pub mod markdown;
 pub mod slash;
@@ -22,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use app::{App, ChatLine, ChatRole, IdleHint, TuiConfig};
 pub use complete::CompletionKind;
+pub use keymap::{KeyAction, KeyMap, KeyMapError};
 pub use logbuf::{LogBuffer, LogLevel, LogLine};
 pub use theme::{Theme, ThemeError, ThemeName};
 

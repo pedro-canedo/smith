@@ -59,6 +59,11 @@ pub struct Config {
     /// inside `[theme.colors]`.
     #[serde(default)]
     pub theme: ThemeSettings,
+    /// Key bindings for the TUI's discretionary commands, `action = "key"`.
+    /// Serializes as a plain table of scalars, so it must stay ahead of
+    /// `runtime` for the same reason `theme` does.
+    #[serde(default, skip_serializing_if = "KeySettings::is_empty")]
+    pub keys: KeySettings,
     /// Third-party binaries `smith setup` provisioned into `~/.smith/runtime`.
     /// Must stay ahead of `mcp_servers`: TOML forbids a plain table after an
     /// array of tables, so a field serialized after it would produce a file
@@ -191,6 +196,15 @@ pub struct ThemeSettings {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub colors: std::collections::BTreeMap<String, String>,
 }
+
+/// `[keys]` — `action = "key"`, e.g. `toggle_sidebar = "ctrl+t"`.
+///
+/// Held as free-form strings rather than parsed here on purpose: this crate
+/// is a leaf that knows nothing about `crossterm`, and the set of valid
+/// actions belongs to the TUI. `smith-tui::KeyMap::from_overrides` validates
+/// it, and an unknown action or unparseable key is a startup error naming the
+/// offender.
+pub type KeySettings = std::collections::BTreeMap<String, String>;
 
 /// Where `smith setup` put the runtimes it provisioned.
 ///
@@ -361,6 +375,10 @@ impl Config {
         let ThemeSettings { name, colors } = other.theme;
         self.theme.name = name.or(self.theme.name.take());
         self.theme.colors.extend(colors);
+
+        // Per key, not wholesale: a project rebinding one command should not
+        // silently drop the user's global bindings for the others.
+        self.keys.extend(other.keys);
 
         let RuntimeSettings {
             chromium_path,

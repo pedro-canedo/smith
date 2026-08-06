@@ -109,6 +109,29 @@ desconhecido, token desconhecido ou hex inválido **abortam a inicialização**
 com código 2 — um tema que ignora metade do que o config pediu é pior que um
 que se recusa a subir.
 
+### 1.5.2 Teclas remapeáveis (`[keys]`)
+
+`action = "tecla"`, ex. `toggle_sidebar = "ctrl+t"`. Cinco ações:
+`toggle_sidebar`, `cycle_sidebar_tab`, `toggle_logs`, `toggle_card_focus`,
+`insert_newline`.
+
+**Por que existe:** `Ctrl+B` é o prefixo padrão do tmux — o multiplexador come
+a tecla antes de o smith ver o byte. `Ctrl+O` é `discard` numa disciplina de
+linha termios padrão e comando de painel no screen. Não são colisões
+hipotéticas: são a configuração de fábrica dos dois programas com mais chance
+de estarem em volta de um agente de terminal.
+
+**Por que só cinco.** `Enter`, `Esc`, `Backspace` e as setas ficam de fora: 
+remapear o que submete, cancela e edita transforma um erro de configuração num
+terminal onde não se digita nem se sai. `Ctrl+C` também fica — é checado antes
+de todo o resto exatamente para sempre haver uma saída, e um arquivo que
+pudesse movê-lo poderia removê-lo.
+
+Ação desconhecida, tecla impossível de parsear, ou duas ações na mesma tecla →
+erro de inicialização nomeando o culpado, nunca fallback silencioso. Duas ações
+numa tecla é sempre engano, e qual das duas para de funcionar não é previsível
+a partir do arquivo.
+
 ### 1.6 Glifos (tokens de caractere)
 
 Mesma lógica das cores, para o outro eixo de capacidade do terminal.
@@ -243,13 +266,42 @@ Esquerda: `cwd git:(branch)` `secondary` · centro: fase + spinner `ember`
 quando ocupado · direita: `v0.1.0 · ~$0.0123 (est.)` `disabled`.
 
 ### 2.9 `Sidebar`
-Headers UPPERCASE `secondary`; valores `primary`; barra de progresso e
-`▶` de task em `ember`; `PLAN MODE` chip `plan`; números de token `primary`
-com breakdown `secondary`.
+Abas `Session` / `Tasks` / `Vitals` (widget `Tabs`) na primeira linha do
+painel; a aba ativa em `ember` bold, as demais `disabled`, divisor = o glifo
+de régua vertical do tema. Headers UPPERCASE `secondary`; valores `primary`;
+barra de progresso e `▶` de task em `ember`; `PLAN MODE` chip `plan`; números
+de token `primary` com breakdown `secondary`.
+
+**Por que abas e não uma coluna só.** As quatro seções empilhadas pedem mais
+linhas do que um terminal de 24 tem depois do prompt e da status bar — a 80x24
+as de baixo simplesmente não existiam. A aba troca "ver tudo, truncado" por
+"ver uma coisa, inteira", que é a troca certa num painel de 28 colunas. O
+divisor é a régua vertical e não o `·` do tema porque ` · ` mais o espaço que
+o ratatui põe de cada lado custa cinco colunas por divisor: com três abas
+seriam 28 num painel de 27, e todos os títulos apareceriam cortados em quatro
+letras para caber dois espaços.
+
+Largura: os títulos completos cabem em 27 colunas; abaixo disso caem para as
+quatro primeiras letras. Cortar via clipping do `Tabs` não serve — ele descarta
+o último título inteiro, produzindo uma aba selecionável e invisível.
+
+### 2.9.1 `Overlay` (painel de leitura)
+`/usage` e `/mcp` como `Table` real, `Ctrl+L` como linhas. Caixa centrada,
+borda `ember`, título `ember_bold`, fundo `raised`; cabeçalho de coluna
+`info_bold`; rodapé `disabled` com `(scrollable)` em `warning` só quando há
+o que alcançar abaixo.
+
+**Não é uma variante de `Modal`.** Todo variante de `Modal` carrega um
+`oneshot` em que o agente está bloqueado; um quarto variante deixaria `/usage`
+substituir um pedido de permissão pendente e travar o turno para sempre. Vive
+em campo próprio e cede a tela a qualquer modal de verdade.
 
 ### 2.10 `SlashSuggest`
 Selecionada: bg `hover` + `›` + nome bold `info`; demais `secondary`; linha de
-hint `disabled`.
+hint `disabled`. A mesma lista serve `@caminho`: muda só o prefixo impresso
+(`/` ou `@`) e o padding do nome — um caminho é a entrada inteira e não tem
+descrição, então alinhá-lo à coluna de um comando só empurraria tudo à
+direita.
 
 ### 2.11 `JumpPill`
 Se `follow_bottom == false` e chega evento novo: chip flutuante no canto
