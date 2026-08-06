@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 pub use app::{App, ChatLine, ChatRole, IdleHint, TuiConfig};
 pub use theme::Theme;
 
-const SPINNER_INTERVAL: Duration = Duration::from_millis(120);
+const SPINNER_INTERVAL: Duration = Duration::from_millis(app::SPINNER_INTERVAL_MS as u64);
 
 /// Drives the terminal UI until the user quits. `action_tx` carries user
 /// intent out to the orchestrator; `agent_events`, `permission_asks`, and

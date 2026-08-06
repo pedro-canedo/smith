@@ -76,7 +76,7 @@ impl TranscriptCache {
         lines: &[ChatLine],
         in_flight: Option<&str>,
         key: &LayoutKey,
-        spinner: &str,
+        spinner_frame: usize,
     ) {
         self.misses = 0;
         self.in_flight_miss = false;
@@ -107,7 +107,7 @@ impl TranscriptCache {
                     &key.theme,
                     key.width,
                     key.verbose,
-                    spinner,
+                    spinner_frame,
                 ),
             };
             self.misses += 1;
@@ -210,6 +210,18 @@ impl TranscriptCache {
         out
     }
 
+    /// `(first row, row count)` of the `i`th `ChatLine` in the document, or
+    /// `None` if the memo doesn't cover it yet.
+    ///
+    /// This is the height index answering a question it was already carrying:
+    /// scrolling a selected card into view needs its extent, and re-measuring
+    /// the document to find it would undo the whole point of the memo.
+    pub fn entry_rows(&self, index: usize) -> Option<(usize, usize)> {
+        let start = *self.offsets.get(index)?;
+        let end = *self.offsets.get(index + 1)?;
+        Some((start, end - start))
+    }
+
     /// Entries rebuilt by the most recent `sync` — 0 means a full cache hit.
     pub fn misses(&self) -> usize {
         self.misses
@@ -265,9 +277,9 @@ mod tests {
     fn a_second_sync_with_nothing_changed_rebuilds_nothing() {
         let lines = transcript(40);
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, None, &key(60, false), "⠋");
+        cache.sync(&lines, None, &key(60, false), 0);
         assert_eq!(cache.misses(), 40);
-        cache.sync(&lines, None, &key(60, false), "⠋");
+        cache.sync(&lines, None, &key(60, false), 0);
         assert_eq!(cache.misses(), 0, "a settled transcript must be a full hit");
     }
 
@@ -277,7 +289,7 @@ mod tests {
         let mut cache = TranscriptCache::default();
 
         crate::markdown::reset_render_calls();
-        cache.sync(&lines, None, &key(80, false), "⠋");
+        cache.sync(&lines, None, &key(80, false), 0);
         let first = crate::markdown::render_calls();
         assert_eq!(
             first, 100,
@@ -286,7 +298,7 @@ mod tests {
 
         crate::markdown::reset_render_calls();
         for _ in 0..10 {
-            cache.sync(&lines, None, &key(80, false), "⠋");
+            cache.sync(&lines, None, &key(80, false), 0);
         }
         assert_eq!(
             crate::markdown::render_calls(),
@@ -331,7 +343,7 @@ mod tests {
         });
 
         let mut cache = TranscriptCache::default();
-        cache.sync(&app.lines, None, &key(60, false), "⠋");
+        cache.sync(&app.lines, None, &key(60, false), 0);
         assert!(
             rendered(&cache).contains('⠋'),
             "card should be spinning: {}",
@@ -343,7 +355,7 @@ mod tests {
             output: "ok".into(),
             is_error: false,
         });
-        cache.sync(&app.lines, None, &key(60, false), "⠋");
+        cache.sync(&app.lines, None, &key(60, false), 0);
         let done = rendered(&cache);
         assert!(
             done.contains('✓') && !done.contains('⠋'),
@@ -372,7 +384,7 @@ mod tests {
             });
         }
         let mut cache = TranscriptCache::default();
-        cache.sync(&app.lines, None, &key(60, true), "⠋");
+        cache.sync(&app.lines, None, &key(60, true), 0);
         assert!(rendered(&cache).contains("segundo"));
 
         // Settled card, cached, then mutated again.
@@ -381,7 +393,7 @@ mod tests {
             output: "terceiro resultado".into(),
             is_error: false,
         });
-        cache.sync(&app.lines, None, &key(60, true), "⠋");
+        cache.sync(&app.lines, None, &key(60, true), 0);
         let text = rendered(&cache);
         assert_eq!(cache.misses(), 1, "the mutated card was not invalidated");
         assert!(text.contains("terceiro"), "stale card content: {text}");
@@ -403,10 +415,10 @@ mod tests {
             is_error: false,
         });
         let mut cache = TranscriptCache::default();
-        cache.sync(&app.lines, None, &key(60, false), "⠋");
+        cache.sync(&app.lines, None, &key(60, false), 0);
 
         app.on_agent_event(smith_core::AgentEvent::Error("boom".into()));
-        cache.sync(&app.lines, None, &key(60, false), "⠋");
+        cache.sync(&app.lines, None, &key(60, false), 0);
         // Only the new "error:" system row — the settled assistant reply and
         // the already-done card must not be re-rendered.
         assert_eq!(cache.misses(), 1);
@@ -422,8 +434,8 @@ mod tests {
             None,
         )];
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, None, &key(60, false), "⠋");
-        cache.sync(&lines, None, &key(60, false), "⠙");
+        cache.sync(&lines, None, &key(60, false), 0);
+        cache.sync(&lines, None, &key(60, false), 1);
         assert_eq!(cache.misses(), 1);
         let text: String = cache.window(0, 20).iter().map(Line::to_string).collect();
         assert!(text.contains('⠙'), "spinner frame did not advance: {text}");
@@ -433,8 +445,8 @@ mod tests {
     fn changing_the_width_invalidates_everything() {
         let lines = transcript(10);
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, None, &key(60, false), "⠋");
-        cache.sync(&lines, None, &key(50, false), "⠋");
+        cache.sync(&lines, None, &key(60, false), 0);
+        cache.sync(&lines, None, &key(50, false), 0);
         assert_eq!(cache.misses(), 10);
     }
 
@@ -442,8 +454,8 @@ mod tests {
     fn toggling_verbose_invalidates_everything() {
         let lines = transcript(10);
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, None, &key(60, false), "⠋");
-        cache.sync(&lines, None, &key(60, true), "⠋");
+        cache.sync(&lines, None, &key(60, false), 0);
+        cache.sync(&lines, None, &key(60, true), 0);
         assert_eq!(cache.misses(), 10);
     }
 
@@ -451,10 +463,10 @@ mod tests {
     fn changing_the_theme_invalidates_everything() {
         let lines = transcript(10);
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, None, &key(60, false), "⠋");
+        cache.sync(&lines, None, &key(60, false), 0);
         let mut truecolor = key(60, false);
         truecolor.theme = Theme::truecolor();
-        cache.sync(&lines, None, &truecolor, "⠋");
+        cache.sync(&lines, None, &truecolor, 0);
         assert_eq!(cache.misses(), 10);
     }
 
@@ -462,11 +474,11 @@ mod tests {
     fn streaming_text_is_re_rendered_only_when_it_actually_grows() {
         let lines = transcript(50);
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, Some("resposta parcial"), &key(60, false), "⠋");
+        cache.sync(&lines, Some("resposta parcial"), &key(60, false), 0);
         assert!(cache.in_flight_miss());
 
         crate::markdown::reset_render_calls();
-        cache.sync(&lines, Some("resposta parcial"), &key(60, false), "⠋");
+        cache.sync(&lines, Some("resposta parcial"), &key(60, false), 0);
         assert!(!cache.in_flight_miss());
         assert_eq!(cache.misses(), 0);
         assert_eq!(
@@ -475,12 +487,7 @@ mod tests {
             "an unchanged stream must not re-parse anything"
         );
 
-        cache.sync(
-            &lines,
-            Some("resposta parcial e mais"),
-            &key(60, false),
-            "⠋",
-        );
+        cache.sync(&lines, Some("resposta parcial e mais"), &key(60, false), 0);
         assert!(cache.in_flight_miss());
         assert_eq!(
             crate::markdown::render_calls(),
@@ -493,9 +500,9 @@ mod tests {
     fn shrinking_the_transcript_drops_the_rows_it_owned() {
         let lines = transcript(10);
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, None, &key(60, false), "⠋");
+        cache.sync(&lines, None, &key(60, false), 0);
         let tall = cache.total_height();
-        cache.sync(&lines[..3], None, &key(60, false), "⠋");
+        cache.sync(&lines[..3], None, &key(60, false), 0);
         assert!(cache.total_height() < tall);
         assert_eq!(cache.misses(), 0, "the surviving prefix is still valid");
     }
@@ -510,7 +517,7 @@ mod tests {
             Some("ok"),
         ));
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, Some("streaming…"), &key(60, false), "⠋");
+        cache.sync(&lines, Some("streaming…"), &key(60, false), 0);
         let total = cache.total_height();
         assert_eq!(cache.window(0, total + 50).len(), total);
         assert_eq!(cache.window(total, 10).len(), 0);
@@ -520,7 +527,7 @@ mod tests {
     fn a_window_is_the_same_slice_the_whole_document_would_give() {
         let lines = transcript(30);
         let mut cache = TranscriptCache::default();
-        cache.sync(&lines, Some("cauda em streaming"), &key(60, false), "⠋");
+        cache.sync(&lines, Some("cauda em streaming"), &key(60, false), 0);
         let all: Vec<String> = cache
             .window(0, cache.total_height())
             .iter()
@@ -548,7 +555,7 @@ mod tests {
         ));
         let mut cache = TranscriptCache::default();
         for width in [24u16, 40, 61, 100] {
-            cache.sync(&lines, Some(&"z".repeat(300)), &key(width, true), "⠋");
+            cache.sync(&lines, Some(&"z".repeat(300)), &key(width, true), 0);
             for row in cache.window(0, cache.total_height()) {
                 assert!(
                     row.width() <= width as usize,

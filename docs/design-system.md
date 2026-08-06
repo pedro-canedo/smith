@@ -63,7 +63,36 @@ fallback ANSI da coluna 3. Um único `Theme` é criado no `App::new` e passado
 por referência para todo `draw_*` — **nenhum `Color::` literal fora de
 `theme.rs`** (hoje são ~60 espalhados).
 
-### 1.6 Espaçamento e tipografia
+### 1.6 Glifos (tokens de caractere)
+
+Mesma lógica das cores, para o outro eixo de capacidade do terminal.
+`Theme::unicode` é detectado uma vez (`LANG`/`LC_ALL`/`LC_CTYPE` contendo
+`UTF-8`, ou `SMITH_ASCII=1` para forçar o fallback) e vive **dentro do
+`Theme`**, não ao lado dele — porque o `Theme` já é chave do memo do
+transcript (`LayoutKey`), então trocar de conjunto de glifos invalida as linhas
+renderizadas de graça, exatamente como trocar de paleta.
+
+| Papel        | Unicode        | ASCII        |
+| ------------ | -------------- | ------------ |
+| spinner      | braille 10 fases | `-` `\` `\|` `/` (4 fases) |
+| tool ok/erro | `✓` / `✗`      | `+` / `x`    |
+| seleção      | `›`            | `>`          |
+| gauge cheio/vazio | `━` / `─`  | `#` / `-`    |
+
+Um glifo ausente na fonte do terminal não vira um caractere errado — vira uma
+**célula em branco**, e um spinner que pisca para nada lê como travamento. Por
+isso o fallback é por conjunto e não por caractere.
+
+**Nenhum literal de glifo novo fora de `theme.rs`.** A regra é a irmã de
+"nenhum `Color::` fora de `theme.rs`" e vale pelo mesmo motivo: o critério de
+aceite #7 exige um terminal 80x24, 16 cores, sem Unicode.
+
+> Dívida conhecida (v1): as bordas `╭╮╰╯│─`, o gutter `▌`/`▏`, a barra de
+> tasks `▰▱`, os ícones de task `▶`/`◻`/`✔` e a JumpPill `↓` ainda são
+> literais em `ui.rs`/`panel.rs`. São o próximo lote a migrar para os tokens
+> acima; nada novo pode ser adicionado a essa lista.
+
+### 1.7 Espaçamento e tipografia
 
 - Largura máx. de conteúdo: 100 colunas (já existe — manter `clamp_width`).
 - 1 linha em branco entre blocos do transcript; 2 antes de bolha de user.
@@ -129,8 +158,9 @@ Estados: `Running | Done | Error | Cancelled`.
 - **Done:** auto-recolhe só para o header (comportamento de mercado — o
   transcript vira um sumário rolável de passos).
 - **Error:** gutter `▌` danger + tail do output truncado a 3 linhas visível.
-- **Expandido** (toggle `Ctrl+O` global em v1): input completo + output com
-  cap de N linhas + `… +N linhas` em `disabled`.
+- **Expandido** (seleção por card + `Enter`, ver 2.13): input completo +
+  output com cap de N linhas + `… +N linhas` em `disabled`. O card selecionado
+  ganha bg `hover` e o marcador `›` na primeira coluna do header.
 
 ### 2.4 `ThoughtRow`
 `+ Thought: 1.1s` em `ember`, 1 linha, entre tool cards — mede o gap entre o
@@ -182,7 +212,125 @@ qualquer tecla de scroll-to-bottom (`End`/scroll ao fim) dispensa.
 
 ---
 
-## 3. Comportamento agentic (entre requisições)
+### 2.12 `ContextGauge`
+
+`LineGauge` de uma linha alimentado por `AgentEvent::ContextUsage
+{ used, window, estimated }`. Cor progressiva por limiar de ocupação —
+`success` < 60%, `warning` em 60–85%, `danger` ≥ 85% — sempre em tokens de
+`theme.rs`. Label à esquerda do traço, com os **números reais**
+(`62% 79k/128k`), porque uma razão sozinha joga fora exatamente o que o
+usuário quer ler.
+
+`estimated` não é decoração: `used` é a contagem de prompt do provider (exata)
+até a última resposta, e a partir daí parte dele é um `chars/4` do delta ainda
+não enviado. Um número estimado é renderizado com `~` colado nele
+(`~62% 79k/128k`) **e**, onde há espaço para uma segunda linha (a sidebar),
+a legenda `~ est. since last reply` em `disabled` logo abaixo. Na context
+strip só o til sobrevive — uma linha é uma linha. Regra geral: nunca desenhar
+estimativa com a mesma tipografia de medida.
+
+O gauge **não anima**. Ele só muda quando chega um `ContextUsage`, e por isso
+não entra em `App::is_animating()` — o loop de eventos continua redesenhando
+zero vezes por segundo em repouso.
+
+### 2.13 Foco de card e throbber por card
+
+**Seleção.** `Ctrl+O` entra no foco de card (seleciona o card de tool mais
+recente) e sai dele; `↑`/`↓` andam entre cards; `Enter` expande/recolhe o
+selecionado; `Esc` sai. O transcript rola sozinho para manter o card
+selecionado visível.
+
+A seleção e a expansão são **campos do próprio `ChatLine`**, não do `App`, e
+mudam através de mutadores que chamam `touch()`. É isso que as mantém fora do
+`LayoutKey`: um flag de expansão global na chave invalidaria o transcript
+inteiro a cada `Enter`, enquanto um stamp novo invalida exatamente um card. A
+seleção sobrevive a linhas novas chegando durante o streaming porque nada é
+indexado por posição — o flag anda com a linha.
+
+**Throbber.** Cada card deriva sua fase do próprio `started_at`
+(`elapsed / SPINNER_INTERVAL`), não de um contador global — dois tools que
+começaram em momentos diferentes têm que girar defasados, senão a tela informa
+"uma coisa está acontecendo" em vez de "estas N coisas estão acontecendo".
+Cards sem `started_at` caem no contador global. Isso não custa nada ao memo:
+um card `Running` já é excluído dele por `is_animating()`.
+
+---
+
+## 3. Layout compacto — o contrato de 80x24
+
+Critério de aceite #7: *roda em 80x24, 16 cores, sem Unicode; tudo legível e
+navegável.* Esta seção é normativa: **todo widget novo tem que se encaixar
+nela antes de ser escrito**, porque adaptar depois é o que faz esse critério
+falhar tarde.
+
+### 3.1 Faixas de largura
+
+`SIDEBAR_MIN_TERMINAL_WIDTH = 80` é o único breakpoint de largura, e 80 fica
+**dentro** da faixa completa (`>=`), não fora dela — 80x24 é o alvo do
+critério, então é a faixa completa que ele tem que satisfazer.
+
+| Faixa | Largura | Sidebar | Transcript | Vitais |
+| ----- | ------- | ------- | ---------- | ------ |
+| completa | `w >= 80` | 28 col à direita | `min(w - 28, 100)` | na sidebar |
+| compacta | `48 <= w < 80` | **não desenhada** | `min(w, 100)` | na *context strip* |
+| mínima | `w < 48` | não | `w` | strip só com o gauge; status bar perde `cwd git:(branch)` e a versão |
+
+A regra que dá sentido às três: **nada que só exista na sidebar pode ser o
+único lugar onde um vital vive.** Quando a sidebar some, o que ela carregava
+não some junto — desce para a *context strip*.
+
+### 3.2 A context strip
+
+Uma linha, entre o transcript e o input, desenhada **apenas** quando não há
+sidebar e há algo para mostrar. Conteúdo, em ordem de prioridade, cortando da
+direita para a esquerda conforme a largura:
+
+1. `ContextGauge` (2.12) — o único item que sobrevive à faixa mínima;
+2. `tasks 3/8`;
+3. `12.4 tok/s`;
+4. `~$0.0123` (ou `CPU 42%` quando o provider é local e há `ResourceStats`).
+
+O que é **descartado** e não reaparece em lugar nenhum abaixo de 80 colunas:
+o breakdown `in / out` de tokens, a lista de tasks pendentes (vira só a
+contagem), e o bloco `MACHINE` completo (vira `CPU %`). São detalhes de
+inspeção, não vitais de turno.
+
+### 3.3 Orçamento vertical
+
+Alocação por **prioridade**, não por posição — cada passo só gasta o que
+sobrou do anterior:
+
+| # | Região | Reserva |
+| - | ------ | ------- |
+| 1 | status bar | 1 linha, sempre |
+| 2 | input | `INPUT_MIN_ROWS` (3), sempre |
+| 3 | transcript | piso de 8 linhas, ou tudo que sobrar num terminal mais baixo |
+| 4 | context strip | 1 linha, só se `h >= 20` e não há sidebar |
+| 5 | sugestões de slash | até 6 + 1 de hint, do que sobrar — e só ela pode tomar emprestado do piso do transcript, até o piso relaxado de 4, quando não caberia de outro jeito |
+| 6 | crescimento do input | até `INPUT_MAX_ROWS` (10), do que ainda sobrar |
+
+Consequência em 80x24 com a lista de slash aberta: 1 status + 7 sugestões +
+8 input + **8 transcript** — o piso, nunca menos. Sem a lista: 1 + 10 + 13.
+
+O piso do transcript é o que essa tabela existe para proteger. A ordem antiga
+(input cresce até 10 contra `height - 3`) deixava o transcript com 6 linhas
+assim que o usuário digitava `/`.
+
+### 3.4 Invariantes que valem em qualquer faixa
+
+- **Largura:** nenhuma linha excede a largura do painel. Vale para a sidebar
+  também, que por isso passa por `fit_lines` em vez de confiar no `Wrap` —
+  contagem de linhas tem que ser igual a contagem de células verticais, senão
+  não dá para posicionar o gauge por offset.
+- **Custo em repouso:** nada que apareça em qualquer faixa pode fazer
+  `App::is_animating()` virar `true`. Um vital que pisca custa 8 redraws/s
+  para sempre.
+- **Navegabilidade:** toda informação que a faixa completa mostra ou está na
+  faixa compacta, ou é alcançável por teclado (expandir card, `/usage`).
+
+---
+
+## 4. Comportamento agentic (entre requisições)
 
 Ciclo de um turn, e o que a tela mostra em cada estado:
 
@@ -200,15 +348,16 @@ Ciclo de um turn, e o que a tela mostra em cada estado:
 Regras:
 - Auto-follow de scroll mantido; `JumpPill` quando o user está lendo histórico.
 - `Esc` cancela: cards `Running` viram `Cancelled` (ícone `·` `disabled`).
-- Verbosidade: `Ctrl+O` alterna compacto/expandido globalmente; erros sempre
-  mostram tail independente do modo.
+- Verbosidade: `Ctrl+O` entra/sai do foco de card; `↑↓` andam entre cards,
+  `Enter` expande o selecionado (2.13). Erros sempre mostram tail
+  independente do modo.
 - Nada muda em `smith-core`: `ToolCallStarted` já carrega `input` e
   `ToolCallResult` já carrega `output` — hoje o TUI **descarta** ambos
   (`app.rs:1129-1178` só gera label). O redesign é quase todo na camada TUI.
 
 ---
 
-## 4. Plano de implementação (fases)
+## 5. Plano de implementação (fases)
 
 Gate por fase: `cargo fmt --all -- --check && cargo clippy --workspace
 --all-targets -- -D warnings && cargo test --workspace`.
@@ -219,15 +368,15 @@ Gate por fase: `cargo fmt --all -- --check && cargo clippy --workspace
 | F1 | **Primitivas** | `components/{mod,panel,chips,diff}.rs`; add `similar = { workspace = true }` em `smith-tui`. | baixo |
 | F2 | **Modelo de dados** | `ChatLine` ganha `tool_name`, `input`, `output`, `duration`, `expanded`; inserção de `ThoughtRow` (timing de gaps) em `on_agent_event`; ajustar testes existentes de `app.rs`. | médio — toca testes |
 | F3 | **Transcript** | reescrever `draw_messages` para compor os componentes 2.1–2.5; remover activity strip; `Ctrl+O`; `JumpPill`. | maior diff |
+| F6 | **80x24** | seção 3 inteira: faixas de largura, context strip, orçamento vertical, `ContextGauge`, throbber por card, seleção por card. | médio — toca layout e memo |
 | F4 | **Chrome** | input, status bar, sidebar, modais, idle screen, suggestions com tokens (2.6–2.11). | baixo |
 | F5 | **Testes de render** | asserts com `TestBackend` por componente (header de card, diff, chips); snapshots de paleta. | baixo |
 
 Ordem F0→F5 é importante: F0/F1 não mudam comportamento; F2 muda estado sem
 mudar render (testes garantem); F3/F4 só consomem.
 
-## 5. Fora de escopo (v1)
+## 6. Fora de escopo (v1)
 
 - Temas alternativos / config de paleta em `~/.smith/config.toml` (a struct
   `Theme` já deixa a porta aberta).
-- Expansão por-card com navegação de foco (v1 = toggle global).
 - Syntax highlighting real de código (só tag de linguagem).

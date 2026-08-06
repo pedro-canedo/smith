@@ -5,10 +5,22 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+/// Spinner frames for a terminal that can render braille.
+pub const SPINNER_UNICODE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// ASCII fallback wheel. Four phases instead of ten: the point of a throbber
+/// is that it is visibly moving, and a missing glyph renders as a *blank
+/// cell*, so a spinner that flickers to nothing reads as a hang.
+pub const SPINNER_ASCII: &[&str] = &["-", "\\", "|", "/"];
+
 /// `PartialEq` is load-bearing: the transcript memo keys its cached rows on
-/// the theme, since every span style comes from here.
+/// the theme, since every span style comes from here — and, since `unicode`
+/// lives here too, switching glyph sets invalidates rendered rows for free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
+    /// Whether the terminal can be trusted with non-ASCII glyphs. Kept on the
+    /// `Theme` rather than beside it precisely so the render memo picks it up:
+    /// glyphs are design tokens on the other capability axis from colour.
+    pub unicode: bool,
     pub raised: Color,
     pub overlay: Color,
     pub hover: Color,
@@ -33,15 +45,27 @@ impl Theme {
         let truecolor = std::env::var("COLORTERM")
             .map(|v| v == "truecolor" || v == "24bit")
             .unwrap_or(false);
-        if truecolor {
+        let base = if truecolor {
             Self::truecolor()
         } else {
             Self::ansi()
+        };
+        Self {
+            unicode: unicode_capable(),
+            ..base
         }
+    }
+
+    /// The same palette with every glyph forced to ASCII — acceptance
+    /// criterion #7's terminal.
+    pub fn ascii_glyphs(mut self) -> Self {
+        self.unicode = false;
+        self
     }
 
     pub fn truecolor() -> Self {
         Self {
+            unicode: true,
             raised: Color::Rgb(22, 24, 28),
             overlay: Color::Rgb(30, 33, 38),
             hover: Color::Rgb(38, 42, 48),
@@ -69,6 +93,7 @@ impl Theme {
     /// universal than truecolor, so this costs nothing in practice.
     pub fn ansi() -> Self {
         Self {
+            unicode: true,
             raised: Color::Indexed(234),
             overlay: Color::Indexed(236),
             hover: Color::Indexed(238),
@@ -159,6 +184,91 @@ impl Theme {
     pub fn hover_bg(&self) -> Style {
         Style::default().bg(self.hover)
     }
+
+    // --- Glyph tokens (see `docs/design-system.md` §1.6) -------------------
+    //
+    // The colour rule's sibling: no new glyph literal outside this module.
+    // A glyph the terminal's font lacks does not degrade to a wrong character,
+    // it degrades to an empty cell — so the fallback is picked per *set*.
+
+    /// Throbber frames. Indexed with `% len()` by the caller, because the two
+    /// sets deliberately have different lengths.
+    pub fn spinner_frames(&self) -> &'static [&'static str] {
+        if self.unicode {
+            SPINNER_UNICODE
+        } else {
+            SPINNER_ASCII
+        }
+    }
+
+    /// Tool card icon for a call that succeeded.
+    pub fn icon_ok(&self) -> &'static str {
+        if self.unicode {
+            "✓"
+        } else {
+            "+"
+        }
+    }
+
+    /// Tool card icon for a call that failed.
+    pub fn icon_error(&self) -> &'static str {
+        if self.unicode {
+            "✗"
+        } else {
+            "x"
+        }
+    }
+
+    /// Cursor in front of a selected row (tool card, suggestion, option).
+    pub fn marker_selected(&self) -> &'static str {
+        if self.unicode {
+            "›"
+        } else {
+            ">"
+        }
+    }
+
+    /// Separator between items on one row (`a · b · c`).
+    pub fn separator(&self) -> &'static str {
+        if self.unicode {
+            " · "
+        } else {
+            " | "
+        }
+    }
+
+    /// Filled / unfilled cells of a `LineGauge`.
+    pub fn gauge_symbols(&self) -> (&'static str, &'static str) {
+        if self.unicode {
+            ("━", "─")
+        } else {
+            ("#", "-")
+        }
+    }
+}
+
+/// Whether the terminal's locale claims UTF-8. `SMITH_ASCII=1` forces the
+/// fallback — the escape hatch for a terminal that advertises UTF-8 and then
+/// renders braille as blanks anyway, which is most of the ones that fail
+/// acceptance criterion #7.
+///
+/// Unset locale variables are treated as UTF-8: that is the modern default,
+/// and the cost of being wrong is a few blank cells, while the cost of the
+/// opposite default is an ASCII UI for everybody on a bare `env`.
+fn unicode_capable() -> bool {
+    if std::env::var("SMITH_ASCII").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        return false;
+    }
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        match std::env::var(key) {
+            Ok(value) if !value.is_empty() => {
+                let value = value.to_ascii_lowercase();
+                return value.contains("utf-8") || value.contains("utf8");
+            }
+            _ => continue,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -183,6 +293,45 @@ mod tests {
         assert_ne!(ansi.raised, ansi.overlay);
         assert_ne!(ansi.overlay, ansi.hover);
         assert_ne!(ansi.raised, ansi.hover);
+    }
+
+    #[test]
+    fn every_spinner_frame_is_exactly_one_visible_cell() {
+        // Two of the ten braille frames used to be the empty string, so the
+        // throbber blinked out twice per cycle and read as a stall.
+        for set in [SPINNER_UNICODE, SPINNER_ASCII] {
+            for (i, frame) in set.iter().enumerate() {
+                assert_eq!(
+                    unicode_width::UnicodeWidthStr::width(*frame),
+                    1,
+                    "frame {i} ({frame:?}) is not one cell wide"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_ascii_theme_answers_only_in_ascii() {
+        let theme = Theme::truecolor().ascii_glyphs();
+        let (filled, unfilled) = theme.gauge_symbols();
+        let mut glyphs = vec![
+            theme.icon_ok(),
+            theme.icon_error(),
+            theme.marker_selected(),
+            filled,
+            unfilled,
+        ];
+        glyphs.extend(theme.spinner_frames());
+        for glyph in glyphs {
+            assert!(glyph.is_ascii(), "{glyph:?} is not ASCII");
+        }
+    }
+
+    #[test]
+    fn the_glyph_set_is_part_of_the_memo_key() {
+        // Otherwise a terminal switching capability would keep serving rows
+        // drawn with the glyphs it can't show.
+        assert_ne!(Theme::ansi(), Theme::ansi().ascii_glyphs());
     }
 
     #[test]

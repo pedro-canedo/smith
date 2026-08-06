@@ -4,15 +4,32 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{
-    format_thought, ActivityStatus, App, ChatLine, ChatRole, IdleHint, Modal, SPINNER_FRAMES,
-};
+use crate::app::{format_thought, ActivityStatus, App, ChatLine, ChatRole, IdleHint, Modal};
 use crate::components::input::INPUT_MIN_ROWS;
 use crate::components::{chips, diff, panel, wrap};
 use crate::theme::Theme;
 
+/// Width at which the sidebar appears. 80 is *inside* this tier, not below
+/// it: 80x24 is the terminal acceptance criterion #7 names, so it is the
+/// full-fat layout that has to be legible there — see `docs/design-system.md`
+/// §3.1.
 const SIDEBAR_MIN_TERMINAL_WIDTH: u16 = 80;
 const SIDEBAR_WIDTH: u16 = 28;
+/// Below this width the status bar drops `cwd git:(branch)` and the version,
+/// and the context strip keeps only the gauge.
+const MINIMAL_TERMINAL_WIDTH: u16 = 48;
+/// Terminals shorter than this drop the context strip: with fewer than 20
+/// rows, one row of vitals costs the transcript more than it is worth.
+const STRIP_MIN_TERMINAL_HEIGHT: u16 = 20;
+/// Floor on transcript rows. Below it the pane stops being a transcript and
+/// becomes a peephole; the input and the slash list grow only into what is
+/// left above this line.
+const TRANSCRIPT_MIN_ROWS: u16 = 8;
+/// The floor relaxes while the slash list is open — that list is transient
+/// and is what the user is actually reading at that moment.
+const TRANSCRIPT_MIN_ROWS_WITH_SUGGEST: u16 = 4;
+/// Narrowest a gauge can be and still show a bar next to its label.
+const MIN_GAUGE_WIDTH: u16 = 16;
 /// Comfortable reading width for the message/input panes. Without
 /// this, a wide terminal stretches prose edge-to-edge — harder to read, and
 /// tables in particular wrap mid-row instead of just running past a
@@ -28,23 +45,105 @@ const QUIT_HINT: &str = "press Ctrl+C again to quit";
 /// Floor for the permission popup: header, detail, key row and both borders.
 const PERMISSION_MODAL_MIN_HEIGHT: u16 = 8;
 
+/// Rows each region of the vertical stack gets, allocated by priority rather
+/// than by position — see `docs/design-system.md` §3.3. Pure, so the 80x24
+/// contract is testable without a `Frame`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerticalLayout {
+    messages: u16,
+    strip: u16,
+    suggest: u16,
+    input: u16,
+    status: u16,
+}
+
+/// The whole compact-height rule in one place. Each step spends only what the
+/// step before it left over, so the transcript's floor is structurally safe
+/// from the input and the slash list instead of being safe by coincidence.
+fn vertical_layout(
+    height: u16,
+    wanted_input: u16,
+    wanted_suggest: u16,
+    strip_wanted: bool,
+) -> VerticalLayout {
+    // 1. Status bar.
+    let status = height.min(1);
+    let mut free = height - status;
+
+    // 2. The prompt, at its minimum. Never negotiable: a UI you cannot type
+    //    into is not a smaller UI, it is a broken one.
+    let input_min = INPUT_MIN_ROWS.min(free);
+    free -= input_min;
+
+    // 3. The transcript's floor.
+    let mut messages = TRANSCRIPT_MIN_ROWS.min(free);
+    free -= messages;
+
+    // 4. The vitals the sidebar would have carried.
+    let strip = if strip_wanted && height >= STRIP_MIN_TERMINAL_HEIGHT {
+        free.min(1)
+    } else {
+        0
+    };
+    free -= strip;
+
+    // 5. The slash list. It is the one region allowed to borrow from the
+    //    transcript's floor — and only down to the relaxed one, and only when
+    //    it would otherwise not fit at all. A completion list you cannot see
+    //    is a keybinding you cannot discover.
+    let mut suggest = wanted_suggest.min(free);
+    free -= suggest;
+    if suggest < wanted_suggest {
+        let borrow = messages
+            .saturating_sub(TRANSCRIPT_MIN_ROWS_WITH_SUGGEST)
+            .min(wanted_suggest - suggest);
+        messages -= borrow;
+        suggest += borrow;
+    }
+
+    // 6. The prompt's growth — last, so a long draft never costs transcript.
+    let growth = wanted_input.saturating_sub(input_min).min(free);
+    free -= growth;
+
+    VerticalLayout {
+        // Whatever nobody claimed belongs to the transcript.
+        messages: messages + free,
+        strip,
+        suggest,
+        input: input_min + growth,
+        status,
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let suggestions = app.slash_suggestions();
-    let suggest_height = if suggestions.is_empty() {
+    let wanted_suggest = if suggestions.is_empty() {
         0
     } else {
         (suggestions.len().min(6) as u16) + 1 // +1 hint line
     };
 
-    let [message_area, suggest_area, input_area, footer_area] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(suggest_height),
-        Constraint::Length(input_height(app, frame.area())),
-        Constraint::Length(1),
+    let is_idle = app.lines.is_empty() && app.in_flight_text.is_none();
+    // The strip is the sidebar's understudy: it exists only when the sidebar
+    // does not, and only when it would actually say something.
+    let strip_wanted = !is_idle
+        && frame.area().width < SIDEBAR_MIN_TERMINAL_WIDTH
+        && (app.context.is_some() || !strip_extras(app).is_empty());
+
+    let layout = vertical_layout(
+        frame.area().height,
+        wanted_input_rows(app, frame.area()),
+        wanted_suggest,
+        strip_wanted,
+    );
+    let [message_area, strip_area, suggest_area, input_area, footer_area] = Layout::vertical([
+        Constraint::Length(layout.messages),
+        Constraint::Length(layout.strip),
+        Constraint::Length(layout.suggest),
+        Constraint::Length(layout.input),
+        Constraint::Length(layout.status),
     ])
     .areas(frame.area());
-
-    let is_idle = app.lines.is_empty() && app.in_flight_text.is_none();
     // A modal takes over the interface — the transcript behind it must not
     // stay on screen too. Left up, its unwrapped-at-full-width lines poke
     // out on both sides of the centered popup and compete with it for
@@ -71,7 +170,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_messages(frame, app, clamp_width(message_area, MAX_CONTENT_WIDTH));
     }
 
-    if suggest_height > 0 {
+    if layout.strip > 0 {
+        draw_context_strip(frame, &*app, clamp_width(strip_area, MAX_CONTENT_WIDTH));
+    }
+
+    if layout.suggest > 0 {
         draw_slash_suggestions(
             frame,
             app,
@@ -106,7 +209,7 @@ fn draw_idle(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter send   Alt+Enter newline   Esc cancel   Ctrl+O tool detail   Ctrl+C ×2 quit",
+        "Enter send   Alt+Enter newline   Esc cancel   Ctrl+O pick a tool card   Ctrl+C ×2 quit",
         theme.disabled(),
     )));
     lines.push(Line::from(""));
@@ -145,18 +248,94 @@ fn clamp_width(area: Rect, max_width: u16) -> Rect {
     }
 }
 
-/// Rows to reserve for the input box: it grows with the text up to
-/// `INPUT_MAX_ROWS` and then scrolls internally, the way a modern CLI prompt
-/// behaves. Split out of `draw` so it can be tested without a `Frame`.
+/// Rows the input box *wants*: it grows with the text up to `INPUT_MAX_ROWS`
+/// and then scrolls internally, the way a modern CLI prompt behaves.
 ///
 /// There's no circularity here — the box's width comes from the whole frame,
 /// which is known before the vertical split that consumes this height.
-fn input_height(app: &mut App, frame_area: Rect) -> u16 {
+fn wanted_input_rows(app: &mut App, frame_area: Rect) -> u16 {
     let width = clamp_width(frame_area, MAX_CONTENT_WIDTH).width;
-    let wanted = app.input.outer_rows(width);
-    // Never let the prompt crowd out the transcript on a short terminal.
-    let budget = frame_area.height.saturating_sub(3).max(INPUT_MIN_ROWS);
-    wanted.min(budget)
+    app.input.outer_rows(width)
+}
+
+/// Rows the input box actually *gets* once `vertical_layout` has protected
+/// the transcript's floor. `draw` composes the two itself (it also has a
+/// slash list and a strip to place); this is the two-step version the prompt's
+/// own tests read.
+#[cfg(test)]
+fn input_height(app: &mut App, frame_area: Rect) -> u16 {
+    let wanted = wanted_input_rows(app, frame_area);
+    vertical_layout(frame_area.height, wanted, 0, false).input
+}
+
+/// The vitals that live in the sidebar, compressed onto one row for the
+/// terminals too narrow to have one (design-system §3.2). Priority order,
+/// dropped from the right as the row runs out.
+fn strip_extras(app: &App) -> String {
+    use smith_core::TaskStatus;
+
+    let sep = app.theme.separator();
+    let mut parts: Vec<String> = Vec::new();
+    if !app.tasks.is_empty() {
+        let done = app
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .count();
+        parts.push(format!("tasks {done}/{}", app.tasks.len()));
+    }
+    if let Some(rate) = app.display_tokens_per_sec() {
+        parts.push(format!("{rate:.1} tok/s"));
+    }
+    // The full MACHINE block is what gets dropped here; CPU is the one line of
+    // it that changes a decision (is the local model thrashing or thinking).
+    if let Some(stats) = &app.resources {
+        parts.push(format!("CPU {:.0}%", stats.cpu_percent));
+    } else if let Some(cost) =
+        crate::pricing::estimate_cost_usd(&app.provider_label, &app.model_label, &app.usage)
+    {
+        parts.push(format!("~${cost:.4}"));
+    }
+    parts.join(sep)
+}
+
+/// One row between the transcript and the prompt, carrying what the sidebar
+/// would have carried. The gauge takes the left and keeps whatever the extras
+/// leave it; below `MINIMAL_TERMINAL_WIDTH` the extras go entirely and the
+/// gauge gets the whole row.
+fn draw_context_strip(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let extras = if area.width >= MINIMAL_TERMINAL_WIDTH {
+        strip_extras(app)
+    } else {
+        String::new()
+    };
+    let extras_width = extras.chars().count() as u16;
+
+    if let Some((used, window, estimated)) = app.context {
+        // +1 so the bar never runs flush into the extras.
+        let gauge_width = area.width.saturating_sub(extras_width + 1);
+        if gauge_width >= MIN_GAUGE_WIDTH {
+            frame.render_widget(
+                crate::components::gauge::context_gauge(used, window, estimated, theme),
+                Rect {
+                    width: gauge_width,
+                    ..area
+                },
+            );
+        }
+    }
+
+    if extras_width > 0 && extras_width <= area.width {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(extras, theme.secondary()))),
+            Rect {
+                x: area.x + area.width - extras_width,
+                width: extras_width,
+                ..area
+            },
+        );
+    }
 }
 
 fn center_vertically(area: Rect, height: u16) -> Rect {
@@ -180,7 +359,7 @@ pub(crate) fn render_chat_line(
     theme: &Theme,
     width: u16,
     verbose: bool,
-    spinner: &str,
+    spinner_frame: usize,
 ) -> Vec<Line<'static>> {
     let mut rows: Vec<Line<'static>> = Vec::new();
     match line.role() {
@@ -207,7 +386,7 @@ pub(crate) fn render_chat_line(
             ]));
         }
         ChatRole::Tool => {
-            rows.extend(tool_card(theme, line, width, verbose, spinner));
+            rows.extend(tool_card(theme, line, width, verbose, spinner_frame));
         }
     }
     rows.push(Line::from(""));
@@ -231,12 +410,15 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         verbose: app.verbose_tools,
         theme: app.theme.clone(),
     };
-    let spinner = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
     let ember = app.theme.ember;
     let overlay = app.theme.overlay;
 
-    app.transcript
-        .sync(&app.lines, app.in_flight_text.as_deref(), &key, spinner);
+    app.transcript.sync(
+        &app.lines,
+        app.in_flight_text.as_deref(),
+        &key,
+        app.spinner_frame,
+    );
 
     // The memo already knows every row's height, so the document height is a
     // lookup rather than a `Paragraph::line_count` re-measure of the whole
@@ -250,6 +432,26 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         app.scroll = app.scroll.min(max_scroll);
         if app.scroll >= max_scroll {
             app.follow_bottom = true;
+        }
+    }
+
+    // A selection cursor you cannot see is not navigation. The memo's height
+    // index already knows where every card's rows are, so this is a lookup
+    // rather than a re-measure — and it runs only on the frame after a
+    // selection key, never on a streaming delta.
+    if std::mem::take(&mut app.scroll_to_selected) {
+        if let Some(index) = app.selected_card() {
+            if let Some((start, len)) = app.transcript.entry_rows(index) {
+                let start = u16::try_from(start).unwrap_or(u16::MAX);
+                let end = u16::try_from(start as usize + len).unwrap_or(u16::MAX);
+                if start < app.scroll {
+                    app.scroll = start;
+                } else if end > app.scroll + area.height {
+                    app.scroll = end.saturating_sub(area.height);
+                }
+                app.scroll = app.scroll.min(max_scroll);
+                app.follow_bottom = app.scroll >= max_scroll;
+            }
         }
     }
 
@@ -290,28 +492,68 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
 /// A tool call rendered as a raised card: one header row (icon, tool name,
 /// target, duration) plus a context-dependent body — live command inset while
 /// running, error tail on failure, full input/output/diff when verbose.
+/// The throbber frame for one card.
+///
+/// A card with a `started_at` derives its phase from *its own* clock, so two
+/// tools that began at different moments are visibly out of step — the
+/// difference between the screen saying "something is happening" and "these
+/// three things are happening". Cards with no start time (a restored
+/// transcript, tests) fall back to the global counter.
+///
+/// This costs the render memo nothing: a `Running` card is already excluded
+/// from it by `ChatLine::is_animating`, so it was being rebuilt every frame
+/// regardless.
+fn spinner_frame_for(line: &ChatLine, global: usize, theme: &Theme) -> &'static str {
+    let frames = theme.spinner_frames();
+    let phase = match line.started_at() {
+        Some(started) => (started.elapsed().as_millis() / crate::app::SPINNER_INTERVAL_MS) as usize,
+        None => global,
+    };
+    frames[phase % frames.len()]
+}
+
 fn tool_card(
     theme: &Theme,
     line: &ChatLine,
     area_width: u16,
     verbose: bool,
-    spinner: &str,
+    spinner_frame: usize,
 ) -> Vec<Line<'static>> {
     let w = area_width as usize;
-    let bg = theme.raised_bg();
+    // Selection is carried by the surface *and* by a marker glyph: on a
+    // 16-colour terminal the elevation step can be invisible, and on a
+    // monochrome one it certainly is.
+    let selected = line.selected();
+    let bg = if selected {
+        theme.hover_bg()
+    } else {
+        theme.raised_bg()
+    };
     let name = line.tool_name().unwrap_or_default().to_string();
     let target = tool_target(line);
+    // Per-card expansion (`Enter`) on top of the global default.
+    let verbose = verbose || line.expanded();
 
     let (icon, icon_style) = match line.tool_status() {
-        Some(ActivityStatus::Running) | None => (spinner.to_string(), theme.ember()),
-        Some(ActivityStatus::Done) => ("✓".to_string(), theme.success()),
-        Some(ActivityStatus::Error) => ("✗".to_string(), theme.danger()),
+        Some(ActivityStatus::Running) | None => (
+            spinner_frame_for(line, spinner_frame, theme).to_string(),
+            theme.ember(),
+        ),
+        Some(ActivityStatus::Done) => (theme.icon_ok().to_string(), theme.success()),
+        Some(ActivityStatus::Error) => (theme.icon_error().to_string(), theme.danger()),
     };
 
-    let mut left = vec![
+    let mut left = Vec::new();
+    if selected {
+        left.push(Span::styled(
+            format!("{} ", theme.marker_selected()),
+            theme.info_bold(),
+        ));
+    }
+    left.extend([
         Span::styled(format!("{icon} "), icon_style),
         Span::styled(name.clone(), theme.bold()),
-    ];
+    ]);
     if !target.is_empty() {
         left.push(Span::styled(
             format!(" {target}"),
@@ -594,7 +836,48 @@ fn fit_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// The sidebar, split around the one widget in it that isn't a `Line`.
+///
+/// `above` ends with the `CONTEXT` header, the gauge goes in the row after it,
+/// and `below` is everything else. Both halves go through `fit_lines` instead
+/// of relying on `Wrap`: the gauge is positioned by row offset, so the line
+/// count has to equal the row count exactly — a single wrapped line would
+/// slide the gauge off its header.
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(theme.disabled());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = inner.width as usize;
+
+    let (above, below) = sidebar_lines(app);
+    let above = fit_lines(above, width);
+    let below = fit_lines(below, width);
+
+    let gauge_rows = u16::from(app.context.is_some());
+    let [above_area, gauge_area, below_area] = Layout::vertical([
+        Constraint::Length(above.len() as u16),
+        Constraint::Length(gauge_rows),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+
+    frame.render_widget(Paragraph::new(above), above_area);
+    if let Some((used, window, estimated)) = app.context {
+        if gauge_area.height > 0 {
+            frame.render_widget(
+                crate::components::gauge::context_gauge(used, window, estimated, theme),
+                gauge_area,
+            );
+        }
+    }
+    frame.render_widget(Paragraph::new(below), below_area);
+}
+
+/// Sidebar content, split at the row the context gauge occupies.
+fn sidebar_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let theme = &app.theme;
     let head = |s: &str| {
         Line::from(Span::styled(
@@ -634,46 +917,52 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         lines.extend(task_lines(&app.tasks, theme));
     }
 
-    lines.extend([
-        Line::from(""),
-        head("CONTEXT"),
-        Line::from(Span::styled(format!("{total_tokens} tokens"), theme.text())),
-        Line::from(Span::styled(
-            format!(
-                "{} in / {} out",
-                app.usage.input_tokens, app.usage.output_tokens
-            ),
-            theme.secondary(),
-        )),
-    ]);
+    lines.extend([Line::from(""), head("CONTEXT")]);
+
+    // --- the gauge's row goes here ---
+
+    let mut below: Vec<Line<'static>> = Vec::new();
+    if app.context.is_some_and(|(_, _, estimated)| estimated) {
+        // A tilde alone doesn't say *what* is estimated, and the difference
+        // between "162k" and "roughly 162k" is the whole point of the field.
+        below.push(Line::from(Span::styled(
+            crate::components::gauge::ESTIMATE_LEGEND,
+            theme.disabled(),
+        )));
+    }
+    below.push(Line::from(Span::styled(
+        format!("{total_tokens} tokens"),
+        theme.text(),
+    )));
+    below.push(Line::from(Span::styled(
+        format!(
+            "{} in / {} out",
+            app.usage.input_tokens, app.usage.output_tokens
+        ),
+        theme.secondary(),
+    )));
 
     if let Some(rate) = app.display_tokens_per_sec() {
-        lines.push(Line::from(Span::styled(
+        below.push(Line::from(Span::styled(
             format!("{rate:.1} tok/s"),
             theme.secondary(),
         )));
     }
 
-    lines.push(Line::from(""));
+    below.push(Line::from(""));
     if let Some(stats) = &app.resources {
-        lines.extend(resource_lines(stats, theme));
+        below.extend(resource_lines(stats, theme));
     } else if let Some(cost) =
         crate::pricing::estimate_cost_usd(&app.provider_label, &app.model_label, &app.usage)
     {
-        lines.push(head("COST"));
-        lines.push(Line::from(Span::styled(
+        below.push(head("COST"));
+        below.push(Line::from(Span::styled(
             format!("~${cost:.4} (est.)"),
             theme.text(),
         )));
     }
 
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(theme.disabled());
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    (lines, below)
 }
 
 /// Checklist section for the sidebar: a "3/8" count, a filled/unfilled
@@ -897,11 +1186,20 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let bg = theme.raised_bg();
     let w = area.width as usize;
 
-    let left = match &app.git_branch {
-        Some(branch) => format!(" {} git:({}) ", app.cwd_display, branch),
-        None => format!(" {} ", app.cwd_display),
+    // Minimal tier (design-system §3.1): the location and the version are
+    // context, not state — on a 40-column terminal they crowd out the one
+    // thing the bar exists to say, which is what the agent is doing right now.
+    let minimal = area.width < MINIMAL_TERMINAL_WIDTH;
+    let left = match (&app.git_branch, minimal) {
+        (_, true) => String::new(),
+        (Some(branch), false) => format!(" {} git:({}) ", app.cwd_display, branch),
+        (None, false) => format!(" {} ", app.cwd_display),
     };
-    let right = format!(" smith {} ", env!("CARGO_PKG_VERSION"));
+    let right = if minimal {
+        String::new()
+    } else {
+        format!(" smith {} ", env!("CARGO_PKG_VERSION"))
+    };
 
     let busy = !matches!(app.phase, smith_core::AgentPhase::Idle)
         || app.waiting_on_assistant
@@ -910,8 +1208,15 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // on screen telling the user what their next keystroke will do.
     let center = if app.quit_pending() {
         Some(QUIT_HINT.to_string())
+    } else if app.selected_card().is_some() {
+        // Above the busy readout on purpose: card focus is a mode the user
+        // switched into, and while it is held `Enter` no longer submits. That
+        // a turn is running is already visible from the cards themselves.
+        let sep = theme.separator();
+        Some(format!("up/down card{sep}Enter expand{sep}Esc back"))
     } else if busy {
-        let spinner = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
+        let frames = theme.spinner_frames();
+        let spinner = frames[app.spinner_frame % frames.len()];
         let mut s = format!("{spinner} {}", app.phase_label());
         if let Some((iteration, max_iterations)) = app.loop_progress {
             s.push_str(&format!(" · {iteration}/{max_iterations}"));
@@ -1227,7 +1532,7 @@ mod tests {
             &tool_line("read_file", ActivityStatus::Done),
             60,
             false,
-            "⠋",
+            0,
         );
         let header = lines[0].to_string();
         assert!(header.contains("✓"), "{header}");
@@ -1244,7 +1549,7 @@ mod tests {
             &tool_line("read_file", ActivityStatus::Done),
             60,
             false,
-            "⠋",
+            0,
         );
         assert_eq!(lines.len(), 1);
     }
@@ -1257,7 +1562,7 @@ mod tests {
             &tool_line("read_file", ActivityStatus::Done),
             60,
             true,
-            "⠋",
+            0,
         );
         let text: String = lines.iter().map(|l| l.to_string()).collect();
         assert!(text.contains("file contents"), "{text}");
@@ -1272,7 +1577,7 @@ mod tests {
             serde_json::json!({"command": "cargo test"}),
             Some("boom: permission denied"),
         );
-        let lines = tool_card(&theme, &line, 60, false, "⠋");
+        let lines = tool_card(&theme, &line, 60, false, 0);
         let text: String = lines.iter().map(|l| l.to_string()).collect();
         assert!(text.contains("permission denied"), "{text}");
     }
@@ -1289,7 +1594,7 @@ mod tests {
             &tool_line("read_file", ActivityStatus::Done),
             40,
             false,
-            "⠋",
+            0,
         );
         let height = lines.len() as u16;
         let backend = TestBackend::new(40, height);
@@ -1674,7 +1979,6 @@ mod tests {
     /// if the memo and this disagree on any cell, the memo is wrong.
     fn legacy_draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         let theme = app.theme.clone();
-        let spinner = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
         let verbose = app.verbose_tools;
         let mut lines: Vec<Line> = Vec::new();
         for line in &app.lines {
@@ -1705,7 +2009,13 @@ mod tests {
                     ]));
                 }
                 ChatRole::Tool => {
-                    lines.extend(tool_card(&theme, line, area.width, verbose, spinner));
+                    lines.extend(tool_card(
+                        &theme,
+                        line,
+                        area.width,
+                        verbose,
+                        app.spinner_frame,
+                    ));
                 }
             }
             lines.push(Line::from(""));
@@ -1891,6 +2201,382 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- The 80x24 contract (design-system §3) ----------------------------
+
+    #[test]
+    fn at_80x24_the_transcript_keeps_its_floor_whatever_else_is_open() {
+        // Closed slash list: status + full prompt + the rest.
+        let plain = vertical_layout(24, INPUT_MAX_ROWS, 0, false);
+        assert_eq!(plain.status, 1);
+        assert_eq!(plain.input, INPUT_MAX_ROWS);
+        assert_eq!(plain.messages, 13);
+
+        // Slash list open — the case that used to squeeze the transcript,
+        // because the prompt grew against `height - 3` and the list was
+        // simply subtracted from whatever was left.
+        let typing = vertical_layout(24, INPUT_MAX_ROWS, 7, false);
+        assert_eq!(typing.suggest, 7);
+        assert_eq!(typing.messages, TRANSCRIPT_MIN_ROWS);
+        assert_eq!(typing.input, 8);
+
+        for l in [plain, typing] {
+            assert_eq!(l.messages + l.strip + l.suggest + l.input + l.status, 24);
+        }
+    }
+
+    #[test]
+    fn the_strip_costs_the_transcript_one_row_and_only_above_20() {
+        let with = vertical_layout(24, INPUT_MIN_ROWS, 0, true);
+        let without = vertical_layout(24, INPUT_MIN_ROWS, 0, false);
+        assert_eq!(with.strip, 1);
+        assert_eq!(with.messages + 1, without.messages);
+
+        // Too short to spend a row on vitals.
+        assert_eq!(vertical_layout(19, INPUT_MIN_ROWS, 0, true).strip, 0);
+    }
+
+    #[test]
+    fn the_slash_list_may_borrow_from_the_floor_but_nothing_else_may() {
+        // 10 rows: status 1 + prompt 3 leaves 6, less than the 8-row floor.
+        let short = vertical_layout(10, INPUT_MAX_ROWS, 7, false);
+        assert_eq!(short.input, INPUT_MIN_ROWS, "growth never takes transcript");
+        assert!(short.suggest > 0, "the completion list must stay visible");
+        assert_eq!(short.messages, TRANSCRIPT_MIN_ROWS_WITH_SUGGEST);
+        assert_eq!(
+            short.messages + short.strip + short.suggest + short.input + short.status,
+            10
+        );
+    }
+
+    #[test]
+    fn a_tiny_terminal_still_gets_a_prompt_and_a_status_bar() {
+        for height in [1u16, 2, 3, 4, 8] {
+            let l = vertical_layout(height, INPUT_MAX_ROWS, 7, true);
+            assert_eq!(
+                l.messages + l.strip + l.suggest + l.input + l.status,
+                height,
+                "height {height} over-allocated"
+            );
+            assert!(l.input <= height, "height {height}");
+        }
+    }
+
+    fn app_with_context(width: u16) -> App {
+        let mut app = app_for_input_tests();
+        app.lines
+            .push(ChatLine::new(ChatRole::Assistant, "uma resposta"));
+        app.on_agent_event(smith_core::AgentEvent::ContextUsage {
+            used: 79_232,
+            window: 128_000,
+            estimated: false,
+        });
+        app.tasks = vec![smith_core::Task {
+            content: "fazer algo".into(),
+            status: smith_core::TaskStatus::Completed,
+        }];
+        let _ = width;
+        app
+    }
+
+    #[test]
+    fn the_sidebar_carries_the_gauge_at_80_columns() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_context(80);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen_text(&terminal);
+
+        assert!(text.contains("CONTEXT"), "{text}");
+        assert!(text.contains("62% 79k/128k"), "gauge label missing: {text}");
+        assert!(text.contains('━'), "gauge bar missing: {text}");
+    }
+
+    #[test]
+    fn below_80_columns_the_vitals_move_to_the_strip_instead_of_vanishing() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_context(70);
+        let mut terminal = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen_text(&terminal);
+
+        // The sidebar is gone…
+        assert!(!text.contains("CONTEXT"), "sidebar drawn under 80: {text}");
+        // …but nothing it was the only home for went with it.
+        assert!(text.contains("62% 79k/128k"), "gauge lost: {text}");
+        assert!(text.contains("tasks 1/1"), "task count lost: {text}");
+    }
+
+    #[test]
+    fn the_minimal_tier_drops_chrome_before_it_drops_the_gauge() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_context(40);
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen_text(&terminal);
+
+        assert!(text.contains("62% 79k/128k"), "gauge lost: {text}");
+        assert!(!text.contains("~/smith"), "cwd should be dropped: {text}");
+        assert!(!text.contains("tasks 1/1"), "extras should be dropped");
+    }
+
+    #[test]
+    fn an_estimated_context_says_so_in_words_as_well_as_a_tilde() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_context(80);
+        app.on_agent_event(smith_core::AgentEvent::ContextUsage {
+            used: 79_232,
+            window: 128_000,
+            estimated: true,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen_text(&terminal);
+
+        assert!(text.contains("~62% 79k/128k"), "{text}");
+        assert!(
+            text.contains(crate::components::gauge::ESTIMATE_LEGEND),
+            "the tilde needs saying out loud: {text}"
+        );
+    }
+
+    #[test]
+    fn the_gauge_never_makes_the_ui_animate() {
+        // Idle cost is the whole reason the event loop skips a tick when
+        // nothing is moving; a vital that ticks would undo it.
+        let mut app = app_with_context(80);
+        app.phase = smith_core::AgentPhase::Idle;
+        app.waiting_on_assistant = false;
+        assert!(!app.is_animating());
+    }
+
+    #[test]
+    fn every_row_fits_the_pane_at_80x24_in_ascii() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_for_input_tests();
+        app.theme = app.theme.clone().ascii_glyphs();
+        long_transcript(&mut app, 60);
+        app.on_agent_event(smith_core::AgentEvent::ContextUsage {
+            used: 120_000,
+            window: 128_000,
+            estimated: true,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf.area().width, 80);
+        // Every cell the transcript pane painted has to be one column wide,
+        // or a folded row would have pushed a border out of the frame.
+        for y in 0..24 {
+            for x in 0..80 {
+                let symbol = buf.cell(ratatui::layout::Position::new(x, y)).unwrap();
+                assert!(
+                    symbol.symbol().chars().count() <= 2,
+                    "cell ({x},{y}) is not a single grapheme"
+                );
+            }
+        }
+    }
+
+    // --- Per-card throbbers (design-system §2.13) -------------------------
+
+    #[test]
+    fn two_cards_started_at_different_times_show_different_frames() {
+        use std::time::Duration;
+
+        let theme = Theme::ansi();
+        let frames = theme.spinner_frames();
+        let early = ChatLine::test_tool_started(
+            "run_bash",
+            "a",
+            Duration::from_millis(crate::app::SPINNER_INTERVAL_MS as u64 * 3),
+        );
+        let late = ChatLine::test_tool_started("run_bash", "b", Duration::from_millis(0));
+
+        let a = tool_card(&theme, &early, 60, false, 0)[0].to_string();
+        let b = tool_card(&theme, &late, 60, false, 0)[0].to_string();
+        assert!(
+            a.starts_with(frames[3]) && b.starts_with(frames[0]),
+            "cards animated in lockstep: {a:?} vs {b:?}"
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_start_time_falls_back_to_the_global_counter() {
+        let theme = Theme::ansi();
+        let frames = theme.spinner_frames();
+        let line = ChatLine::test_tool(
+            "read_file",
+            ActivityStatus::Running,
+            serde_json::json!({"path": "src/main.rs"}),
+            None,
+        );
+        for frame in [0usize, 1, 7] {
+            let header = tool_card(&theme, &line, 60, false, frame)[0].to_string();
+            assert!(header.starts_with(frames[frame % frames.len()]), "{header}");
+        }
+    }
+
+    #[test]
+    fn the_card_icons_degrade_to_ascii() {
+        let theme = Theme::ansi().ascii_glyphs();
+        for (status, expected) in [(ActivityStatus::Done, "+"), (ActivityStatus::Error, "x")] {
+            let header =
+                tool_card(&theme, &tool_line("read_file", status), 60, false, 0)[0].to_string();
+            assert!(header.starts_with(expected), "{header}");
+            assert!(header.is_ascii(), "{header}");
+        }
+    }
+
+    // --- Per-card selection and expansion (design-system §2.13) -----------
+
+    #[test]
+    fn a_selected_card_is_marked_and_raised_but_others_are_untouched() {
+        let theme = Theme::ansi();
+        let plain = tool_card(
+            &theme,
+            &tool_line("read_file", ActivityStatus::Done),
+            60,
+            false,
+            0,
+        );
+        let picked = tool_card(
+            &theme,
+            &tool_line("read_file", ActivityStatus::Done).test_selected(),
+            60,
+            false,
+            0,
+        );
+
+        assert!(!plain[0].to_string().starts_with(theme.marker_selected()));
+        assert!(
+            picked[0].to_string().starts_with(theme.marker_selected()),
+            "no cursor: {}",
+            picked[0]
+        );
+        assert_eq!(
+            picked[0].spans[0].style.bg,
+            Some(theme.hover),
+            "the selected row must sit on the hover surface"
+        );
+    }
+
+    #[test]
+    fn enter_expands_one_card_without_touching_the_global_default() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_for_input_tests();
+        app.on_agent_event(smith_core::AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "read_file".into(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+        });
+        app.on_agent_event(smith_core::AgentEvent::ToolCallResult {
+            id: "call_1".into(),
+            output: "conteudo secreto do arquivo".into(),
+            is_error: false,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!screen_text(&terminal).contains("conteudo secreto"));
+
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            screen_text(&terminal).contains("conteudo secreto"),
+            "Enter did not expand the selected card"
+        );
+        assert!(!app.verbose_tools);
+    }
+
+    #[test]
+    fn expanding_a_card_rebuilds_only_that_card() {
+        // The reason `expanded` is a `ChatLine` field: joining `LayoutKey`
+        // would invalidate the whole memo on every `Enter`.
+        let mut app = app_for_input_tests();
+        long_transcript(&mut app, 60);
+        buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
+
+        app.toggle_card_focus();
+        app.toggle_selected_card();
+        buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
+        assert_eq!(
+            app.transcript.misses(),
+            1,
+            "one Enter must not re-render the session"
+        );
+    }
+
+    #[test]
+    fn selecting_a_card_scrolls_it_into_view() {
+        let mut app = app_for_input_tests();
+        long_transcript(&mut app, 120);
+        buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
+        let bottom = app.scroll;
+
+        // Walk back through several cards; the viewport has to follow.
+        app.toggle_card_focus();
+        for _ in 0..8 {
+            app.move_card_focus(false);
+        }
+        buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
+        assert!(
+            app.scroll < bottom,
+            "the cursor moved up but the viewport stayed at {bottom}"
+        );
+
+        let index = app.selected_card().unwrap();
+        let (start, len) = app.transcript.entry_rows(index).unwrap();
+        assert!(
+            start >= app.scroll as usize && start + len <= app.scroll as usize + 24,
+            "card rows {start}..{} are outside the viewport at {}",
+            start + len,
+            app.scroll
+        );
+    }
+
+    #[test]
+    fn card_focus_publishes_its_keymap_in_the_status_bar() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_for_input_tests();
+        app.on_agent_event(smith_core::AgentEvent::ToolCallStarted {
+            id: "call_1".into(),
+            tool_name: "read_file".into(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+        });
+        app.on_agent_event(smith_core::AgentEvent::ToolCallResult {
+            id: "call_1".into(),
+            output: "ok".into(),
+            is_error: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!screen_text(&terminal).contains("Enter expand"));
+
+        app.toggle_card_focus();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            screen_text(&terminal).contains("Enter expand"),
+            "a mode that steals Enter has to say so"
+        );
     }
 
     #[test]

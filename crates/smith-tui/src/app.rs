@@ -11,7 +11,10 @@ use crate::slash::SlashRegistry;
 use crate::theme::Theme;
 use crate::transcript::TranscriptCache;
 
-pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", ""];
+/// How often the throbber advances. Shared with the event loop's tick
+/// interval (`crate::SPINNER_INTERVAL`) so a card's own phase — derived from
+/// its `started_at` — advances at the same rate as the global counter.
+pub const SPINNER_INTERVAL_MS: u128 = 120;
 const MAX_LABEL_CHARS: usize = 64;
 /// Minimum gap (seconds) between events before we emit a `Thought` row —
 /// anything shorter is just provider latency, not a real thinking pause.
@@ -76,8 +79,22 @@ pub struct ChatLine {
     /// Wall-clock seconds the call took, populated on `ToolCallResult`.
     tool_secs: Option<f32>,
     /// When the call started — for the live elapsed counter in the header
-    /// while the card is still `Running`.
+    /// while the card is still `Running`, and for this card's own throbber
+    /// phase (see `spinner_frame_for`).
     started_at: Option<Instant>,
+    /// Set only for `ChatRole::Tool` lines: the user expanded this one card
+    /// with `Enter`.
+    ///
+    /// Deliberately a field of the *line*, not of the `App`: every mutator
+    /// here ends in `touch()`, so toggling one card invalidates exactly that
+    /// card's memo entry. A global "expanded" flag would have to join
+    /// `LayoutKey` instead, and re-render the whole transcript per keystroke.
+    expanded: bool,
+    /// Set only for `ChatRole::Tool` lines: the transcript's selection cursor
+    /// is on this card. Same reasoning as `expanded` — and because nothing is
+    /// keyed by position, the selection rides along with its line while new
+    /// lines stream in above and below it.
+    selected: bool,
     stamp: LineStamp,
 }
 
@@ -94,6 +111,8 @@ impl ChatLine {
             tool_output: None,
             tool_secs: None,
             started_at: None,
+            expanded: false,
+            selected: false,
             stamp: next_stamp(),
         }
     }
@@ -165,6 +184,34 @@ impl ChatLine {
 
     pub fn started_at(&self) -> Option<Instant> {
         self.started_at
+    }
+
+    /// Whether the user expanded this card with `Enter`.
+    pub fn expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Whether the transcript's selection cursor is on this card.
+    pub fn selected(&self) -> bool {
+        self.selected
+    }
+
+    /// Toggles this card's expansion. `touch()` is what keeps the memo honest;
+    /// it runs unconditionally because the value always changes here.
+    fn toggle_expanded(&mut self) {
+        self.expanded = !self.expanded;
+        self.touch();
+    }
+
+    /// Moves the selection cursor on or off this card. A no-op — including no
+    /// new stamp — when the flag already holds the wanted value, so walking
+    /// the whole transcript to re-sync the cursor invalidates at most the two
+    /// cards that actually changed.
+    fn set_selected(&mut self, selected: bool) {
+        if self.selected != selected {
+            self.selected = selected;
+            self.touch();
+        }
     }
 
     pub(crate) fn stamp(&self) -> LineStamp {
@@ -242,6 +289,31 @@ impl ChatLine {
             tool_secs: Some(0.4),
             ..Self::new(ChatRole::Tool, format!("Running {name}"))
         }
+    }
+
+    /// A running card that started `ago` in the past — the only way to give a
+    /// test a deterministic throbber phase, since a card's phase is derived
+    /// from its own clock.
+    #[cfg(test)]
+    pub(crate) fn test_tool_started(name: &str, id: &str, ago: Duration) -> Self {
+        Self {
+            tool_id: Some(id.to_string()),
+            started_at: Some(Instant::now() - ago),
+            tool_secs: None,
+            ..Self::test_tool(
+                name,
+                ActivityStatus::Running,
+                serde_json::json!({ "path": "src/main.rs" }),
+                None,
+            )
+        }
+    }
+
+    /// Marks this card selected, for rendering tests.
+    #[cfg(test)]
+    pub(crate) fn test_selected(mut self) -> Self {
+        self.selected = true;
+        self
     }
 }
 
@@ -411,8 +483,13 @@ pub struct App {
     pub spinner_frame: usize,
     /// Ember design tokens — the single source of truth for every color.
     pub theme: Theme,
-    /// When true, tool cards expand to show full input + output + diffs.
+    /// When true, *every* tool card expands. Now only a programmatic default
+    /// — `Ctrl+O` drives per-card expansion instead (see `toggle_card_focus`)
+    /// — but it stays in `LayoutKey`, because it is still global.
     pub verbose_tools: bool,
+    /// Set when the selection cursor moves; consumed by `ui::draw_messages`,
+    /// the only place that knows which rows the selected card occupies.
+    pub(crate) scroll_to_selected: bool,
     /// Start of the current "thinking" gap — when the next activity arrives
     /// we emit a `Thought` row if the gap exceeds `THOUGHT_THRESHOLD_SECS`.
     thinking_since: Option<Instant>,
@@ -488,6 +565,7 @@ impl App {
             spinner_frame: 0,
             theme,
             verbose_tools: false,
+            scroll_to_selected: false,
             thinking_since: None,
             provider_label: config.provider_label,
             model_label: config.model_label,
@@ -566,11 +644,116 @@ impl App {
 
     /// Advances the spinner animation; call on a timer while `is_animating()`.
     pub fn tick(&mut self) {
-        self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        // Not reduced modulo any frame count: the ASCII and Unicode sets have
+        // different lengths, so the wrap belongs at the indexing site.
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
     }
 
     pub fn is_animating(&self) -> bool {
         self.waiting_on_assistant || self.modal.is_some() || !matches!(self.phase, AgentPhase::Idle)
+    }
+
+    // --- Card focus -------------------------------------------------------
+    //
+    // The transcript is a list, and a list needs a cursor. The cursor lives on
+    // the `ChatLine`s themselves (`ChatLine::selected`) rather than as an
+    // index here: an index would have to be fixed up every time a line is
+    // appended mid-stream, and would silently point at the wrong card if it
+    // ever wasn't. Scanning for the flag is O(lines) on a keystroke, which is
+    // nothing next to the render it replaces.
+
+    /// Position of the tool card the cursor is on. `None` means the input owns
+    /// the keyboard — the default, and what `Esc`/`Ctrl+O` return to.
+    pub fn selected_card(&self) -> Option<usize> {
+        self.lines.iter().position(ChatLine::selected)
+    }
+
+    /// The tool call id under the cursor, for tests and for anything that has
+    /// to survive a re-render.
+    pub fn selected_card_id(&self) -> Option<&str> {
+        self.selected_card().and_then(|i| self.lines[i].tool_id())
+    }
+
+    fn last_card(&self) -> Option<usize> {
+        self.lines.iter().rposition(|l| l.role() == ChatRole::Tool)
+    }
+
+    /// `Ctrl+O`: enter card focus at the newest tool card, or leave it.
+    /// Returns whether focus is now held.
+    pub fn toggle_card_focus(&mut self) -> bool {
+        if self.selected_card().is_some() {
+            self.select_card(None);
+            return false;
+        }
+        match self.last_card() {
+            Some(index) => {
+                self.select_card(Some(index));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Moves the cursor to the next/previous tool card. Clamps rather than
+    /// wraps: wrapping from the newest card to the oldest in a thousand-line
+    /// session is never what the keystroke meant.
+    pub fn move_card_focus(&mut self, forward: bool) -> bool {
+        let Some(current) = self.selected_card() else {
+            return false;
+        };
+        let is_card = |(_, l): &(usize, &ChatLine)| l.role() == ChatRole::Tool;
+        let next = if forward {
+            self.lines
+                .iter()
+                .enumerate()
+                .skip(current + 1)
+                .find(is_card)
+                .map(|(i, _)| i)
+        } else {
+            self.lines
+                .iter()
+                .enumerate()
+                .take(current)
+                .rev()
+                .find(is_card)
+                .map(|(i, _)| i)
+        };
+        match next {
+            Some(index) => {
+                self.select_card(Some(index));
+                true
+            }
+            None => {
+                // Still ask for a scroll: the user pressed a key and deserves
+                // to see the edge card they are already on.
+                self.scroll_to_selected = true;
+                false
+            }
+        }
+    }
+
+    /// `Enter` in card focus. Returns whether a card was actually toggled.
+    pub fn toggle_selected_card(&mut self) -> bool {
+        let Some(index) = self.selected_card() else {
+            return false;
+        };
+        self.lines[index].toggle_expanded();
+        self.scroll_to_selected = true;
+        true
+    }
+
+    fn select_card(&mut self, index: Option<usize>) {
+        for (i, line) in self.lines.iter_mut().enumerate() {
+            if line.role() == ChatRole::Tool {
+                line.set_selected(Some(i) == index);
+            }
+        }
+        self.scroll_to_selected = index.is_some();
+        if index.is_some() {
+            // Pinning to the live edge would yank the viewport off the card
+            // the user just pointed at, on the very next streaming delta.
+            self.follow_bottom = false;
+        }
     }
 
     pub fn phase_label(&self) -> &'static str {
@@ -809,8 +992,35 @@ impl App {
         }
 
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('o') {
-            self.verbose_tools = !self.verbose_tools;
+            self.toggle_card_focus();
             return None;
+        }
+
+        // Card focus claims exactly four keys and leaves typing alone, so the
+        // prompt stays usable — but `Enter` belongs to the card while one is
+        // selected, which is why `Ctrl+O`/`Esc` both have to release it.
+        if self.selected_card().is_some() {
+            match code {
+                KeyCode::Up => {
+                    self.move_card_focus(false);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.move_card_focus(true);
+                    return None;
+                }
+                KeyCode::Enter => {
+                    self.toggle_selected_card();
+                    return None;
+                }
+                // A running turn keeps `Esc` for cancelling — that is the more
+                // urgent meaning, and `Ctrl+O` still releases focus.
+                KeyCode::Esc if !self.waiting_on_assistant => {
+                    self.select_card(None);
+                    return None;
+                }
+                _ => {}
+            }
         }
 
         let slash_hints = self.slash_suggestions();
@@ -2711,16 +2921,161 @@ mod tests {
         assert!(app.thinking_since.is_some());
     }
 
+    /// A transcript with `count` tool cards separated by assistant replies,
+    /// so navigation has to actually skip non-card lines.
+    fn app_with_cards(count: usize) -> App {
+        let mut app = test_app();
+        for i in 0..count {
+            app.on_agent_event(AgentEvent::ToolCallStarted {
+                id: format!("call_{i}"),
+                tool_name: "read_file".into(),
+                input: serde_json::json!({ "path": format!("src/f{i}.rs") }),
+            });
+            app.on_agent_event(AgentEvent::ToolCallResult {
+                id: format!("call_{i}"),
+                output: "ok".into(),
+                is_error: false,
+            });
+            app.lines
+                .push(ChatLine::new(ChatRole::Assistant, format!("resposta {i}")));
+        }
+        app
+    }
+
     #[test]
-    fn ctrl_o_toggles_verbose_tools() {
+    fn ctrl_o_focuses_the_newest_card_and_releases_it() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_with_cards(3);
+        assert_eq!(app.selected_card_id(), None);
+
+        assert!(app
+            .on_key(KeyCode::Char('o'), KeyModifiers::CONTROL)
+            .is_none());
+        assert_eq!(app.selected_card_id(), Some("call_2"), "newest card first");
+
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(app.selected_card_id(), None);
+    }
+
+    #[test]
+    fn ctrl_o_is_inert_with_nothing_to_select() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = test_app();
-        assert!(!app.verbose_tools);
-        let action = app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
-        assert!(action.is_none());
-        assert!(app.verbose_tools);
+        app.lines
+            .push(ChatLine::new(ChatRole::Assistant, "sem tool nenhuma"));
         app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
-        assert!(!app.verbose_tools);
+        assert_eq!(app.selected_card_id(), None);
+    }
+
+    #[test]
+    fn arrows_walk_between_cards_and_clamp_at_the_ends() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_with_cards(3);
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected_card_id(), Some("call_1"));
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected_card_id(), Some("call_0"));
+        // Clamped, not wrapped: wrapping to the newest card from the oldest is
+        // never what the keystroke meant in a long session.
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected_card_id(), Some("call_0"));
+
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.selected_card_id(), Some("call_1"));
+    }
+
+    #[test]
+    fn enter_expands_only_the_selected_card() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_with_cards(3);
+        app.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(app.on_key(KeyCode::Enter, KeyModifiers::NONE).is_none());
+
+        let expanded: Vec<&str> = app
+            .lines
+            .iter()
+            .filter(|l| l.expanded())
+            .filter_map(ChatLine::tool_id)
+            .collect();
+        assert_eq!(expanded, vec!["call_2"]);
+        assert!(
+            !app.verbose_tools,
+            "per-card expansion must not flip the global default"
+        );
+
+        // Enter toggles, it doesn't latch.
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.lines.iter().all(|l| !l.expanded()));
+    }
+
+    #[test]
+    fn expanding_one_card_stamps_only_that_card() {
+        // The whole reason expansion is a field of `ChatLine` and not of
+        // `App`: a global flag would have to join `LayoutKey` and re-render
+        // the entire transcript on every `Enter`.
+        let mut app = app_with_cards(3);
+        let before: Vec<LineStamp> = app.lines.iter().map(ChatLine::stamp).collect();
+        app.toggle_card_focus();
+        app.toggle_selected_card();
+        let after: Vec<LineStamp> = app.lines.iter().map(ChatLine::stamp).collect();
+
+        let moved = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+        assert_eq!(moved, 1, "selection + expansion touched {moved} lines");
+    }
+
+    #[test]
+    fn selection_survives_new_lines_arriving_while_the_user_reads() {
+        let mut app = app_with_cards(2);
+        app.toggle_card_focus();
+        app.move_card_focus(false);
+        assert_eq!(app.selected_card_id(), Some("call_0"));
+
+        // A whole turn's worth of streaming lands underneath the cursor.
+        app.on_agent_event(AgentEvent::AssistantTextDelta("mais texto".into()));
+        for i in 9..12 {
+            app.on_agent_event(AgentEvent::ToolCallStarted {
+                id: format!("call_{i}"),
+                tool_name: "grep".into(),
+                input: serde_json::json!({ "pattern": "x" }),
+            });
+        }
+        assert_eq!(
+            app.selected_card_id(),
+            Some("call_0"),
+            "the cursor is carried by its line, not by an index"
+        );
+    }
+
+    #[test]
+    fn esc_releases_card_focus_but_never_steals_a_cancel() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_with_cards(2);
+        app.toggle_card_focus();
+        app.waiting_on_assistant = true;
+        // A running turn keeps Esc: cancelling is the more urgent meaning.
+        assert!(matches!(
+            app.on_key(KeyCode::Esc, KeyModifiers::NONE),
+            Some(Action::CancelGeneration)
+        ));
+        assert!(app.selected_card_id().is_some());
+
+        app.waiting_on_assistant = false;
+        assert!(app.on_key(KeyCode::Esc, KeyModifiers::NONE).is_none());
+        assert_eq!(app.selected_card_id(), None);
+    }
+
+    #[test]
+    fn card_focus_leaves_typing_alone() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_with_cards(1);
+        app.toggle_card_focus();
+        for c in "oi".chars() {
+            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.input.text(), "oi");
+        assert!(app.selected_card_id().is_some());
     }
 
     #[test]
