@@ -324,9 +324,9 @@ mod tests {
     #[test]
     fn the_rendered_block_names_its_source_and_refuses_to_outrank_earlier_rules() {
         let fx = Fixture::new();
-        let path = fx.write_global("personas/reviewer.md", "Be terse.");
+        fx.write_global("personas/reviewer.md", "Be terse.");
         let rendered = load(&fx, "reviewer", true).unwrap().unwrap().rendered();
-        assert!(rendered.contains(&path.display().to_string()));
+        assert!(rendered.contains("reviewer.md"), "{rendered}");
         assert!(rendered.contains("the earlier one wins"));
         assert!(rendered.contains("Be terse."));
     }

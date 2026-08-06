@@ -389,7 +389,10 @@ mod tests {
     fn an_unusable_name_is_refused_rather_than_loaded_unreachable() {
         let fx = Fixture::new();
         fx.write(".smith/commands/two words.md", "body");
-        fx.write(".smith/commands/a:b.md", "body");
+        // `:` is an alternate-data-stream separator on Windows, so it is
+        // not a portable regular filename. A dot in the stem is invalid for
+        // command names while remaining a normal filename everywhere.
+        fx.write(".smith/commands/a.b.md", "body");
 
         let set = discover(&fx);
         assert!(set.is_empty(), "{:?}", set.entries());

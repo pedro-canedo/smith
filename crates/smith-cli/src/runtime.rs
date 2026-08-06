@@ -144,6 +144,7 @@ impl CftPlatform {
 
     /// Whether a Unix executable bit has to be restored on extraction. Zip
     /// stores the mode, but only Unix acts on it.
+    #[cfg(unix)]
     fn is_windows(self) -> bool {
         matches!(self, Self::Win32 | Self::Win64)
     }
@@ -1443,6 +1444,7 @@ mod tests {
 
     /// Builds a zip in the shape the real archives have, with `binary` as the
     /// contents of the one executable.
+    #[cfg(unix)]
     fn fixture_archive(platform: CftPlatform, binary: &[u8]) -> Vec<u8> {
         use zip::write::SimpleFileOptions;
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -1470,10 +1472,12 @@ mod tests {
 
     /// A "browser" that answers `--version`, so the install path's acceptance
     /// check can run without a 100 MB download.
+    #[cfg(unix)]
     fn fake_browser(version: &str) -> Vec<u8> {
         format!("#!/bin/sh\necho '{version}'\n").into_bytes()
     }
 
+    #[cfg(unix)]
     struct FakeSource {
         manifest: String,
         archive: Vec<u8>,
@@ -1483,6 +1487,7 @@ mod tests {
         fetched: std::sync::Mutex<Vec<String>>,
     }
 
+    #[cfg(unix)]
     impl FakeSource {
         fn new(archive: Vec<u8>) -> Self {
             let md5 = base64::engine::general_purpose::STANDARD
@@ -1497,6 +1502,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl AssetSource for FakeSource {
         async fn manifest(&self) -> Result<String, String> {
@@ -1521,6 +1527,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn platform_or_skip() -> Option<CftPlatform> {
         CftPlatform::detect()
     }
