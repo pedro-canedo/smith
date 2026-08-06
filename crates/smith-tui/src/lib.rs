@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 pub use app::{App, ChatLine, ChatRole, IdleHint, TuiConfig};
 pub use complete::CompletionKind;
 pub use logbuf::{LogBuffer, LogLevel, LogLine};
-pub use theme::Theme;
+pub use theme::{Theme, ThemeError, ThemeName};
 
 const SPINNER_INTERVAL: Duration = Duration::from_millis(app::SPINNER_INTERVAL_MS as u64);
 

@@ -53,6 +53,12 @@ pub struct Config {
     /// `web_search` backend settings that are not credentials.
     #[serde(default)]
     pub search: SearchSettings,
+    /// Which palette the TUI paints in. Must stay ahead of `runtime` for the
+    /// ordering reason below *and* because its own `colors` field serializes
+    /// as a nested table: a plain-table field written after it would land
+    /// inside `[theme.colors]`.
+    #[serde(default)]
+    pub theme: ThemeSettings,
     /// Third-party binaries `smith setup` provisioned into `~/.smith/runtime`.
     /// Must stay ahead of `mcp_servers`: TOML forbids a plain table after an
     /// array of tables, so a field serialized after it would produce a file
@@ -160,6 +166,30 @@ pub struct SearchSettings {
     /// queries an agent mostly issues; set it if yours are usually in another
     /// language.
     pub market: Option<String>,
+}
+
+/// `[theme]` — which palette the TUI paints in, and any single colours the
+/// user wants to move.
+///
+/// The values are kept as plain strings here on purpose: this crate must not
+/// know what a `ratatui::style::Color` is (nothing below `smith-tui` does),
+/// and the "no colour literal outside `theme.rs`" rule is exactly the rule a
+/// second parser in a second crate would break. `smith-tui::theme::Theme::
+/// resolve` is the one place that turns these strings into colours, and the
+/// one place that rejects them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThemeSettings {
+    /// `dark` (the default), `light` or `high_contrast`. An unknown name is a
+    /// startup error, never a silent fall back to the default.
+    pub name: Option<String>,
+    /// Per-token overrides by hex string, e.g. `ember = "#ff8c3c"`. Keys are
+    /// the design system's token names (`base`, `raised`, `primary`, …);
+    /// an unknown key is an error for the same reason an unknown name is.
+    ///
+    /// Must stay the **last** field: it serializes as a nested table, so a
+    /// scalar written after it would land inside `[theme.colors]`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub colors: std::collections::BTreeMap<String, String>,
 }
 
 /// Where `smith setup` put the runtimes it provisioned.
@@ -324,6 +354,13 @@ impl Config {
         self.search.backend = backend.or(self.search.backend.take());
         self.search.searxng_url = searxng_url.or(self.search.searxng_url.take());
         self.search.market = market.or(self.search.market.take());
+
+        // A project may restyle smith without restating the whole palette, so
+        // the overrides merge per token rather than wholesale — the same rule
+        // the scalar fields above follow, one level down.
+        let ThemeSettings { name, colors } = other.theme;
+        self.theme.name = name.or(self.theme.name.take());
+        self.theme.colors.extend(colors);
 
         let RuntimeSettings {
             chromium_path,
@@ -633,6 +670,77 @@ mod tests {
         assert_eq!(server.args, vec!["/home/u".to_string()]);
         assert!(server.url.is_none() && server.transport.is_none());
         assert!(server.headers.is_empty());
+    }
+
+    #[test]
+    fn a_project_may_restyle_one_token_without_restating_the_palette() {
+        let mut config = global();
+        config.theme.name = Some("dark".into());
+        config.theme.colors.insert("ember".into(), "#ff8c3c".into());
+        config.theme.colors.insert("plan".into(), "#c684ff".into());
+        config.merge_over(
+            toml::from_str(
+                r##"
+                [theme]
+                name = "light"
+                [theme.colors]
+                plan = "#6c30a2"
+                "##,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(config.theme.name.as_deref(), Some("light"));
+        assert_eq!(config.theme.colors.get("plan").unwrap(), "#6c30a2");
+        // The token the project did not mention keeps the global value.
+        assert_eq!(config.theme.colors.get("ember").unwrap(), "#ff8c3c");
+    }
+
+    #[test]
+    fn an_unstated_theme_section_changes_nothing() {
+        let mut config = global();
+        config.theme.name = Some("high_contrast".into());
+        config.merge_over(Config::default());
+        assert_eq!(config.theme.name.as_deref(), Some("high_contrast"));
+    }
+
+    /// `[theme.colors]` is a nested table, so anything serialized after it
+    /// would be written into it. Same hazard as `mcp_servers.headers`, and
+    /// only a round-trip with the later sections present catches it.
+    #[test]
+    fn a_config_with_a_theme_and_everything_after_it_round_trips() {
+        let mut config = global();
+        config.theme.name = Some("light".into());
+        config.theme.colors.insert("base".into(), "#faf9f7".into());
+        config.runtime.chromium_path = Some("/home/u/.smith/runtime/chrome".into());
+        config.hooks.pre_tool_use.push(HookCommand {
+            command: "true".into(),
+            matcher: None,
+            timeout_ms: None,
+        });
+
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).expect("must parse back: {text}");
+        assert_eq!(parsed.theme.name.as_deref(), Some("light"));
+        assert_eq!(parsed.theme.colors.get("base").unwrap(), "#faf9f7");
+        assert_eq!(
+            parsed.runtime.chromium_path.as_deref(),
+            Some("/home/u/.smith/runtime/chrome")
+        );
+        assert_eq!(parsed.hooks.pre_tool_use.len(), 1);
+        assert_eq!(parsed.mcp_servers.len(), 1);
+    }
+
+    /// A config written before `[theme]` existed still loads, with the
+    /// section simply absent.
+    #[test]
+    fn a_config_without_a_theme_section_loads() {
+        let parsed: Config = toml::from_str("[general]\nmodel = \"m\"\n").unwrap();
+        assert!(parsed.theme.name.is_none());
+        assert!(parsed.theme.colors.is_empty());
+        // And an empty section writes no `colors` table at all.
+        let text = toml::to_string_pretty(&parsed).unwrap();
+        assert!(!text.contains("theme.colors"), "{text}");
     }
 
     #[test]

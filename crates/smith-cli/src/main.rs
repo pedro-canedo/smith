@@ -61,6 +61,12 @@ struct Cli {
     #[arg(long)]
     ascii: bool,
 
+    /// Palette for the terminal UI: `dark` (default), `light` or
+    /// `high_contrast`. Overrides `[theme] name` in the config. An unknown
+    /// name is an error — see `smith_tui::theme`.
+    #[arg(long, value_name = "NAME")]
+    theme: Option<String>,
+
     /// Screen-reader friendly output: no TUI, no chrome, no colour escapes.
     #[arg(long)]
     plain: bool,
@@ -480,6 +486,11 @@ struct Startup {
     /// Custom slash commands. Discovered here so a broken file is reported
     /// once at startup, like a broken subagent definition.
     commands: smith_config::CommandSet,
+    /// The resolved palette. Only the TUI paints with it, but it is resolved
+    /// here, for both frontends, so that a bad `--theme` or a bad hex value
+    /// in `[theme.colors]` is reported by every invocation — including the
+    /// headless one, which is where a CI config is usually first typed.
+    theme: Theme,
 }
 
 impl Startup {
@@ -523,6 +534,7 @@ impl Startup {
             explicit,
         )?;
         let commands = smith_config::CommandSet::discover(&cwd, &smith_tui::slash::builtin_names());
+        let theme = tui_theme(cli.ascii, cli.theme.as_deref(), &config.theme)?;
 
         let session_store = SessionStore::open(&cwd).ok();
         let (session_id, initial_messages, idle_hint, initial_goal) =
@@ -541,6 +553,7 @@ impl Startup {
             initial_goal,
             persona,
             commands,
+            theme,
         })
     }
 
@@ -629,7 +642,7 @@ async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         idle_hint: std::mem::replace(&mut startup.idle_hint, IdleHint::Tip(String::new())),
         initial_lines,
         permission_policy: startup.permission_policy,
-        theme: tui_theme(cli.ascii),
+        theme: startup.theme.clone(),
         goal: startup.initial_goal.clone(),
         tasks: last_write_tasks_call(&startup.initial_messages),
         history: prompt_history(&startup.initial_messages),
@@ -767,13 +780,26 @@ fn use_color() -> bool {
     )
 }
 
-fn tui_theme(force_ascii: bool) -> Theme {
-    let theme = Theme::detect();
-    if force_ascii {
+/// The palette this run paints in.
+///
+/// Precedence is `--theme` > project `.smith/config.toml` > global
+/// `~/.smith/config.toml` > the detected default, and the two config layers
+/// have already been merged into `config` by `Config::load_layered`. Every
+/// failure is a usage error rather than a fallback: a theme name or a hex
+/// value that did not take effect is invisible, and a user who cannot see
+/// that their config was ignored will file it as "the flag does nothing".
+fn tui_theme(
+    force_ascii: bool,
+    flag: Option<&str>,
+    config: &smith_config::ThemeSettings,
+) -> Result<Theme, String> {
+    let name = flag.or(config.name.as_deref());
+    let theme = Theme::resolve(name, &config.colors).map_err(|e| format!("smith: {e}"))?;
+    Ok(if force_ascii {
         theme.ascii_glyphs()
     } else {
         theme
-    }
+    })
 }
 
 fn is_dumb_terminal() -> bool {
@@ -1027,6 +1053,7 @@ fn detect_git_branch(cwd: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use smith_tui::ThemeName;
     use std::ffi::OsStr;
 
     fn cli(args: &[&str]) -> Cli {
@@ -1220,8 +1247,60 @@ mod tests {
 
     #[test]
     fn ascii_flag_forces_the_tui_glyph_axis_only() {
-        assert!(!tui_theme(true).unicode);
-        assert_eq!(tui_theme(false).raised, Theme::detect().raised);
+        let settings = smith_config::ThemeSettings::default();
+        assert!(!tui_theme(true, None, &settings).unwrap().unicode);
+        assert_eq!(
+            tui_theme(false, None, &settings).unwrap().raised,
+            Theme::detect().raised
+        );
+    }
+
+    #[test]
+    fn the_theme_flag_outranks_the_config_and_the_config_outranks_the_default() {
+        let mut settings = smith_config::ThemeSettings {
+            name: Some("light".into()),
+            ..Default::default()
+        };
+        // Config alone.
+        let from_config = tui_theme(false, None, &settings).unwrap();
+        assert_eq!(from_config.primary, Theme::named(ThemeName::Light).primary);
+        // The flag wins over it.
+        let from_flag = tui_theme(false, Some("high_contrast"), &settings).unwrap();
+        assert_eq!(
+            from_flag.primary,
+            Theme::named(ThemeName::HighContrast).primary
+        );
+        // Neither: the detected default.
+        settings.name = None;
+        assert_eq!(
+            tui_theme(false, None, &settings).unwrap().primary,
+            Theme::detect().primary
+        );
+    }
+
+    #[test]
+    fn a_bad_theme_name_or_colour_is_a_usage_error_not_a_fallback() {
+        let settings = smith_config::ThemeSettings::default();
+        let err = tui_theme(false, Some("solarized"), &settings).unwrap_err();
+        assert!(
+            err.contains("solarized") && err.contains("high_contrast"),
+            "{err}"
+        );
+
+        let mut settings = smith_config::ThemeSettings::default();
+        settings
+            .colors
+            .insert("ember".into(), "not-a-colour".into());
+        let err = tui_theme(false, None, &settings).unwrap_err();
+        assert!(err.contains("ember"), "{err}");
+    }
+
+    #[test]
+    fn a_per_token_override_survives_into_the_resolved_theme() {
+        let mut settings = smith_config::ThemeSettings::default();
+        settings.colors.insert("base".into(), "#123456".into());
+        let theme = tui_theme(false, Some("dark"), &settings).unwrap();
+        assert_ne!(theme.base, Theme::detect().base);
     }
 
     #[test]

@@ -25,18 +25,30 @@ mais universalmente que truecolor.
 
 | Token             | Truecolor         | Fallback 256      | Uso                                              |
 | ----------------- | ----------------- | ----------------- | ------------------------------------------------ |
-| `surface.base`    | default do term   | default           | fundo geral, texto do assistente                 |
+| `surface.base`    | `Rgb(16,18,21)`   | `Indexed(232)`    | fundo geral, texto do assistente                 |
 | `surface.raised`  | `Rgb(22,24,28)`   | `Indexed(234)`    | tool cards, bolha do user, blocos de código      |
-| `surface.overlay` | `Rgb(30,33,38)`   | `Indexed(236)`    | insets dentro de cards: `$ cmd`, output, diff gutter, chips de tecla |
-| `surface.hover`   | `Rgb(38,42,48)`   | `Indexed(238)`    | linha selecionada (suggestions, question modal)  |
+| `surface.overlay` | `Rgb(30,33,38)`   | `Indexed(235)`    | insets dentro de cards: `$ cmd`, output, diff gutter, chips de tecla |
+| `surface.hover`   | `Rgb(38,42,48)`   | `Indexed(236)`    | linha selecionada (suggestions, question modal)  |
+
+`surface.base` **é pintado** (`ui::draw` desenha um `Block` com ele sobre o
+frame inteiro, e de novo sobre a área que um modal limpa com `Clear`), não
+herdado do terminal. Herdar era o que tornava um tema claro impossível: os
+tokens de texto foram escolhidos contra um fundo escuro que ninguém tinha
+declarado, então em um terminal claro `text.primary` ficava branco no branco.
+
+A escada de elevação do fallback 256 é mais curta que a original
+(234/235/236 em vez de 234/236/238) por medição: com `hover` em `Indexed(238)`
+(cinza 68), seis dos dez tokens de foreground ficavam abaixo de AA. Baixar dois
+degraus custa um pouco de separação entre superfícies e devolve a paleta
+inteira.
 
 ### 1.2 Texto
 
 | Token            | Truecolor         | Fallback 256    |
 | ---------------- | ----------------- | --------------- |
 | `text.primary`   | `Rgb(226,229,233)`| `Indexed(253)`  |
-| `text.secondary` | `Rgb(148,154,163)`| `Indexed(246)`  |
-| `text.disabled`  | `Rgb(94,100,110)` | `Indexed(242)`  |
+| `text.secondary` | `Rgb(148,154,163)`| `Indexed(247)`  |
+| `text.disabled`  | `Rgb(114,120,130)`| `Indexed(244)`  |
 
 ### 1.3 Semântica / roles
 
@@ -44,11 +56,11 @@ mais universalmente que truecolor.
 | ------------ | ----------------- | -------------- | ------------------------------------------ |
 | `ember`      | `Rgb(255,140,60)` | `Indexed(208)` | marca, spinner, thought rows, gutter do assistente, título do input |
 | `amber`      | `Rgb(255,190,90)` | `Indexed(215)` | inline code, destaque de path              |
-| `success`    | `Rgb(88,206,128)` | `Indexed(78)`  | ✓, diffs `+`, teclas de confirmar          |
-| `danger`     | `Rgb(240,90,90)`  | `Indexed(203)` | ✗, diffs `-`, teclas de cancelar, erros    |
+| `success`    | `Rgb(88,206,128)` | `Indexed(84)`  | ✓, diffs `+`, teclas de confirmar          |
+| `danger`     | `Rgb(243,102,102)`| `Indexed(210)` | ✗, diffs `-`, teclas de cancelar, erros    |
 | `warning`    | `Rgb(250,204,21)` | `Indexed(220)` | permission modal, tools `Dangerous`        |
 | `info`       | `Rgb(86,182,255)` | `Indexed(75)`  | tools read-only, slash commands, seleção   |
-| `plan`       | `Rgb(198,132,255)`| `Indexed(141)` | plan mode (input, modal, sidebar)          |
+| `plan`       | `Rgb(198,132,255)`| `Indexed(177)` | plan mode (input, modal, sidebar)          |
 
 ### 1.4 Diff
 
@@ -62,6 +74,40 @@ mais universalmente que truecolor.
 fallback ANSI da coluna 3. Um único `Theme` é criado no `App::new` e passado
 por referência para todo `draw_*` — **nenhum `Color::` literal fora de
 `theme.rs`** (hoje são ~60 espalhados).
+
+### 1.5.1 Presets, contraste e configuração
+
+São três paletas — `dark` (o Ember das tabelas acima), `light` e
+`high_contrast` — cada uma com variante truecolor e 256/16 cores. `light`
+**não** é uma inversão: cada cor de papel é escolhida de novo contra fundo
+claro, porque um laranja que lê como "quente" em `Rgb(255,140,60)` sobre
+quase-preto é ilegível sobre quase-branco.
+
+O que mantém as três honestas é `theme.rs::contrast_ratio` — luminância
+relativa e razão de contraste da WCAG 2.1, com o cubo de 256 cores mapeado
+para RGB (`indexed_rgb`) para que a variante ANSI seja mensurável, não
+pulável. O teste `every_preset_meets_wcag_aa` varre **todo** par
+foreground/superfície de **todo** preset e exige AA: 4.5:1 para tokens que
+carregam texto, 3:1 para `text.disabled`, que só carrega cromo esmaecido
+(gutters, tempos decorridos, números de linha) e nunca é o único portador de
+uma informação. Quando um par falha, muda-se a cor — nunca o limiar. Foi assim
+que `text.disabled` (2.42:1 sobre `hover`) e `danger` (4.34:1) mudaram de valor
+no tema escuro que já existia.
+
+`high_contrast` mira baixa visão e terminais de 16 cores: a variante ANSI é a
+única que fica dentro de `Indexed(0..16)`, e nela **todas as superfícies são
+pretas** de propósito — os dois fundos que as 16 cores ofereceriam (cinza 8,
+azul 4) derrubam pelo menos uma cor de papel abaixo de 4.5:1, então a
+elevação é trocada por legibilidade e a estrutura fica com o marcador `›` e as
+bordas.
+
+Seleção do tema, em ordem de precedência: `--theme <nome>` › `[theme]` do
+`<project>/.smith/config.toml` › `[theme]` do `~/.smith/config.toml` ›
+`Theme::detect()`. Overrides por token vêm de `[theme.colors]` em hex
+(`ember = "#ff8c3c"`), mesclados chave a chave entre as camadas. Nome
+desconhecido, token desconhecido ou hex inválido **abortam a inicialização**
+com código 2 — um tema que ignora metade do que o config pediu é pior que um
+que se recusa a subir.
 
 ### 1.6 Glifos (tokens de caractere)
 
@@ -377,6 +423,9 @@ mudar render (testes garantem); F3/F4 só consomem.
 
 ## 6. Fora de escopo (v1)
 
-- Temas alternativos / config de paleta em `~/.smith/config.toml` (a struct
-  `Theme` já deixa a porta aberta).
+- ~~Temas alternativos / config de paleta em `~/.smith/config.toml`~~ —
+  entregue; ver 1.5.1.
+- Trocar de tema no meio da sessão (`/theme`). O `Theme` é chave do memo do
+  transcript, então trocar é barato de renderizar; o que falta é decidir se
+  a troca persiste no config.
 - Syntax highlighting real de código (só tag de linguagem).
