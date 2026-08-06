@@ -153,9 +153,15 @@ than happened is worse than a short one.
 - **Verified on Linux:** the release profile builds; the release binary runs,
   reports its version, and passes `smith doctor`; `--panic-now` is absent from
   a release build, so the PTY test apparatus does not ship.
-- **Not verified anywhere:** the release workflow itself has never run — no
-  tag has been pushed. macOS and Windows have only ever been exercised by the
-  CI test matrix, never by the release job.
+- **Verified since:** the release workflow has now run green on all five
+  targets plus the publish step (tags `v0.1.0` and `v0.1.01`). The note above
+  said it never had; it has.
+- **Still not verified:** nobody has *run* the macOS or Windows artifacts. The
+  release job proves they build and upload, not that they work.
+- **The crate version is not bumped with the tag.** Both releases ship a binary
+  that reports `smith 0.1.0`, so `smith update` sees `v0.1.01` as newer than
+  the version it is already running and will keep offering the same update
+  forever. Bump `[workspace.package] version` in the same commit as the tag.
 - **Known risk on macOS:** `chrome-headless-shell` is downloaded unsigned and
   unnotarised, so Gatekeeper is expected to refuse it on first run. Nothing in
   `smith setup` handles that yet.

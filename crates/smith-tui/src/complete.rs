@@ -44,10 +44,21 @@ const MAX_SUGGESTIONS: usize = 6;
 /// reason `grep` is built on it rather than on a hand-rolled walk. A prompt
 /// that completes to `target/debug/build/...` is worse than no completion at
 /// all.
+///
+/// `require_git(false)` for the reason `grep::walk_builder` already gives:
+/// `.gitignore` is the user's statement of what is noise, and it is just as
+/// true in a tarball or an un-initialised directory as in a checkout. The
+/// crate's default of honouring it only inside a repository makes the feature
+/// behave differently for a reason the user cannot see — and it is not
+/// hypothetical, because it is what it did. Every test of this passed on my
+/// machine and failed on all three CI platforms, because this machine happens
+/// to have a stray `/tmp/.git`, which made every temporary directory count as
+/// "inside a repository".
 pub fn index_files(root: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
+        .require_git(false)
         .git_ignore(true)
         .git_global(true)
         .parents(true)
@@ -223,6 +234,16 @@ mod tests {
         );
     }
 
+    /// `.gitignore` is honoured whether or not a repository is involved.
+    ///
+    /// That independence is `require_git(false)`, and it is the difference
+    /// between this test measuring the code and measuring the machine it runs
+    /// on. Without the flag it passed here and failed on all three CI
+    /// platforms, because this development box has a stray `/tmp/.git` which
+    /// made every temporary directory look like a checkout. Deliberately *not*
+    /// asserting the absence of an ancestor repo: that would only move the
+    /// environment dependence to the other side and make the test unrunnable
+    /// here instead of in CI.
     #[test]
     fn indexing_skips_directories_and_respects_gitignore() {
         let dir = tempfile::tempdir().unwrap();
