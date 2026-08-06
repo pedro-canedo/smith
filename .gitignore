@@ -1,4 +1,33 @@
 /target
 .smith/
 .claude/worktrees/
+
+# graphify writes a knowledge graph under graphify-out/. Two of those files are
+# worth keeping and the rest are not, so the ignore list is explicit rather
+# than a blanket directory.
+#
+# Kept: GRAPH_REPORT.md, because it is prose a human reads, and
+# .graphify_labels.json, because the community names in it were written by a
+# person and survive a rebuild.
+#
+# Ignored below, for three different reasons:
+#
+#  - graph.json / graph.html / cache/ are derived data, regenerated wholesale
+#    on every run. Committing them adds ~14 MB to history *per rebuild*, and
+#    nothing regenerates them on a merge, so they go stale silently — a graph
+#    that confidently answers about code that has since moved is worse than no
+#    graph. Rebuild with `/graphify --update`, which re-extracts only the files
+#    that changed.
+#  - manifest.json and cost.json are per-machine bookkeeping (incremental-update
+#    state and a token-spend log).
+#  - .graphify_python and .graphify_root hold absolute paths into whoever ran it
+#    last ("/home/<user>/.local/share/uv/tools/..."). The skill *reads*
+#    .graphify_python to pick an interpreter, so a committed one is not merely
+#    noise: it points a teammate's run at a path that does not exist.
+graphify-out/graph.json
 graphify-out/graph.html
+graphify-out/cache/
+graphify-out/manifest.json
+graphify-out/cost.json
+graphify-out/.graphify_python
+graphify-out/.graphify_root
