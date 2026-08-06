@@ -253,6 +253,34 @@ async fn main() -> ExitCode {
     }
 
     let headless = cli.is_headless(std::io::stdout().is_terminal());
+
+    // A first run used to guess Anthropic and then fail on a key the user was
+    // never asked for, blaming them for a choice the code made. There is no
+    // honest guess to make here, so it stops guessing: with a terminal, the
+    // wizard opens; without one, the error names every way out instead of the
+    // one provider that happened to be first in an enum.
+    if needs_first_run_setup(&cli) {
+        if headless {
+            eprintln!("smith: no provider configured yet. Pick one of:");
+            eprintln!("  smith setup                       — interactive, saves to ~/.smith");
+            eprintln!("  smith --provider ollama --model <name> -p '…'   — one run, no config");
+            eprintln!("  export ANTHROPIC_API_KEY=…        — or OPENAI_/OPENROUTER_/NINEROUTER_");
+            return ExitCode::from(EXIT_USAGE);
+        }
+        println!("smith: no provider configured yet — starting setup.\n");
+        if let Err(e) = setup::run(false).await {
+            eprintln!("smith: setup failed: {e}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+        // Re-read rather than trust: the wizard may have been Esc'd out of
+        // with nothing chosen, and starting a session that cannot answer is
+        // the failure this whole branch exists to avoid.
+        if needs_first_run_setup(&cli) {
+            eprintln!("smith: still no provider configured — {GENERIC_TIP}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    }
+
     if !headless {
         if std::env::var("SMITH_AUTO_UPDATE").as_deref() == Ok("1") {
             update::auto_update().await;
@@ -266,6 +294,58 @@ async fn main() -> ExitCode {
     } else {
         run_tui(cli, logs).await
     }
+}
+
+/// Env vars that count as "a provider is configured" even with an empty
+/// config file, paired with the provider each one names. Exporting one is a
+/// deliberate act; a CI box that did it must never be dropped into an
+/// interactive menu, and must not be told about a provider it never named.
+///
+/// Order is the tie-break when several are exported. Anthropic leads because
+/// it was the historical default, so a box that already worked keeps working.
+const PROVIDER_KEY_ENVS: [(&str, ProviderKind); 4] = [
+    ("ANTHROPIC_API_KEY", ProviderKind::Anthropic),
+    ("OPENAI_API_KEY", ProviderKind::Openai),
+    ("OPENROUTER_API_KEY", ProviderKind::Openrouter),
+    ("NINEROUTER_API_KEY", ProviderKind::NineRouter),
+];
+
+fn provider_from_exported_key() -> Option<ProviderKind> {
+    PROVIDER_KEY_ENVS
+        .iter()
+        .find(|(var, _)| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
+        .map(|(_, kind)| *kind)
+}
+
+/// True when this run has nothing to talk to and nobody has said otherwise.
+///
+/// `--provider` counts, because it names one outright. So does any saved
+/// `[general] provider`, and so does an exported key. Everything else is a
+/// fresh install.
+fn needs_first_run_setup(cli: &Cli) -> bool {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = Config::load_layered(&cwd).unwrap_or_default();
+    first_run_needed(
+        cli.provider,
+        provider_from_exported_key(),
+        config.general.provider.as_deref(),
+    )
+}
+
+/// The decision itself, without the environment. Split out because the three
+/// inputs are a process-global env var, the working directory and a parsed
+/// config — none of which a test can vary in parallel with another test.
+fn first_run_needed(
+    from_flag: Option<ProviderKind>,
+    from_env: Option<ProviderKind>,
+    from_config: Option<&str>,
+) -> bool {
+    from_flag.is_none()
+        && from_env.is_none()
+        // A config naming a provider smith does not understand is not a
+        // configured provider. Treating it as one would send the user into
+        // the same dead end this branch exists to prevent, one layer deeper.
+        && from_config.and_then(ProviderKind::from_config_str).is_none()
 }
 
 /// Rust sets `SIGPIPE` to `SIG_IGN` at startup, which turns `smith sessions
@@ -512,6 +592,12 @@ impl Startup {
                     .as_deref()
                     .and_then(ProviderKind::from_config_str)
             })
+            // An exported key is the only remaining statement of intent, and
+            // it says which provider. Without this, a box with just
+            // `OPENAI_API_KEY` set reached the old Anthropic default and was
+            // told it had no Anthropic key — naming a provider the user never
+            // mentioned, about a key they never had to have.
+            .or_else(provider_from_exported_key)
             .unwrap_or(ProviderKind::Anthropic);
         let model = cli
             .model
@@ -1081,6 +1167,48 @@ mod tests {
     use clap::CommandFactory;
     use smith_tui::ThemeName;
     use std::ffi::OsStr;
+
+    /// The regression: a fresh install used to guess Anthropic and then fail
+    /// on a key nobody was asked for.
+    #[test]
+    fn a_machine_with_nothing_configured_is_a_first_run() {
+        assert!(first_run_needed(None, None, None));
+    }
+
+    #[test]
+    fn any_one_statement_of_intent_ends_the_first_run() {
+        assert!(!first_run_needed(Some(ProviderKind::Ollama), None, None));
+        assert!(!first_run_needed(None, Some(ProviderKind::Openai), None));
+        assert!(!first_run_needed(None, None, Some("openrouter")));
+    }
+
+    /// A provider id smith cannot parse is not a configured provider — it is a
+    /// typo, and treating it as configured walks into the same dead end one
+    /// layer further down, where the message is about a missing key.
+    #[test]
+    fn a_config_naming_an_unknown_provider_is_still_a_first_run() {
+        assert!(first_run_needed(None, None, Some("gpt5-turbo-ultra")));
+        assert!(first_run_needed(None, None, Some("")));
+    }
+
+    /// The env table has to name the provider each key belongs to, or a box
+    /// with only `OPENAI_API_KEY` set gets told it has no *Anthropic* key.
+    #[test]
+    fn every_provider_key_env_names_its_own_provider() {
+        for (var, kind) in PROVIDER_KEY_ENVS {
+            let expected = match kind {
+                ProviderKind::Anthropic => "ANTHROPIC",
+                ProviderKind::Openai => "OPENAI",
+                ProviderKind::Openrouter => "OPENROUTER",
+                ProviderKind::NineRouter => "NINEROUTER",
+                ProviderKind::Ollama => unreachable!("ollama needs no key"),
+            };
+            assert!(
+                var.starts_with(expected),
+                "{var} is paired with {kind:?}, which it does not name"
+            );
+        }
+    }
 
     fn cli(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("smith").chain(args.iter().copied()))
