@@ -167,6 +167,7 @@ fn hook_set(config: &Config) -> Arc<smith_core::HookSet> {
 /// `doctor` cannot disagree about which backends are configured.
 pub(crate) fn web_search_settings(config: &Config) -> smith_tools::web_search::SearchSettings {
     smith_tools::web_search::SearchSettings {
+        backend: config.search.backend.clone(),
         exa_api_key: config.exa.api_key.clone(),
         tavily_api_key: config.tavily.api_key.clone(),
         searxng_url: config.search.searxng_url.clone(),

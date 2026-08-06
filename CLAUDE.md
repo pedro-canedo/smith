@@ -246,7 +246,12 @@ lives independently of the `Arc<dyn LlmProvider>`.
 ### Web search backends
 
 `web_search` (`smith-tools/src/web_search.rs`) tries seven backends in order,
-each falling through to the next when it is unconfigured, blocked, or errors:
+each falling through to the next when it is unconfigured, blocked, or errors.
+`[search] backend` pins every search to exactly one of them (Hermes-style
+explicit routing): a pin is absolute — pinned-but-unconfigured fails naming
+the missing key rather than silently rerouting, because the user who pins
+(own SearXNG, for privacy) is exactly the user a silent fallback betrays.
+Unpinned, the chain is:
 
 1. **SearXNG** (`smith-tools/src/searxng.rs`) — the user's own instance, set
    via `[search] searxng_url`. First whenever configured, ahead of even a paid

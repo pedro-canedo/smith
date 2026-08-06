@@ -141,6 +141,10 @@ impl Unavailable {
 /// does not churn every call site.
 #[derive(Debug, Clone, Default)]
 pub struct SearchSettings {
+    /// Pin every search to exactly one backend (`[search] backend`). See
+    /// [`WebSearchTool::run_pinned`] for the names and the no-fallback
+    /// contract.
+    pub backend: Option<String>,
     pub exa_api_key: Option<String>,
     /// API key for Tavily (https://app.tavily.com) — free tier available.
     pub tavily_api_key: Option<String>,
@@ -282,6 +286,16 @@ impl WebSearchTool {
         ctx: &ToolContext,
         cancel: &CancellationToken,
     ) -> Result<(String, Vec<SearchResult>), Vec<(&'static str, Unavailable)>> {
+        if let Some(pin) = self
+            .settings
+            .backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            return self.run_pinned(pin, query, limit, ctx, cancel).await;
+        }
+
         let mut failures: Vec<(&'static str, Unavailable)> = Vec::new();
 
         macro_rules! tier {
@@ -340,6 +354,123 @@ impl WebSearchTool {
         );
 
         Err(failures)
+    }
+
+    /// Runs exactly the pinned backend — no fallback, Hermes-style.
+    ///
+    /// The contract is that an explicit pin **wins even when unavailable**: a
+    /// pin to `tavily` with no key fails saying "set `[tavily] api_key`"
+    /// rather than silently searching somewhere else. Silent rerouting is
+    /// worse than the error for exactly the user who pins — someone routing
+    /// queries through their own SearXNG for privacy would have them leak to
+    /// Bing on the first hiccup, and never know.
+    async fn run_pinned(
+        &self,
+        pin: &str,
+        query: &str,
+        limit: usize,
+        ctx: &ToolContext,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Vec<SearchResult>), Vec<(&'static str, Unavailable)>> {
+        // `google_news` and `google-news` are the same intent; so are case
+        // variants. Normalising is cheap and the pin is typed by a human.
+        let normalized = pin.to_ascii_lowercase().replace('_', "-");
+
+        let (label, outcome): (&'static str, Result<Vec<SearchResult>, Unavailable>) =
+            match normalized.as_str() {
+                "searxng" => (
+                    "SearXNG",
+                    match self
+                        .settings
+                        .searxng_url
+                        .as_deref()
+                        .filter(|u| !u.trim().is_empty())
+                    {
+                        Some(url) => {
+                            ctx.report_progress("trying SearXNG…".to_string());
+                            crate::searxng::search(&self.client, url, query, limit).await
+                        }
+                        None => Err(Unavailable::Misconfigured(
+                            "`[search] backend` is pinned to `searxng` but no `[search] \
+                             searxng_url` is set — set one, or remove the pin"
+                                .into(),
+                        )),
+                    },
+                ),
+                "exa" => (
+                    "Exa",
+                    match self
+                        .settings
+                        .exa_api_key
+                        .as_deref()
+                        .filter(|k| !k.trim().is_empty())
+                    {
+                        Some(key) => {
+                            ctx.report_progress("trying Exa…".to_string());
+                            self.search_exa(key, query, limit).await
+                        }
+                        None => Err(Unavailable::Misconfigured(
+                            "`[search] backend` is pinned to `exa` but no `[exa] api_key` is \
+                             set — set one, or remove the pin"
+                                .into(),
+                        )),
+                    },
+                ),
+                "tavily" => (
+                    "Tavily",
+                    match self
+                        .settings
+                        .tavily_api_key
+                        .as_deref()
+                        .filter(|k| !k.trim().is_empty())
+                    {
+                        Some(key) => {
+                            ctx.report_progress("trying Tavily…".to_string());
+                            self.search_tavily(key, query, limit).await
+                        }
+                        None => Err(Unavailable::Misconfigured(
+                            "`[search] backend` is pinned to `tavily` but no `[tavily] api_key` \
+                             is set — set one, or remove the pin"
+                                .into(),
+                        )),
+                    },
+                ),
+                "bing" => {
+                    ctx.report_progress("trying Bing…".to_string());
+                    ("Bing", self.search_bing(query, limit, cancel).await)
+                }
+                "bing-browser" => {
+                    ctx.report_progress("trying Bing via headless browser…".to_string());
+                    (
+                        "Bing via headless browser",
+                        self.search_bing_browser(query, limit, cancel).await,
+                    )
+                }
+                "google-news" => {
+                    ctx.report_progress("trying Google News…".to_string());
+                    ("Google News", self.search_google_news(query, limit).await)
+                }
+                "duckduckgo" | "ddg" => {
+                    ctx.report_progress("trying DuckDuckGo…".to_string());
+                    (
+                        "DuckDuckGo",
+                        search_duckduckgo_lite(&self.client, query, limit).await,
+                    )
+                }
+                _ => (
+                    "web_search config",
+                    Err(Unavailable::Misconfigured(format!(
+                        "`[search] backend = \"{pin}\"` names no backend — valid values: \
+                         searxng, exa, tavily, bing, bing-browser, google-news, duckduckgo \
+                         (or remove the key to use the full chain)"
+                    ))),
+                ),
+            };
+
+        match outcome {
+            Ok(results) => Ok((format!("{label} (pinned)"), results)),
+            Err(e) => Err(vec![(label, e)]),
+        }
     }
 
     /// Bing over plain HTTP, retried across markets and then over time.
@@ -1267,6 +1398,88 @@ mod tests {
         assert_eq!(tool.cached("q", 1).unwrap().results.len(), 1);
         assert_eq!(tool.cached("q", 2).unwrap().results.len(), 2);
         assert!(tool.cached("q", 3).is_none());
+    }
+
+    // ---- pinned backend ------------------------------------------------------
+
+    /// The pin contract: pinned-but-unconfigured fails naming exactly the
+    /// missing key, and no other tier is attempted — the failure detail
+    /// carries one backend, not the whole chain.
+    #[tokio::test]
+    async fn a_pinned_backend_never_falls_back_and_names_the_missing_config() {
+        let tool = WebSearchTool::with_settings(SearchSettings {
+            backend: Some("tavily".into()),
+            ..SearchSettings::default()
+        });
+        let ctx = smith_core::ToolContext::new(std::env::temp_dir(), "test");
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "anything"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("[tavily] api_key"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("- Tavily:"), "{}", result.content);
+        // Single-entry detail — Bing/DuckDuckGo were never consulted.
+        assert!(!result.content.contains("- Bing:"), "{}", result.content);
+        assert!(
+            !result.content.contains("- DuckDuckGo:"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pin_is_a_config_error_listing_the_valid_names() {
+        let tool = WebSearchTool::with_settings(SearchSettings {
+            backend: Some("frobnicate".into()),
+            ..SearchSettings::default()
+        });
+        let ctx = smith_core::ToolContext::new(std::env::temp_dir(), "test");
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "anything"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("frobnicate"), "{}", result.content);
+        assert!(
+            result.content.contains("valid values"),
+            "{}",
+            result.content
+        );
+    }
+
+    /// A pinned SearXNG with no URL is the privacy user's likeliest mistake —
+    /// it must name the missing setting, not quietly search elsewhere.
+    #[tokio::test]
+    async fn a_searxng_pin_without_a_url_names_the_missing_setting() {
+        let tool = WebSearchTool::with_settings(SearchSettings {
+            backend: Some("SearXNG".into()), // case-insensitive on purpose
+            ..SearchSettings::default()
+        });
+        let ctx = smith_core::ToolContext::new(std::env::temp_dir(), "test");
+        let result = tool
+            .execute(
+                serde_json::json!({"query": "anything"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("searxng_url"), "{}", result.content);
+        assert!(!result.content.contains("- Bing:"), "{}", result.content);
     }
 
     /// An empty result set is the one most likely to be an upstream hiccup;

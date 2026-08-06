@@ -66,6 +66,9 @@ fn provider_summary(config: &Config) -> String {
 
 /// One line of state for the main menu's web-search row.
 fn search_summary(config: &Config) -> String {
+    if let Some(pin) = config.search.backend.as_deref().filter(|p| !p.is_empty()) {
+        return format!("pinned: {pin}");
+    }
     let mut parts: Vec<&str> = Vec::new();
     if config.search.searxng_url.is_some() {
         parts.push("searxng");
@@ -302,6 +305,10 @@ fn section_search(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Res
     loop {
         let items = [
             format!(
+                "Backend          [{}]   auto = try every tier in order; a pin never falls back",
+                config.search.backend.as_deref().unwrap_or("auto")
+            ),
+            format!(
                 "SearXNG URL      [{}]   your own instance — best free backend",
                 config.search.searxng_url.as_deref().unwrap_or("not set")
             ),
@@ -327,6 +334,34 @@ fn section_search(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Res
 
         match choice {
             Some(0) => {
+                let backends = [
+                    "auto (recommended — full fall-through chain)",
+                    "searxng",
+                    "tavily",
+                    "exa",
+                    "bing",
+                    "bing-browser",
+                    "google-news",
+                    "duckduckgo",
+                ];
+                let current = config
+                    .search
+                    .backend
+                    .as_deref()
+                    .and_then(|b| backends.iter().position(|x| *x == b))
+                    .unwrap_or(0);
+                if let Some(idx) = Select::with_theme(theme)
+                    .with_prompt("Backend (a pin runs only that backend and never falls back)")
+                    .items(&backends)
+                    .default(current)
+                    .interact_opt()?
+                {
+                    let next = (idx > 0).then(|| backends[idx].to_string());
+                    changed |= next != config.search.backend;
+                    config.search.backend = next;
+                }
+            }
+            Some(1) => {
                 let entered: String = Input::with_theme(theme)
                     .with_prompt("SearXNG base URL (blank keeps, '-' clears)")
                     .allow_empty(true)
@@ -335,7 +370,7 @@ fn section_search(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Res
                 changed |= next != config.search.searxng_url;
                 config.search.searxng_url = next;
             }
-            Some(1) => {
+            Some(2) => {
                 let entered: String = Password::with_theme(theme)
                     .with_prompt("Tavily API key (blank keeps, '-' clears)")
                     .allow_empty_password(true)
@@ -344,7 +379,7 @@ fn section_search(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Res
                 changed |= next != config.tavily.api_key;
                 config.tavily.api_key = next;
             }
-            Some(2) => {
+            Some(3) => {
                 let entered: String = Password::with_theme(theme)
                     .with_prompt("Exa API key (blank keeps, '-' clears)")
                     .allow_empty_password(true)
@@ -353,7 +388,7 @@ fn section_search(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Res
                 changed |= next != config.exa.api_key;
                 config.exa.api_key = next;
             }
-            Some(3) => {
+            Some(4) => {
                 let entered: String = Input::with_theme(theme)
                     .with_prompt("Bing market tag, e.g. pt-BR (blank keeps, '-' returns to auto)")
                     .allow_empty(true)
@@ -565,6 +600,16 @@ mod tests {
         config.tavily.api_key = Some("k".into());
         config.search.searxng_url = Some("https://sx.example".into());
         assert_eq!(search_summary(&config), "searxng + tavily");
+    }
+
+    /// A pin dominates the summary: with one set, the keys beside it are
+    /// dormant and listing them would misstate what a search will do.
+    #[test]
+    fn search_summary_shows_a_pin_over_everything_else() {
+        let mut config = Config::default();
+        config.tavily.api_key = Some("k".into());
+        config.search.backend = Some("searxng".into());
+        assert_eq!(search_summary(&config), "pinned: searxng");
     }
 
     #[test]

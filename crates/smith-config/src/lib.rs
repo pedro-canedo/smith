@@ -131,6 +131,17 @@ pub struct OllamaSettings {
 /// `[search]` — how `web_search` looks things up.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchSettings {
+    /// Pin `web_search` to exactly one backend (`searxng`, `exa`, `tavily`,
+    /// `bing`, `bing-browser`, `google-news`, `duckduckgo`). Unset means the
+    /// full fall-through chain.
+    ///
+    /// A pin is absolute, Hermes-style: only that backend runs, and if it is
+    /// missing its key or URL the search fails with a message naming exactly
+    /// what to set — never a silent reroute to another backend. That is the
+    /// point of pinning: a user who runs their own SearXNG so queries stay on
+    /// their infrastructure must not have one quietly sent to Bing because
+    /// their instance was down.
+    pub backend: Option<String>,
     /// Base URL of a SearXNG instance the user runs, e.g.
     /// `https://searx.example.com`. When set it becomes the *first* backend
     /// `web_search` tries, ahead of even a paid Exa key: it is the user's own
@@ -306,9 +317,11 @@ impl Config {
         self.ollama.base_url = other.ollama.base_url.or(self.ollama.base_url.take());
 
         let SearchSettings {
+            backend,
             searxng_url,
             market,
         } = other.search;
+        self.search.backend = backend.or(self.search.backend.take());
         self.search.searxng_url = searxng_url.or(self.search.searxng_url.take());
         self.search.market = market.or(self.search.market.take());
 
