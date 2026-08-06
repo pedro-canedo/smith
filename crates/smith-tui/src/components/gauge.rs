@@ -51,13 +51,21 @@ pub fn fill_style(ratio: f64, theme: &Theme) -> Style {
 /// it is a `chars/4` estimate of the unsent delta. Rendering an estimate in
 /// the same shape as a measurement is a lie about which one this is.
 pub fn label(used: u32, window: u32, estimated: bool) -> String {
-    let percent = (ratio(used, window) * 100.0).round() as u32;
+    // Deliberately *not* clamped, and this is the whole point of the label.
+    //
+    // It used to print `window.max(used)`, so a prompt of 7.4k against a 4.1k
+    // window read as "100% 7.4k/7.4k" — a full window, which is normal — when
+    // the truth was 180% of a window that had been detected wrong. The number
+    // that would have exposed a misconfigured model was the one being hidden.
+    // Over 100% is a real state worth seeing: the provider is truncating, or
+    // the window smith believes in is not the one the model has.
+    let percent = if window == 0 {
+        0
+    } else {
+        ((f64::from(used) / f64::from(window)) * 100.0).round() as u32
+    };
     let tilde = if estimated { "~" } else { "" };
-    format!(
-        "{tilde}{percent}% {}/{}",
-        compact(used),
-        compact(window.max(used))
-    )
+    format!("{tilde}{percent}% {}/{}", compact(used), compact(window))
 }
 
 /// Spelled out under the gauge whenever `estimated` is set, because a tilde
@@ -94,6 +102,26 @@ pub fn context_gauge(used: u32, window: u32, estimated: bool, theme: &Theme) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bar clamps because `LineGauge` panics past 1.0; the *label* must
+    /// not, or a blown window is indistinguishable from a full one.
+    ///
+    /// This is not hypothetical: a session on an Ollama cloud model whose
+    /// window smith had detected as 4096 sat at "100% 7.4k/7.4k" for its whole
+    /// life. The real figure was 180%, and it was the only thing on screen
+    /// that could have said the model was misconfigured.
+    #[test]
+    fn a_window_that_is_already_blown_says_so() {
+        assert_eq!(label(7_400, 4_096, false), "181% 7.4k/4.1k");
+        assert_eq!(label(2_048, 4_096, false), "50% 2.0k/4.1k");
+        // The bar itself still clamps, because the widget requires it.
+        assert_eq!(ratio(7_400, 4_096), 1.0);
+    }
+
+    #[test]
+    fn an_unknown_window_reports_no_percentage_rather_than_dividing() {
+        assert_eq!(label(500, 0, false), "0% 500/0");
+    }
 
     #[test]
     fn the_ratio_is_clamped_at_both_ends() {
@@ -133,10 +161,14 @@ mod tests {
     }
 
     #[test]
-    fn the_label_never_claims_more_than_a_full_window() {
-        // `used > window` is real; showing "104% 133k/128k" is not useful, and
-        // showing "100% 133k/128k" is self-contradictory.
-        assert_eq!(label(133_000, 128_000, false), "100% 133k/133k");
+    fn the_label_reports_an_over_full_window_instead_of_rounding_it_away() {
+        // This test used to assert "100% 133k/133k", on the reasoning that
+        // "104% 133k/128k" is not useful and "100% 133k/128k" is
+        // self-contradictory. The first half was wrong: `used > window` is
+        // exactly the state a user needs to see, because it means the provider
+        // is truncating or the window smith believes in is not the model's.
+        // Rewriting both numbers to agree removed the only evidence of that.
+        assert_eq!(label(133_000, 128_000, false), "104% 133k/128k");
     }
 
     #[test]

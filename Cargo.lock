@@ -2864,6 +2864,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smith-core",
+ "tokio",
  "tokio-util",
  "tracing",
 ]

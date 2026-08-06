@@ -331,7 +331,7 @@ impl OrchestratorState {
     /// Rebuilds the agent against a (possibly new) provider/model, carrying
     /// the conversation history over so switching mid-chat doesn't lose
     /// context.
-    fn switch_model(
+    async fn switch_model(
         &mut self,
         provider: Option<String>,
         model: String,
@@ -377,6 +377,10 @@ impl OrchestratorState {
         // edited mid-session take effect on `/model` and nowhere else.
         let subagents = self.agent.subagent_definitions().to_vec();
         let unattended = self.agent.unattended();
+
+        // Same reason as at startup: a switch to a model with a different
+        // window must move the gauge and the compaction threshold with it.
+        new_provider.warm_capabilities(&model).await;
 
         let scratch_dir = tool_ctx.scratch_dir();
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
@@ -673,6 +677,11 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     // static prompt byte-identical for the whole session.
     let system = system_prompt_with(persona.as_ref());
 
+    // Before the first request, so the context gauge and the compaction
+    // threshold are built on what the model actually has rather than on a
+    // guess. Best-effort: a provider that cannot answer keeps its defaults.
+    provider.warm_capabilities(&model).await;
+
     let scratch_dir = tool_ctx.scratch_dir();
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_checkpointer(checkpoints.clone())
@@ -783,7 +792,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                 let config = config.clone();
                 tokio::spawn(async move {
                     let mut guard = state.lock().await;
-                    match guard.switch_model(provider, model, &config) {
+                    match guard.switch_model(provider, model, &config).await {
                         Ok((provider_label, model_label)) => {
                             let saved = if save {
                                 let mut to_save = config.clone();

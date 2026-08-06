@@ -151,6 +151,23 @@ pub trait LlmProvider: Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// Asks the provider to learn what it can about `model` before the first
+    /// request, so `capabilities` stops guessing.
+    ///
+    /// Exists because `capabilities` is sync and the honest answer sometimes
+    /// needs a round trip. Ollama is the case that forced it: its
+    /// OpenAI-compatible endpoint says nothing about the context window, so
+    /// smith assumed a conservative 4096 — which is right for an unconfigured
+    /// local `ollama serve` and wrong by a factor of 64 for a cloud model.
+    /// A wrong window is not a cosmetic error: compaction fires against it, so
+    /// the conversation gets summarised away every few rounds and the model
+    /// keeps forgetting what it just learned.
+    ///
+    /// Best-effort by contract. A provider that cannot answer leaves the
+    /// defaults in place, and a network failure here must never stop a
+    /// session starting.
+    async fn warm_capabilities(&self, _model: &str) {}
+
     /// Stream a completion. The returned stream yields normalized `StreamEvent`s;
     /// the caller accumulates them into a `Message`.
     async fn stream_completion(

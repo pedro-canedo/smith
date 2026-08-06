@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -45,6 +46,22 @@ const OPENAI_MODEL_LIMITS: &[(&str, u32, u32)] = &[
 /// 128K here would let compaction sail past a limit that is really 4096 —
 /// exactly the failure this default exists to prevent.
 const OLLAMA_CONTEXT_WINDOW: u32 = 4096;
+/// Pulls `num_ctx` out of Ollama's flat `parameters` blob (`"num_ctx 8192"`,
+/// one setting per line).
+fn parse_num_ctx(parameters: &str) -> Option<u32> {
+    parameters.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        (parts.next()? == "num_ctx")
+            .then(|| parts.next()?.parse().ok())
+            .flatten()
+    })
+}
+
+/// Cap on the output half of the window.
+///
+/// Halving works at 4096; at 262144 it would claim a 131k reply, which no
+/// model produces and some servers reject outright.
+const OLLAMA_MAX_OUTPUT_CEILING: u32 = 32_768;
 
 fn openai_capabilities(model: &str) -> ProviderCapabilities {
     let Some(&(id, context_window, max_output)) = OPENAI_MODEL_LIMITS
@@ -69,12 +86,14 @@ fn openai_capabilities(model: &str) -> ProviderCapabilities {
     }
 }
 
-fn ollama_capabilities(_model: &str) -> ProviderCapabilities {
+fn ollama_capabilities(window: u32) -> ProviderCapabilities {
     ProviderCapabilities {
-        context_window: OLLAMA_CONTEXT_WINDOW,
+        context_window: window,
         // Output is carved out of the same `num_ctx` budget, so leave half the
-        // window for the prompt rather than claiming the whole thing.
-        max_output: OLLAMA_CONTEXT_WINDOW / 2,
+        // window for the prompt rather than claiming the whole thing — but
+        // never more than a model will actually emit in one reply, or the
+        // request asks for something the server refuses.
+        max_output: (window / 2).min(OLLAMA_MAX_OUTPUT_CEILING),
         // Tool support is per-model on Ollama and not advertised over this
         // endpoint; smith already sends tools and lets the server ignore them.
         supports_tools: true,
@@ -91,6 +110,12 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     base_url: String,
     flavor: Flavor,
+    /// Context windows learned from Ollama's own `/api/show`, keyed by model.
+    ///
+    /// A fact beats the constant below every time it is available. Empty until
+    /// `warm_capabilities` has run, and left empty when it fails — the guess is
+    /// the fallback, not the answer.
+    known_windows: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 impl OpenAiProvider {
@@ -100,6 +125,62 @@ impl OpenAiProvider {
             client: http_client(),
             base_url: DEFAULT_BASE_URL.to_string(),
             flavor: Flavor::OpenAi,
+            known_windows: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// The window `/api/show` reported for this model, or the conservative
+    /// guess if it was never asked or never answered.
+    fn known_window(&self, model: &str) -> u32 {
+        self.known_windows
+            .read()
+            .ok()
+            .and_then(|known| known.get(model).copied())
+            .unwrap_or(OLLAMA_CONTEXT_WINDOW)
+    }
+
+    /// Ollama's native API sits beside the OpenAI-compatible one: the base URL
+    /// is `.../v1`, and `/api/show` hangs off its parent.
+    fn ollama_api_root(&self) -> String {
+        self.base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string()
+    }
+
+    /// Asks Ollama what this model's context length actually is.
+    ///
+    /// `parameters` wins over `model_info` when it names `num_ctx`: the
+    /// architecture's context length is what the weights support, `num_ctx` is
+    /// what this server allocated, and the smaller one is what the prompt is
+    /// truncated to.
+    async fn probe_ollama_window(&self, model: &str) -> Option<u32> {
+        let url = format!("{}/api/show", self.ollama_api_root());
+        let body = serde_json::json!({ "model": model });
+        let response = self.client.post(&url).json(&body).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value: serde_json::Value = response.json().await.ok()?;
+
+        let architecture_window = value
+            .get("model_info")
+            .and_then(|info| info.as_object())
+            .and_then(|info| {
+                info.iter()
+                    .find(|(key, _)| key.ends_with(".context_length"))
+                    .and_then(|(_, v)| v.as_u64())
+            })
+            .and_then(|n| u32::try_from(n).ok());
+
+        let allocated = value
+            .get("parameters")
+            .and_then(|p| p.as_str())
+            .and_then(parse_num_ctx);
+
+        match (architecture_window, allocated) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -123,10 +204,24 @@ impl LlmProvider for OpenAiProvider {
         "openai"
     }
 
+    async fn warm_capabilities(&self, model: &str) {
+        if self.flavor != Flavor::Ollama {
+            return;
+        }
+        let Some(window) = self.probe_ollama_window(model).await else {
+            // Left unset on purpose: `known_window` then answers with the
+            // conservative default, which is the right way to be wrong.
+            return;
+        };
+        if let Ok(mut known) = self.known_windows.write() {
+            known.insert(model.to_string(), window);
+        }
+    }
+
     fn capabilities(&self, model: &str) -> ProviderCapabilities {
         match self.flavor {
             Flavor::OpenAi => openai_capabilities(model),
-            Flavor::Ollama => ollama_capabilities(model),
+            Flavor::Ollama => ollama_capabilities(self.known_window(model)),
         }
     }
 
@@ -382,6 +477,85 @@ fn messages_to_wire(messages: &[Message], system: Option<&str>) -> Vec<serde_jso
 
 #[cfg(test)]
 mod tests {
+    /// Exercises the real `/api/show` against a running Ollama. Ignored, like
+    /// the other live tests: it needs a server and a pulled model.
+    ///
+    /// `PROBE_MODEL=nemotron-3-super:cloud cargo test -p smith-provider \
+    ///   live_ollama -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_ollama_reports_a_real_window() {
+        let model =
+            std::env::var("PROBE_MODEL").unwrap_or_else(|_| "nemotron-3-super:cloud".to_string());
+        let provider = OpenAiProvider::ollama("http://127.0.0.1:11434/v1");
+        let before = provider.capabilities(&model).context_window;
+        provider.warm_capabilities(&model).await;
+        let after = provider.capabilities(&model);
+        println!(
+            "{model}: guessed {before}, probed {} (max_output {})",
+            after.context_window, after.max_output
+        );
+        assert!(
+            after.context_window > OLLAMA_CONTEXT_WINDOW,
+            "the probe did not improve on the guess"
+        );
+    }
+
+    /// `num_ctx` is what the server actually allocated; the architecture's
+    /// context length is only what the weights could support.
+    #[test]
+    fn num_ctx_is_read_out_of_ollamas_flat_parameter_blob() {
+        assert_eq!(
+            parse_num_ctx("num_ctx                        8192"),
+            Some(8192)
+        );
+        assert_eq!(
+            parse_num_ctx("stop                           \"<|eot|>\"\nnum_ctx  16384\n"),
+            Some(16384)
+        );
+        assert_eq!(parse_num_ctx("temperature 0.7"), None);
+        assert_eq!(parse_num_ctx(""), None);
+        // A malformed value is not a window; better the conservative default
+        // than a nonsense one.
+        assert_eq!(parse_num_ctx("num_ctx lots"), None);
+    }
+
+    /// The bug this fixes, stated as arithmetic: a cloud model with a 262144
+    /// window was being driven as if it had 4096, so compaction fired every
+    /// few rounds and the model forgot what it had just searched for.
+    #[test]
+    fn a_known_window_replaces_the_conservative_guess() {
+        let guessed = ollama_capabilities(OLLAMA_CONTEXT_WINDOW);
+        assert_eq!(guessed.context_window, 4096);
+        assert_eq!(guessed.max_output, 2048);
+
+        let real = ollama_capabilities(262_144);
+        assert_eq!(real.context_window, 262_144);
+        // Halving stops being sensible at this size: no model emits a 131k
+        // reply, and some servers refuse the request outright.
+        assert_eq!(real.max_output, OLLAMA_MAX_OUTPUT_CEILING);
+    }
+
+    /// `/api/show` sits beside the OpenAI-compatible endpoint, not under it.
+    #[test]
+    fn the_native_api_root_is_the_parent_of_the_openai_one() {
+        let provider = OpenAiProvider::ollama("http://127.0.0.1:11434/v1");
+        assert_eq!(provider.ollama_api_root(), "http://127.0.0.1:11434");
+        let trailing = OpenAiProvider::ollama("http://127.0.0.1:11434/v1/");
+        assert_eq!(trailing.ollama_api_root(), "http://127.0.0.1:11434");
+    }
+
+    /// Until the probe answers — and forever if it never does — the guess
+    /// stands. A provider that cannot be asked must still start a session.
+    #[test]
+    fn an_unprobed_model_keeps_the_conservative_default() {
+        let provider = OpenAiProvider::ollama("http://127.0.0.1:11434/v1");
+        assert_eq!(
+            provider.capabilities("anything:cloud").context_window,
+            OLLAMA_CONTEXT_WINDOW
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -540,10 +714,14 @@ mod tests {
         );
     }
 
+    /// Unprobed, every model gets the conservative local default — the window
+    /// is now a value rather than a constant baked into this function, so what
+    /// this pins is the *fallback*, not the answer.
     #[test]
-    fn ollama_reports_the_conservative_local_default_for_every_model() {
+    fn ollama_reports_the_conservative_local_default_when_nothing_is_known() {
+        let provider = OpenAiProvider::ollama("http://127.0.0.1:11434/v1");
         for model in ["llama3.3", "qwen2.5", "something-nobody-has-heard-of"] {
-            let caps = ollama_capabilities(model);
+            let caps = provider.capabilities(model);
             assert_eq!(caps.context_window, 4096);
             assert!(caps.max_output <= caps.context_window);
             assert!(!caps.supports_cache && !caps.supports_token_count);

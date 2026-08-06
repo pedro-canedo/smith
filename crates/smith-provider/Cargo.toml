@@ -16,3 +16,8 @@ reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 async-stream = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The live `/api/show` probe test needs a runtime; nothing in the shipped
+# crate does, which is why this is dev-only.
+tokio = { workspace = true, features = ["macros", "rt"] }
