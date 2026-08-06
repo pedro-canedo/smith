@@ -222,6 +222,20 @@ impl TranscriptCache {
         Some((start, end - start))
     }
 
+    /// Which entry occupies document row `row`, if any.
+    ///
+    /// `offsets` is a prefix sum, so this is a binary search rather than a
+    /// walk — the same index that makes the height lookup O(1) makes a click
+    /// O(log n) instead of O(session).
+    pub fn entry_at_row(&self, row: usize) -> Option<usize> {
+        if self.offsets.len() < 2 || row >= *self.offsets.last()? {
+            return None;
+        }
+        // `partition_point` gives the first offset strictly greater than
+        // `row`; the entry that contains the row is the one before it.
+        Some(self.offsets.partition_point(|&o| o <= row) - 1)
+    }
+
     /// Entries rebuilt by the most recent `sync` — 0 means a full cache hit.
     pub fn misses(&self) -> usize {
         self.misses
@@ -321,6 +335,7 @@ mod tests {
             goal: None,
             tasks: Vec::new(),
             commands: crate::slash::SlashRegistry::builtin(),
+            history: Vec::new(),
             logs: crate::logbuf::LogBuffer::default(),
         })
     }

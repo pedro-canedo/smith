@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod banner;
+pub mod complete;
 pub mod components;
 pub mod highlight;
 pub mod logbuf;
@@ -20,6 +21,7 @@ use smith_core::{Action, AgentEvent, PermissionAsk, QuestionAsk};
 use tokio::sync::{mpsc, oneshot};
 
 pub use app::{App, ChatLine, ChatRole, IdleHint, TuiConfig};
+pub use complete::CompletionKind;
 pub use logbuf::{LogBuffer, LogLevel, LogLine};
 pub use theme::Theme;
 
@@ -63,6 +65,11 @@ pub async fn run(
                 let Some(Ok(event)) = maybe_event else { continue };
                 if let Event::Paste(text) = &event {
                     app.on_paste(text);
+                }
+                if let Event::Mouse(mouse) = event {
+                    if let Some(action) = app.on_mouse(mouse) {
+                        let _ = action_tx.send(action);
+                    }
                 }
                 if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press {

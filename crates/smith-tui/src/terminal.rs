@@ -3,8 +3,8 @@ use std::sync::OnceLock;
 
 use crossterm::cursor::Show;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -28,7 +28,19 @@ pub fn init() -> io::Result<Tui> {
     // Bracketed paste turns a pasted block into one `Event::Paste` instead of
     // a stream of keys — without it, pasting anything multi-line submits the
     // prompt at the first newline.
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    // Mouse capture costs the terminal's own click-drag text selection, which
+    // is a real trade: holding **Shift** while dragging bypasses capture and
+    // selects natively in every terminal that implements the protocol at all
+    // (xterm, iTerm2, Windows Terminal, kitty, alacritty, gnome-terminal). We
+    // take that trade for the wheel: a transcript you cannot scroll with the
+    // wheel reads as broken to anyone who has used a terminal in the last
+    // twenty years, and PageUp is a poor substitute for a long tool output.
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     // Lets terminals that support it distinguish Shift+Enter from Enter.
     // Everywhere else the two are the same byte and Alt+Enter is the fallback.
     let keyboard_enhancement = keyboard_enhancement_available();
@@ -51,6 +63,7 @@ pub fn restore() -> io::Result<()> {
     let screen = execute!(
         io::stdout(),
         Show,
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     );

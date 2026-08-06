@@ -7,6 +7,9 @@ use smith_core::{
 };
 
 use crate::components::input::TextInput;
+use ratatui::layout::Rect;
+
+use crate::complete::{self, CompletionKind};
 use crate::logbuf::LogBuffer;
 use crate::slash::SlashRegistry;
 use crate::theme::Theme;
@@ -463,11 +466,19 @@ pub struct TuiConfig {
     /// Custom slash commands discovered under `.smith/commands/` and
     /// `~/.smith/commands/`. Empty for a frontend that does not load them.
     pub commands: SlashRegistry,
+    /// Prompts already submitted in this project, most recent first. Empty
+    /// for a fresh session; on `--resume` it is the resumed conversation's
+    /// own user messages.
+    pub history: Vec<String>,
     /// Shared ring the `tracing` subscriber writes into; `Ctrl+L` reads it.
     /// Default-constructed for a frontend that installs no subscriber, in
     /// which case the panel simply reports that it is empty.
     pub logs: LogBuffer,
 }
+
+/// Prompts kept in the recall ring. Generous — an entry is a short string,
+/// and the cost of forgetting the one you wanted is another round of typing.
+pub const HISTORY_LIMIT: usize = 200;
 
 /// Title of the `Ctrl+L` panel. A constant because the key toggles on it:
 /// pressing `Ctrl+L` with `/usage` open should replace it, not close it.
@@ -633,6 +644,29 @@ pub struct App {
     /// Latest local-machine resource snapshot (Ollama only; `None` for
     /// token-billed providers, which show a cost estimate instead).
     pub resources: Option<ResourceStats>,
+    /// Where the transcript was drawn last frame, so a click can be turned
+    /// into a row in it. Recorded by `ui::draw_messages`, which is the only
+    /// place that knows the rect.
+    pub(crate) message_area: Rect,
+    /// Paths under the project root, for `@` completion. Built on the first
+    /// `@` rather than at startup: walking a large repository is not something
+    /// to spend on a session that never types one.
+    file_index: Option<Vec<String>>,
+    /// What the suggestion list is currently offering.
+    pub completion_kind: CompletionKind,
+    /// Prompts submitted in this project, oldest last — `history[0]` is the
+    /// most recent, so "one step back" is a plain index.
+    ///
+    /// Seeded on startup from the resumed session's own user messages rather
+    /// than from a separate history file: the messages are already persisted,
+    /// already scoped to this project, and cannot drift out of sync with the
+    /// conversation they came from.
+    history: Vec<String>,
+    /// How far back the user has walked, or `None` while editing their own
+    /// text. `history_draft` holds that text so walking back and forward
+    /// again returns it rather than eating it.
+    history_pos: Option<usize>,
+    history_draft: String,
     /// The read-only panel on screen, if any — see `Overlay`. Yields to a
     /// real `Modal`, which is why both can be set without ambiguity.
     pub overlay: Option<Overlay>,
@@ -723,6 +757,12 @@ impl App {
             usage: Usage::default(),
             context: None,
             resources: None,
+            message_area: Rect::default(),
+            file_index: None,
+            completion_kind: CompletionKind::default(),
+            history: config.history,
+            history_pos: None,
+            history_draft: String::new(),
             overlay: None,
             logs: config.logs,
             session_cost: None,
@@ -749,9 +789,24 @@ impl App {
         }
     }
 
-    /// Slash-command suggestions for the current input (empty when not typing `/cmd`).
-    pub fn slash_suggestions(&self) -> Vec<crate::slash::SlashSuggestion> {
-        self.commands.suggestions_for(&self.input.text())
+    /// Completions for what the caret is on: slash commands for `/cmd`, file
+    /// paths for `@path`, nothing otherwise.
+    ///
+    /// `&mut` because the file index is built here, on the first `@` of the
+    /// session. Walking the repository at startup would charge every session
+    /// for a feature most never use, and doing it per keystroke would charge
+    /// the ones that do, on every keystroke.
+    pub fn suggestions(&mut self) -> Vec<crate::slash::SlashSuggestion> {
+        let text = self.input.text();
+        if let Some(token) = complete::file_token(&text) {
+            self.completion_kind = CompletionKind::File;
+            let files = self
+                .file_index
+                .get_or_insert_with(|| complete::index_files(std::path::Path::new(".")));
+            return complete::file_suggestions(files, token);
+        }
+        self.completion_kind = CompletionKind::Slash;
+        self.commands.suggestions_for(&text)
     }
 
     /// Bracketed paste: text arrives as one event, so embedded newlines land
@@ -1234,11 +1289,20 @@ impl App {
             }
         }
 
-        let slash_hints = self.slash_suggestions();
-        let slash_nav = !slash_hints.is_empty();
+        let hints = self.suggestions();
+        let slash_nav = !hints.is_empty();
+        let completing_file = self.completion_kind == CompletionKind::File;
 
         match code {
             KeyCode::Esc if self.waiting_on_assistant => Some(Action::CancelGeneration),
+            KeyCode::Tab if slash_nav && completing_file => {
+                if let Some(pick) = hints.get(self.slash_selected) {
+                    let replaced = complete::accept_file(&self.input.text(), &pick.name);
+                    self.input.set(&replaced);
+                    self.slash_selected = 0;
+                }
+                None
+            }
             KeyCode::Tab if slash_nav => {
                 if let Some(completed) = self
                     .commands
@@ -1254,7 +1318,7 @@ impl App {
                 None
             }
             KeyCode::Down if slash_nav => {
-                let max = slash_hints.len().saturating_sub(1);
+                let max = hints.len().saturating_sub(1);
                 self.slash_selected = (self.slash_selected + 1).min(max);
                 None
             }
@@ -1276,11 +1340,20 @@ impl App {
                 None
             }
             // Arrows walk the caret through a multi-line prompt first; they
-            // only fall through to scrolling the transcript once the caret is
-            // already at the top/bottom of the input — which is always the
-            // case for the single-row prompt this used to be.
+            // only reach the history once the caret is already at the top or
+            // bottom of the input — which is always the case for the
+            // single-row prompt this used to be.
             KeyCode::Up if self.input.move_up() => None,
             KeyCode::Down if self.input.move_down() => None,
+            // Past the edge of the input, the arrows walk the prompt history,
+            // the way every shell and REPL binds them. Scrolling the
+            // transcript keeps PageUp/PageDown and the mouse wheel: a
+            // conversation is read by the page, and a previous prompt is
+            // recalled by the line.
+            KeyCode::Up if self.history_back() => None,
+            KeyCode::Down if self.history_forward() => None,
+            // Nothing to recall — fall back to the old meaning rather than
+            // making the key inert.
             KeyCode::Up => {
                 self.follow_bottom = false;
                 self.scroll = self.scroll.saturating_sub(1);
@@ -1303,6 +1376,17 @@ impl App {
                 if self.input.text().trim().is_empty() || self.waiting_on_assistant {
                     return None;
                 }
+                // A highlighted path is accepted rather than submitted — the
+                // list is on screen precisely because the caret is mid-token,
+                // so Enter means "that one", the way Tab does.
+                if slash_nav && completing_file {
+                    if let Some(pick) = hints.get(self.slash_selected) {
+                        let replaced = complete::accept_file(&self.input.text(), &pick.name);
+                        self.input.set(&replaced);
+                        self.slash_selected = 0;
+                        return None;
+                    }
+                }
                 // If a slash suggestion is highlighted and input is still only
                 // a partial command, Tab-complete first instead of submitting.
                 if slash_nav && !self.input.text().contains(char::is_whitespace) {
@@ -1317,6 +1401,9 @@ impl App {
                 }
                 let text = self.input.take();
                 self.slash_selected = 0;
+                // Slash commands go in too: `/model gpt-4.1` is exactly the
+                // kind of thing you want back with one keypress.
+                self.remember_prompt(&text);
 
                 if let Some(command) = text.strip_prefix('/') {
                     return self.run_slash_command(command.trim());
@@ -1829,6 +1916,154 @@ impl App {
         ]);
         overlay.scroll = u16::MAX;
         self.overlay = Some(overlay);
+    }
+
+    /// Rows a wheel notch moves. Three is the terminal convention and what
+    /// every other pager in the user's shell already does.
+    const WHEEL_ROWS: u16 = 3;
+
+    /// Mouse input. Scrolling is the whole point; clicking selects the tool
+    /// card under the pointer, which is the same selection `Ctrl+O` drives.
+    pub fn on_mouse(&mut self, event: crossterm::event::MouseEvent) -> Option<Action> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                // Whatever is on top gets the wheel: a panel or modal covers
+                // the transcript, so scrolling what is hidden behind it would
+                // be scrolling something the user cannot see.
+                if self.overlay.is_some() {
+                    self.scroll_overlay(-(Self::WHEEL_ROWS as i32));
+                } else if self.modal.is_some() {
+                    self.scroll_modal(-(Self::WHEEL_ROWS as i32));
+                } else {
+                    self.follow_bottom = false;
+                    self.scroll = self.scroll.saturating_sub(Self::WHEEL_ROWS);
+                }
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                if self.overlay.is_some() {
+                    self.scroll_overlay(Self::WHEEL_ROWS as i32);
+                } else if self.modal.is_some() {
+                    self.scroll_modal(Self::WHEEL_ROWS as i32);
+                } else {
+                    self.scroll = self.scroll.saturating_add(Self::WHEEL_ROWS);
+                }
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.click_at(event.column, event.row);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Select the tool card under a click, or clear the selection when the
+    /// click lands somewhere that isn't one.
+    fn click_at(&mut self, column: u16, row: u16) {
+        if self.overlay.is_some() || self.modal.is_some() {
+            return;
+        }
+        let area = self.message_area;
+        if area.height == 0
+            || row < area.y
+            || row >= area.y + area.height
+            || column < area.x
+            || column >= area.x + area.width
+        {
+            return;
+        }
+        // Screen row -> document row: the pane starts at `area.y` and shows
+        // the document from `self.scroll` down.
+        let doc_row = (row - area.y) as usize + self.scroll as usize;
+        let Some(index) = self.transcript.entry_at_row(doc_row) else {
+            self.select_card(None);
+            return;
+        };
+        if self
+            .lines
+            .get(index)
+            .is_some_and(|l| l.role == ChatRole::Tool)
+        {
+            // A second click on the same card expands it, which is what
+            // double-clicking a row means everywhere else.
+            if self.selected_card() == Some(index) {
+                self.toggle_selected_card();
+            } else {
+                self.select_card(Some(index));
+            }
+        } else {
+            self.select_card(None);
+        }
+    }
+
+    /// Step one entry further back in the prompt history. `false` means there
+    /// was nothing to step to, so the caller can give the key its old meaning.
+    fn history_back(&mut self) -> bool {
+        let next = match self.history_pos {
+            None => 0,
+            Some(i) => i + 1,
+        };
+        if next >= self.history.len() {
+            return false;
+        }
+        if self.history_pos.is_none() {
+            // Set aside whatever was half-typed, so walking forward again
+            // brings it back instead of losing it.
+            self.history_draft = self.input.text();
+        }
+        self.history_pos = Some(next);
+        let entry = self.history[next].clone();
+        self.input.set(&entry);
+        true
+    }
+
+    /// Step one entry forward; past the newest, restore the saved draft.
+    fn history_forward(&mut self) -> bool {
+        let Some(i) = self.history_pos else {
+            return false;
+        };
+        if i == 0 {
+            self.history_pos = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.input.set(&draft);
+        } else {
+            self.history_pos = Some(i - 1);
+            let entry = self.history[i - 1].clone();
+            self.input.set(&entry);
+        }
+        true
+    }
+
+    /// Record a submitted prompt and leave history-walking mode.
+    ///
+    /// Consecutive duplicates collapse — holding Enter on the same message,
+    /// or resubmitting a recalled one, should not make Up press twice to get
+    /// past it.
+    fn remember_prompt(&mut self, text: &str) {
+        self.history_pos = None;
+        self.history_draft.clear();
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.history.first().is_some_and(|h| h == text) {
+            return;
+        }
+        self.history.insert(0, text.to_string());
+        self.history.truncate(HISTORY_LIMIT);
+    }
+
+    /// Move the open modal by `delta` rows, if it has a scroll offset.
+    /// Clamping to the end is the renderer's job, as it is for the overlay.
+    fn scroll_modal(&mut self, delta: i32) {
+        let scroll = match &mut self.modal {
+            Modal::Permission(m) => &mut m.scroll,
+            Modal::Plan(m) => &mut m.scroll,
+            Modal::Question(_) | Modal::None => return,
+        };
+        *scroll = (*scroll as i32).saturating_add(delta).max(0) as u16;
     }
 
     /// Move the overlay by `delta` rows. Clamping to the *end* is left to the
@@ -2573,6 +2808,7 @@ mod tests {
             goal: None,
             tasks: Vec::new(),
             commands,
+            history: Vec::new(),
             logs: LogBuffer::default(),
         })
     }
@@ -3134,6 +3370,147 @@ mod tests {
         // Never off the top.
         app.on_key(KeyCode::PageUp, KeyModifiers::NONE);
         assert_eq!(app.overlay.as_ref().unwrap().scroll, 0);
+    }
+
+    fn submit(app: &mut App, text: &str) {
+        app.input.set(text);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn up_walks_back_through_submitted_prompts_and_down_walks_forward() {
+        let mut app = test_app();
+        submit(&mut app, "first");
+        app.waiting_on_assistant = false;
+        submit(&mut app, "second");
+        app.waiting_on_assistant = false;
+
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "second", "most recent comes back first");
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "first");
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "second");
+    }
+
+    /// Walking back must not eat what was already typed.
+    #[test]
+    fn walking_forward_past_the_newest_entry_restores_the_draft() {
+        let mut app = test_app();
+        submit(&mut app, "old prompt");
+        app.waiting_on_assistant = false;
+        app.input.set("half-typed");
+
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "old prompt");
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "half-typed");
+    }
+
+    #[test]
+    fn history_stops_at_the_oldest_entry_instead_of_wrapping() {
+        let mut app = test_app();
+        submit(&mut app, "only one");
+        app.waiting_on_assistant = false;
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "only one");
+    }
+
+    /// With nothing to recall, the arrows keep their old meaning rather than
+    /// becoming inert keys.
+    #[test]
+    fn an_empty_history_leaves_the_arrows_scrolling_the_transcript() {
+        let mut app = test_app();
+        app.scroll = 5;
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.scroll, 4);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn resubmitting_the_same_prompt_does_not_double_it_in_the_history() {
+        let mut app = test_app();
+        submit(&mut app, "same");
+        app.waiting_on_assistant = false;
+        submit(&mut app, "same");
+        app.waiting_on_assistant = false;
+        assert_eq!(app.history, vec!["same".to_string()]);
+    }
+
+    #[test]
+    fn typing_an_at_token_switches_the_suggestion_list_to_files() {
+        let mut app = test_app();
+        app.input.set("look at @Cargo");
+        // Seeded directly: the real index walks the filesystem, which is not
+        // what this test is about.
+        app.file_index = Some(vec!["Cargo.toml".to_string(), "src/app.rs".to_string()]);
+        let hints = app.suggestions();
+        assert_eq!(app.completion_kind, CompletionKind::File);
+        assert_eq!(hints.first().map(|h| h.name.as_str()), Some("Cargo.toml"));
+    }
+
+    #[test]
+    fn tab_accepts_a_file_suggestion_into_the_prompt() {
+        let mut app = test_app();
+        app.file_index = Some(vec!["crates/smith-tui/src/app.rs".to_string()]);
+        app.input.set("explain @app.rs");
+        app.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.input.text(), "explain @crates/smith-tui/src/app.rs ");
+    }
+
+    /// A slash command must still complete as a slash command.
+    #[test]
+    fn the_file_list_does_not_displace_slash_completion() {
+        let mut app = test_app();
+        app.input.set("/he");
+        let hints = app.suggestions();
+        assert_eq!(app.completion_kind, CompletionKind::Slash);
+        assert!(hints.iter().any(|h| h.name == "help"), "{hints:?}");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_transcript_and_releases_the_live_edge() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.scroll = 10;
+        app.follow_bottom = true;
+
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll, 7);
+        assert!(!app.follow_bottom, "scrolling up unpins the live edge");
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll, 10);
+        // A click outside any recorded transcript area is inert, not a panic.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 200,
+            row: 200,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    /// An open panel is what the user is looking at, so it gets the wheel.
+    #[test]
+    fn the_wheel_scrolls_an_open_overlay_rather_than_the_transcript_behind_it() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = test_app();
+        app.scroll = 10;
+        app.run_slash_command("usage");
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.overlay.as_ref().unwrap().scroll, 3);
+        assert_eq!(app.scroll, 10, "the transcript stayed put");
     }
 
     #[test]

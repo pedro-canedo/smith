@@ -632,6 +632,7 @@ async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         theme: tui_theme(cli.ascii),
         goal: startup.initial_goal.clone(),
         tasks: last_write_tasks_call(&startup.initial_messages),
+        history: prompt_history(&startup.initial_messages),
         commands: smith_tui::slash::SlashRegistry::new(commands),
         logs,
     };
@@ -938,6 +939,37 @@ fn messages_to_chat_lines(messages: &[Message]) -> Vec<ChatLine> {
         }
     }
     lines
+}
+
+/// The user's own prompts from a resumed session, most recent first, so the
+/// Up key reaches them the way it would in a shell.
+///
+/// Only messages the *user* typed: a `Role::User` message can also be a
+/// carrier for tool results, and recalling `[{"type":"tool_result",...}]` into
+/// the prompt box would be nonsense. Text blocks are the only ones a user
+/// could have produced by typing.
+fn prompt_history(messages: &[Message]) -> Vec<String> {
+    let mut history: Vec<String> = Vec::new();
+    for message in messages {
+        if message.role != smith_core::Role::User {
+            continue;
+        }
+        let text: String = message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.trim().is_empty() {
+            history.push(text);
+        }
+    }
+    history.reverse();
+    history.truncate(smith_tui::app::HISTORY_LIMIT);
+    history
 }
 
 /// Rebuilds the checklist from the last `write_tasks` call in a resumed

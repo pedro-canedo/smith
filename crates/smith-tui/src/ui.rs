@@ -119,7 +119,7 @@ fn vertical_layout(
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let suggestions = app.slash_suggestions();
+    let suggestions = app.suggestions();
     let wanted_suggest = if suggestions.is_empty() {
         0
     } else {
@@ -552,6 +552,9 @@ pub(crate) fn render_in_flight(text: &str, theme: &Theme, width: u16) -> Vec<Lin
 }
 
 fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Recorded for the mouse: turning a click into a transcript row needs the
+    // rect, and this is the only place that knows it.
+    app.message_area = area;
     let key = crate::transcript::LayoutKey {
         width: area.width,
         verbose: app.verbose_tools,
@@ -1401,6 +1404,13 @@ fn draw_slash_suggestions(
 ) {
     let theme = &app.theme;
     let w = area.width as usize;
+    let prefix = app.completion_kind.prefix();
+    // A path is the whole entry and carries no description, so padding it to
+    // a command's column width would just push every row right.
+    let name_width = match app.completion_kind {
+        crate::complete::CompletionKind::Slash => 12,
+        crate::complete::CompletionKind::File => 0,
+    };
     let mut lines: Vec<Line> = suggestions
         .iter()
         .take(6)
@@ -1409,7 +1419,7 @@ fn draw_slash_suggestions(
             let selected = i == app.slash_selected;
             let marker = if selected { "› " } else { "  " };
             let spans = vec![Span::styled(
-                format!("{marker}/{:<12} {}", s.name, s.description),
+                format!("{marker}{prefix}{:<name_width$} {}", s.name, s.description),
                 if selected {
                     theme.info_bold()
                 } else {
@@ -2195,6 +2205,7 @@ mod tests {
             goal: None,
             tasks: Vec::new(),
             commands: crate::slash::SlashRegistry::builtin(),
+            history: Vec::new(),
             logs: crate::logbuf::LogBuffer::default(),
         })
     }

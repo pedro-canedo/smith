@@ -2847,6 +2847,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "futures",
+ "ignore",
  "ratatui",
  "serde_json",
  "similar",
