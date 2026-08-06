@@ -176,7 +176,11 @@ impl MemoryScope {
 
 /// First ancestor of `from` (inclusive) holding a root marker, else `from`.
 fn find_project_root(from: &Path) -> PathBuf {
+    let temp_root = lexical_normalize(&std::env::temp_dir());
     for dir in from.ancestors() {
+        if lexical_normalize(dir) == temp_root && dir != from {
+            continue;
+        }
         if ROOT_MARKERS.iter().any(|m| dir.join(m).exists()) {
             return dir.to_path_buf();
         }

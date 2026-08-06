@@ -7,6 +7,8 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use crate::Theme;
+
 /// Pad `spans` with trailing styled spaces so the row's background covers
 /// exactly `width` cells. Without this, the terminal's own bg leaks through
 /// at the end of short lines and the panel looks broken.
@@ -67,6 +69,37 @@ pub fn rule(
     fill_line(spans, width, bg)
 }
 
+pub fn themed_rule(
+    theme: &Theme,
+    left: &str,
+    right: &str,
+    label: Option<(&str, Style)>,
+    width: usize,
+    border: Style,
+    bg: Style,
+) -> Line<'static> {
+    let inner = width.saturating_sub(2);
+    let horizontal = theme.border_horizontal();
+    let mut spans = vec![Span::styled(left.to_string(), border)];
+
+    match label {
+        Some((text, style)) if inner > text.chars().count() + 4 => {
+            let label = format!(" {text} ");
+            let label_width = label.chars().count();
+            spans.push(Span::styled(horizontal.to_string(), border));
+            spans.push(Span::styled(label, style));
+            spans.push(Span::styled(
+                horizontal.repeat(inner - label_width - 1),
+                border,
+            ));
+        }
+        _ => spans.push(Span::styled(horizontal.repeat(inner), border)),
+    }
+
+    spans.push(Span::styled(right.to_string(), border));
+    fill_line(spans, width, bg)
+}
+
 /// A side-bordered row: `│` on both ends, padded content in the middle.
 ///
 /// Guarantees a result of exactly `width` cells — content wider than the box
@@ -97,6 +130,30 @@ pub fn bordered_row(
     fill_line(spans, width, bg)
 }
 
+pub fn themed_bordered_row(
+    theme: &Theme,
+    content: Vec<Span<'static>>,
+    width: usize,
+    border: Style,
+    bg: Style,
+) -> Line<'static> {
+    let inner = width.saturating_sub(2);
+    let text_width = inner.saturating_sub(BOX_PADDING * 2);
+    let content = crate::components::wrap::truncate_spans(&content, text_width);
+    let used: usize = content.iter().map(|s| s.width()).sum();
+    let vertical = theme.border_vertical();
+
+    let mut spans = vec![Span::styled(vertical.to_string(), border)];
+    spans.push(Span::styled(" ".repeat(BOX_PADDING), bg));
+    spans.extend(content);
+    spans.push(Span::styled(
+        " ".repeat(text_width.saturating_sub(used) + BOX_PADDING),
+        bg,
+    ));
+    spans.push(Span::styled(vertical.to_string(), border));
+    fill_line(spans, width, bg)
+}
+
 /// Build a complete rounded box around a list of content lines. The box
 /// fills the full `width` with `bg` and uses `border` for the frame.
 pub fn rounded_box(
@@ -122,6 +179,40 @@ pub fn rounded_box_titled(
         out.push(bordered_row(line.spans.clone(), width, border, bg));
     }
     out.push(rule("╰", "╯", None, width, border, bg));
+    out
+}
+
+pub fn themed_rounded_box_titled(
+    theme: &Theme,
+    title: Option<(&str, Style)>,
+    content: &[Line<'static>],
+    width: usize,
+    border: Style,
+    bg: Style,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(content.len() + 2);
+    let (top_left, top_right, bottom_left, bottom_right) = theme.rounded_corners();
+    out.push(themed_rule(
+        theme, top_left, top_right, title, width, border, bg,
+    ));
+    for line in content {
+        out.push(themed_bordered_row(
+            theme,
+            line.spans.clone(),
+            width,
+            border,
+            bg,
+        ));
+    }
+    out.push(themed_rule(
+        theme,
+        bottom_left,
+        bottom_right,
+        None,
+        width,
+        border,
+        bg,
+    ));
     out
 }
 

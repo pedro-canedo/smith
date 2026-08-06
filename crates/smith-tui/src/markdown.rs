@@ -94,10 +94,10 @@ pub fn render(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     #[cfg(test)]
     RENDER_CALLS.with(|c| c.set(c.get() + 1));
     let rendered = from_str_with_options(text, &options(theme));
-    owned_lines(rendered)
+    owned_lines(rendered, theme)
 }
 
-fn owned_lines(text: Text<'_>) -> Vec<Line<'static>> {
+fn owned_lines(text: Text<'_>, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = text
         .lines
         .into_iter()
@@ -105,7 +105,14 @@ fn owned_lines(text: Text<'_>) -> Vec<Line<'static>> {
             Line::from(
                 line.spans
                     .into_iter()
-                    .map(|span| Span::styled(span.content.to_string(), span.style))
+                    .map(|span| {
+                        let content = if theme.unicode {
+                            span.content.to_string()
+                        } else {
+                            ascii_markdown_glyphs(&span.content)
+                        };
+                        Span::styled(content, span.style)
+                    })
                     .collect::<Vec<_>>(),
             )
         })
@@ -114,6 +121,18 @@ fn owned_lines(text: Text<'_>) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
     lines
+}
+
+fn ascii_markdown_glyphs(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '│' => '|',
+            '─' | '━' => '-',
+            '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' => '+',
+            '…' => '.',
+            other => other,
+        })
+        .collect()
 }
 
 #[cfg(test)]

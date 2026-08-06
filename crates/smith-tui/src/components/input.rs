@@ -50,7 +50,11 @@ impl TextInput {
         // derives the chrome height from it, and the row budget is counted in
         // outer rows. `draw_input` replaces this each frame with the titled,
         // mode-coloured version — same borders, same height.
-        area.set_block(Block::default().borders(Borders::ALL));
+        area.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(theme.block_border_set()),
+        );
         Self { area }
     }
 

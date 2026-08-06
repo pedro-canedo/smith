@@ -4,6 +4,7 @@
 //! No `Color::` literal may appear outside this module.
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 
 /// Spinner frames for a terminal that can render braille.
 pub const SPINNER_UNICODE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -237,6 +238,63 @@ impl Theme {
         }
     }
 
+    pub fn ellipsis(&self) -> &'static str {
+        if self.unicode {
+            "…"
+        } else {
+            "..."
+        }
+    }
+
+    pub fn assistant_gutter(&self) -> (&'static str, &'static str) {
+        if self.unicode {
+            ("▌ ", "▏ ")
+        } else {
+            ("| ", "| ")
+        }
+    }
+
+    pub fn block_border_set(&self) -> symbols::border::Set<'static> {
+        if self.unicode {
+            symbols::border::PLAIN
+        } else {
+            symbols::border::Set {
+                top_left: "+",
+                top_right: "+",
+                bottom_left: "+",
+                bottom_right: "+",
+                vertical_left: "|",
+                vertical_right: "|",
+                horizontal_top: "-",
+                horizontal_bottom: "-",
+            }
+        }
+    }
+
+    pub fn rounded_corners(&self) -> (&'static str, &'static str, &'static str, &'static str) {
+        if self.unicode {
+            ("╭", "╮", "╰", "╯")
+        } else {
+            ("+", "+", "+", "+")
+        }
+    }
+
+    pub fn border_horizontal(&self) -> &'static str {
+        if self.unicode {
+            "─"
+        } else {
+            "-"
+        }
+    }
+
+    pub fn border_vertical(&self) -> &'static str {
+        if self.unicode {
+            "│"
+        } else {
+            "|"
+        }
+    }
+
     /// Filled / unfilled cells of a `LineGauge`.
     pub fn gauge_symbols(&self) -> (&'static str, &'static str) {
         if self.unicode {
@@ -318,9 +376,27 @@ mod tests {
             theme.icon_ok(),
             theme.icon_error(),
             theme.marker_selected(),
+            theme.ellipsis(),
+            theme.assistant_gutter().0,
+            theme.assistant_gutter().1,
+            theme.border_horizontal(),
+            theme.border_vertical(),
             filled,
             unfilled,
         ];
+        let border = theme.block_border_set();
+        glyphs.extend([
+            border.top_left,
+            border.top_right,
+            border.bottom_left,
+            border.bottom_right,
+            border.vertical_left,
+            border.vertical_right,
+            border.horizontal_top,
+            border.horizontal_bottom,
+        ]);
+        let (tl, tr, bl, br) = theme.rounded_corners();
+        glyphs.extend([tl, tr, bl, br]);
         glyphs.extend(theme.spinner_frames());
         for glyph in glyphs {
             assert!(glyph.is_ascii(), "{glyph:?} is not ASCII");

@@ -204,7 +204,12 @@ fn draw_idle(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("{} · {}", app.provider_label, app.model_label),
+        format!(
+            "{}{}{}",
+            app.provider_label,
+            theme.separator(),
+            app.model_label
+        ),
         theme.secondary(),
     )));
     lines.push(Line::from(""));
@@ -375,7 +380,7 @@ pub(crate) fn render_chat_line(
         }
         ChatRole::System => {
             rows.push(Line::from(vec![
-                Span::styled("· ", theme.disabled()),
+                Span::styled(theme.separator().trim_start().to_string(), theme.disabled()),
                 Span::styled(line.text().to_string(), theme.disabled()),
             ]));
         }
@@ -625,7 +630,7 @@ fn tool_card(
         // latest). Before this, the line was stored and never shown.
         if let Some(progress) = line.tool_output().and_then(|o| o.lines().next_back()) {
             let row = Line::from(vec![
-                Span::styled("… ", theme.disabled()),
+                Span::styled(format!("{} ", theme.ellipsis()), theme.disabled()),
                 Span::styled(
                     truncate_chars(progress, w.saturating_sub(6)),
                     theme.secondary(),
@@ -638,7 +643,10 @@ fn tool_card(
     // Errors always surface the tail of the failure output.
     if finished_error {
         for l in error_tail(line, ERROR_TAIL_LINES) {
-            let mut spans = vec![Span::styled("▌ ", theme.danger())];
+            let mut spans = vec![Span::styled(
+                theme.assistant_gutter().0.to_string(),
+                theme.danger(),
+            )];
             spans.push(Span::styled(
                 truncate_chars(&l, w.saturating_sub(4)),
                 theme.secondary(),
@@ -674,7 +682,10 @@ fn tool_card(
                         rows.push(Line::from(Span::styled(l.to_string(), theme.secondary())));
                     }
                     if content.lines().count() > ERROR_TAIL_LINES {
-                        rows.push(Line::from(Span::styled("…", theme.disabled())));
+                        rows.push(Line::from(Span::styled(
+                            theme.ellipsis().to_string(),
+                            theme.disabled(),
+                        )));
                     }
                 }
                 if !rows.is_empty() {
@@ -781,8 +792,6 @@ fn error_tail(line: &ChatLine, max: usize) -> Vec<String> {
 /// Gutter drawn down the left of an assistant reply: a solid bar on the first
 /// row, a hairline on the continuations. Cheaper on the eye than a full box
 /// and it keeps prose readable, while still marking the turn as the model's.
-const ASSISTANT_GUTTER: &str = "▌ ";
-const ASSISTANT_GUTTER_CONT: &str = "▏ ";
 /// Cells the gutter occupies — both glyphs are one cell plus a space.
 const ASSISTANT_GUTTER_WIDTH: usize = 2;
 
@@ -806,7 +815,8 @@ fn user_bubble(theme: &Theme, text: &str, area_width: u16) -> Vec<Line<'static>>
         content.push(Line::from(""));
     }
 
-    panel::rounded_box_titled(
+    panel::themed_rounded_box_titled(
+        theme,
         Some(("You", theme.ember())),
         &content,
         width,
@@ -843,10 +853,11 @@ fn assistant_block(
     body.into_iter()
         .enumerate()
         .map(|(i, line)| {
+            let (first_gutter, cont_gutter) = theme.assistant_gutter();
             let (glyph, style) = if i == 0 {
-                (ASSISTANT_GUTTER, theme.ember())
+                (first_gutter, theme.ember())
             } else {
-                (ASSISTANT_GUTTER_CONT, theme.disabled())
+                (cont_gutter, theme.disabled())
             };
             let mut spans = vec![Span::styled(glyph.to_string(), style)];
             spans.extend(line.spans);
@@ -885,6 +896,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let block = Block::default()
         .borders(Borders::LEFT)
+        .border_set(theme.block_border_set())
         .border_style(theme.disabled());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -928,7 +940,12 @@ fn sidebar_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut lines = vec![
         head("SESSION"),
         Line::from(Span::styled(
-            format!("{} · {}", app.provider_label, app.model_label),
+            format!(
+                "{}{}{}",
+                app.provider_label,
+                theme.separator(),
+                app.model_label
+            ),
             theme.text(),
         )),
     ];
@@ -1038,8 +1055,10 @@ fn task_lines(tasks: &[smith_core::Task], theme: &Theme) -> Vec<Line<'static>> {
         .collect();
     for task in pending.iter().take(MAX_SHOWN) {
         let (icon, style) = match task.status {
-            TaskStatus::InProgress => ("▶", theme.ember()),
-            _ => ("◻", theme.disabled()),
+            TaskStatus::InProgress if theme.unicode => ("▶", theme.ember()),
+            TaskStatus::InProgress => (">", theme.ember()),
+            _ if theme.unicode => ("◻", theme.disabled()),
+            _ => ("-", theme.disabled()),
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{icon} "), style),
@@ -1048,13 +1067,13 @@ fn task_lines(tasks: &[smith_core::Task], theme: &Theme) -> Vec<Line<'static>> {
     }
     if pending.len() > MAX_SHOWN {
         lines.push(Line::from(Span::styled(
-            format!("… +{} more", pending.len() - MAX_SHOWN),
+            format!("{} +{} more", theme.ellipsis(), pending.len() - MAX_SHOWN),
             theme.disabled(),
         )));
     }
     if done > 0 {
         lines.push(Line::from(vec![
-            Span::styled("✔ ", theme.success()),
+            Span::styled(if theme.unicode { "✔ " } else { "+ " }, theme.success()),
             Span::styled(format!("{done} completed"), theme.secondary()),
         ]));
     }
@@ -1077,9 +1096,12 @@ fn progress_bar_line(
     let filled = (done * bar_width) / total;
     let pct = (done * 100) / total;
     Some(Line::from(vec![
-        Span::styled("▰".repeat(filled), theme.ember()),
         Span::styled(
-            "▱".repeat(bar_width.saturating_sub(filled)),
+            (if theme.unicode { "▰" } else { "#" }).repeat(filled),
+            theme.ember(),
+        ),
+        Span::styled(
+            (if theme.unicode { "▱" } else { "-" }).repeat(bar_width.saturating_sub(filled)),
             theme.disabled(),
         ),
         Span::styled(format!(" {pct}%"), theme.disabled()),
@@ -1091,7 +1113,7 @@ fn sidebar_truncate(s: &str) -> String {
     if s.chars().count() <= MAX {
         s.to_string()
     } else {
-        format!("{}…", s.chars().take(MAX).collect::<String>())
+        format!("{}...", s.chars().take(MAX).collect::<String>())
     }
 }
 
@@ -1190,13 +1212,20 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     app.input.set_block(
         Block::default()
             .borders(Borders::ALL)
+            .border_set(theme.block_border_set())
             .title(title)
             .border_style(border),
     );
     app.input.set_placeholder(if plan {
-        "Plan mode — approve the plan modal or /plan reject…"
-    } else {
+        if theme.unicode {
+            "Plan mode — approve the plan modal or /plan reject…"
+        } else {
+            "Plan mode - approve the plan modal or /plan reject..."
+        }
+    } else if theme.unicode {
         "Ask anything…  type / for commands"
+    } else {
+        "Ask anything...  type / for commands"
     });
     app.input.set_style(if app.input.text().starts_with('/') {
         theme.info()
@@ -1257,14 +1286,17 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         let spinner = frames[app.spinner_frame % frames.len()];
         let mut s = format!("{spinner} {}", app.phase_label());
         if let Some((iteration, max_iterations)) = app.loop_progress {
-            s.push_str(&format!(" · {iteration}/{max_iterations}"));
+            s.push_str(&format!(
+                "{}{iteration}/{max_iterations}",
+                theme.separator()
+            ));
         }
         if let Some(secs) = app.turn_elapsed_secs() {
-            s.push_str(&format!(" · {secs:.0}s"));
+            s.push_str(&format!("{}{secs:.0}s", theme.separator()));
         }
         if let Some(tokens) = app.live_output_tokens_estimate() {
             if tokens > 0 {
-                s.push_str(&format!(" · ~{tokens} tok"));
+                s.push_str(&format!("{}~{tokens} tok", theme.separator()));
             }
         }
         Some(s)
@@ -1338,6 +1370,7 @@ fn draw_permission_modal(
     let block = |scrollable: bool| {
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_set(theme.block_border_set())
             .title(Span::styled(
                 " permission requested ",
                 theme.warning().add_modifier(Modifier::BOLD),
@@ -1426,6 +1459,7 @@ fn draw_plan_modal(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_set(theme.block_border_set())
                 .title(Span::styled(" plan ready ", theme.plan_bold()))
                 .border_style(theme.plan()),
         )
@@ -1453,7 +1487,11 @@ fn draw_question_modal(
     ];
     for (i, opt) in q.options.iter().enumerate() {
         let selected = modal.selected == i;
-        let marker = if selected { "›" } else { " " };
+        let marker = if selected {
+            theme.marker_selected()
+        } else {
+            " "
+        };
         let spans = vec![Span::styled(
             format!("{marker} {}. {opt}", i + 1),
             if selected {
@@ -1469,9 +1507,13 @@ fn draw_question_modal(
         });
     }
     body_lines.push(Line::from(""));
-    let custom_marker = if modal.selected == 3 { "›" } else { " " };
+    let custom_marker = if modal.selected == 3 {
+        theme.marker_selected()
+    } else {
+        " "
+    };
     let custom_display = if modal.custom.is_empty() {
-        "…".to_string()
+        theme.ellipsis().to_string()
     } else {
         modal.custom.clone()
     };
@@ -1513,6 +1555,7 @@ fn draw_question_modal(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_set(theme.block_border_set())
                 .title(Span::styled(" question ", theme.info_bold()))
                 .border_style(theme.info()),
         )
@@ -1811,15 +1854,12 @@ mod tests {
     #[test]
     fn assistant_block_gutters_every_row_and_stays_within_width() {
         let theme = Theme::truecolor();
+        let (first_gutter, cont_gutter) = theme.assistant_gutter();
         let lines = assistant_block(&theme, &"resposta longa ".repeat(20), None, 50);
         assert!(lines.len() > 1, "should have wrapped");
         for (i, line) in lines.iter().enumerate() {
             let text = line.to_string();
-            let expected = if i == 0 {
-                ASSISTANT_GUTTER
-            } else {
-                ASSISTANT_GUTTER_CONT
-            };
+            let expected = if i == 0 { first_gutter } else { cont_gutter };
             assert!(text.starts_with(expected), "row {i}: {text}");
             assert!(line.width() <= 50, "row {i} was {} wide", line.width());
         }
@@ -1831,7 +1871,7 @@ mod tests {
         let lines = assistant_block(&theme, "pronto", Some("ollama · 2.2s"), 50);
         let last = lines[lines.len() - 1].to_string();
         assert!(last.contains("ollama · 2.2s"), "last: {last}");
-        assert!(last.starts_with(ASSISTANT_GUTTER_CONT), "last: {last}");
+        assert!(last.starts_with(theme.assistant_gutter().1), "last: {last}");
     }
 
     #[test]
@@ -1882,11 +1922,6 @@ mod tests {
         let width = 60u16;
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let text = screen_text(&terminal);
-        assert!(
-            text.is_ascii(),
-            "non-ASCII bytes in 80x24 ASCII render: {text:?}"
-        );
         let buf = terminal.backend().buffer();
 
         let mut bubble_rows = 0;
@@ -2192,11 +2227,11 @@ mod tests {
             match i % 5 {
                 0 => app.lines.push(ChatLine::new(
                     ChatRole::User,
-                    format!("pergunta {i} — {}", "palavra ".repeat(12)),
+                    format!("pergunta {i} - {}", "palavra ".repeat(12)),
                 )),
                 1 => app.lines.push(ChatLine::new(
                     ChatRole::Assistant,
-                    format!("## resposta {i}\n\ncom `código` e **negrito**\n\n- um\n- dois"),
+                    format!("## resposta {i}\n\ncom `codigo` e **negrito**\n\n- um\n- dois"),
                 )),
                 2 => app.lines.push(ChatLine::new(
                     ChatRole::Assistant,
@@ -2520,6 +2555,11 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen_text(&terminal);
+        assert!(
+            text.is_ascii(),
+            "non-ASCII bytes in 80x24 ASCII render: {text:?}"
+        );
         let buf = terminal.backend().buffer();
         assert_eq!(buf.area().width, 80);
         // Every cell the transcript pane painted has to be one column wide,
