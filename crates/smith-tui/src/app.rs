@@ -390,9 +390,16 @@ impl ChatLine {
     fn touch(&mut self) {
         self.stamp = next_stamp();
     }
+}
 
+/// Card constructors that only tests use. They are `ChatLine`'s own, because
+/// they set private fields, but they are not `ChatLine`'s behaviour — so they
+/// sit in their own block rather than interleaved with the methods that ship.
+/// `pub(crate)`, not feature-gated: `ui.rs` and `transcript.rs` build cards to
+/// render, and a `#[cfg(test)]` item is visible to the whole crate's own tests.
+#[cfg(test)]
+impl ChatLine {
     /// Builds an arbitrary tool card for rendering tests.
-    #[cfg(test)]
     pub(crate) fn test_tool(
         name: &str,
         status: ActivityStatus,
@@ -413,7 +420,6 @@ impl ChatLine {
     /// A running card that started `ago` in the past — the only way to give a
     /// test a deterministic throbber phase, since a card's phase is derived
     /// from its own clock.
-    #[cfg(test)]
     pub(crate) fn test_tool_started(name: &str, id: &str, ago: Duration) -> Self {
         Self {
             tool_id: Some(id.to_string()),
@@ -429,7 +435,6 @@ impl ChatLine {
     }
 
     /// Marks this card selected, for rendering tests.
-    #[cfg(test)]
     pub(crate) fn test_selected(mut self) -> Self {
         self.selected = true;
         self

@@ -1,6 +1,15 @@
 use super::*;
 use crate::app::ChatRole;
 
+/// Rows the input box actually *gets* once `vertical_layout` has protected
+/// the transcript's floor. `draw` composes the two itself (it also has a
+/// slash list and a strip to place); this is the two-step version the prompt's
+/// own tests read.
+fn input_height(app: &mut App, frame_area: Rect) -> u16 {
+    let wanted = wanted_input_rows(app, frame_area);
+    vertical_layout(frame_area.height, wanted, 0, 0, false).input
+}
+
 #[test]
 fn clamp_width_shrinks_a_wide_area_and_leaves_position_alone() {
     let area = Rect {

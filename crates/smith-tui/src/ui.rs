@@ -442,16 +442,6 @@ fn wanted_input_rows(app: &mut App, frame_area: Rect) -> u16 {
     app.input.outer_rows(width)
 }
 
-/// Rows the input box actually *gets* once `vertical_layout` has protected
-/// the transcript's floor. `draw` composes the two itself (it also has a
-/// slash list and a strip to place); this is the two-step version the prompt's
-/// own tests read.
-#[cfg(test)]
-fn input_height(app: &mut App, frame_area: Rect) -> u16 {
-    let wanted = wanted_input_rows(app, frame_area);
-    vertical_layout(frame_area.height, wanted, 0, 0, false).input
-}
-
 /// The vitals that live in the sidebar, compressed onto one row for the
 /// terminals too narrow to have one (design-system §3.2). Priority order,
 /// dropped from the right as the row runs out.
