@@ -290,6 +290,32 @@ impl OpenAiProvider {
             .to_string()
     }
 
+    /// Rewrites a provider error into something the user can act on.
+    ///
+    /// Only Ollama has anything to rewrite, and only because it is a proxy:
+    /// the failures that matter belong to `ollama.com` and to the daemon's
+    /// signed-in state, neither of which the raw JSON explains. Every other
+    /// flavour's errors are already about the thing the user configured, so
+    /// they pass through untouched — dressing up an error smith did not
+    /// understand is how a message stops being true.
+    pub(crate) fn translate_error(&self, err: ProviderError) -> ProviderError {
+        if self.flavor != Flavor::Ollama {
+            return err;
+        }
+        let ProviderError::Api { ref message, .. } = err else {
+            return err;
+        };
+        // The body is the message here: `api_error` puts the whole response
+        // text in it, and that text is the JSON the daemon sent.
+        let text = serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|body| crate::ollama::error_in_success_body(&body).map(str::to_string));
+        match text {
+            Some(inner) => crate::ollama::classify_ollama_error(&inner),
+            None => err,
+        }
+    }
+
     /// Asks Ollama what this model's context length actually is.
     ///
     /// `parameters` wins over `model_info` when it names `num_ctx`: the
@@ -432,7 +458,7 @@ impl LlmProvider for OpenAiProvider {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(api_error(resp).await);
+            return Err(self.translate_error(api_error(resp).await));
         }
 
         let mut events = resp.bytes_stream().eventsource();
