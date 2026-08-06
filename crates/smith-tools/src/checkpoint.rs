@@ -697,7 +697,9 @@ impl Checkpointer for CheckpointStore {
 
 // ---- helpers ---------------------------------------------------------------
 
-fn hash_bytes(bytes: &[u8]) -> String {
+/// Shared with `fs_tools`, which hashes file contents for the same reason
+/// this module does — to tell "the same bytes" from "different bytes now".
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())

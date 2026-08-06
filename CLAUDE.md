@@ -137,6 +137,49 @@ Don't confuse `smith-tools/src/checkpoint.rs` with `staging.rs`: staging holds
 the *new* bytes of a write for the moment before it is applied and deletes
 itself immediately; checkpoints hold the *old* bytes and persist.
 
+### The read-before-overwrite gate
+
+`write_file` refuses to replace an **existing** file that the session has not
+read. Creating a new file is untouched — there is nothing there to destroy.
+Checkpoints can undo a blind overwrite, but the user often does not notice it
+happened until much later, so this prevents rather than undoes.
+
+The state is `smith_tools::fs_tools::ReadSet`: one `Arc`, built in
+`ToolRegistry::with_builtin_tools` and shared by `read_file`, `write_file`,
+`edit_file` and `multi_edit`. It cannot live on `ToolContext` (cloned per
+call, so writes through a clone are lost) or in a plain `ToolRegistry` field
+(the registry is behind an `Arc` and `execute` takes `&self`), so the tools —
+the only per-session objects that outlive a call — hold it, with a
+`std::sync::Mutex` inside. No lock is held across an `.await`; `ReadOnly`
+calls really do run concurrently now, and each record is one whole critical
+section.
+
+The four judgement calls, each of which has a wrong answer:
+
+- **Only `read_file` counts.** `grep` shows three lines out of a thousand and
+  `list_dir` shows a name; treating either as knowledge would make the gate
+  decorative.
+- **Coverage accumulates, and partial is not whole.** Ranges are merged, so a
+  long file read in chunks (what `read_file`'s own TRUNCATED note tells the
+  model to do) adds up. A clipped line or a lossy decode records nothing —
+  the model was shown characters the file does not contain.
+- **An edit does not grant knowledge, it carries it.** Matching `old_str`
+  proves the model knew that snippet, not the file, so `edit_file` never
+  *creates* a reading; it refreshes an existing whole-file one across the
+  change it just made. `write_file` marks what it wrote as known, because the
+  model authored those bytes.
+- **Knowledge is pinned to content, not to the event.** Entries are keyed on
+  the sha256 of the bytes that were read (`checkpoint::hash_bytes`), so a file
+  the user or `run_bash` changed afterwards is stale again. What that misses:
+  a model that has *forgotten* what it read (compaction) still passes, and
+  reading a file through `cat` in `run_bash` still fails — deliberately, on
+  the safe side.
+
+There is no `force` argument, and there must not be one: an escape hatch the
+model can set itself is not a gate. The refusal is one step from recovery
+(`read_file`, then write), which is why no user-facing override was added
+either.
+
 ### Session/goal persistence
 
 Conversations persist per-project to `.smith/sessions.db` (SQLite, via

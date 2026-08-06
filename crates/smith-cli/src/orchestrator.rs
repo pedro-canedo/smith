@@ -1169,8 +1169,17 @@ mod tests {
             .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-");
         let db = tempfile::tempdir().unwrap();
         let provider = Arc::new(ScriptedProvider::streams([
+            // The read is not decoration: `write_file` refuses to replace a
+            // file the session has never read (`fs_tools::ReadSet`), so a
+            // scripted model that skipped it would never get as far as the
+            // checkpoint this test is about.
             tool_call_reply(
                 "call_1",
+                "read_file",
+                serde_json::json!({ "path": target.to_string_lossy() }),
+            ),
+            tool_call_reply(
+                "call_2",
                 "write_file",
                 serde_json::json!({ "path": target.to_string_lossy(), "content": "the rewrite\n" }),
             ),

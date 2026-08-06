@@ -73,13 +73,18 @@ impl ToolRegistry {
     /// (e.g. read-only tools only).
     pub fn with_builtin_tools() -> Self {
         let mut registry = Self::new();
-        registry.register(Arc::new(crate::fs_tools::ReadFileTool));
+        // One read-set shared by the file tools: `write_file` refuses to
+        // replace an existing file that `read_file` has not shown the model
+        // (see `fs_tools::ReadSet`), so they have to be looking at the same
+        // record of what was read.
+        let reads = Arc::new(crate::fs_tools::ReadSet::new());
+        registry.register(Arc::new(crate::fs_tools::ReadFileTool::new(reads.clone())));
         registry.register(Arc::new(crate::fs_tools::ListDirTool));
         registry.register(Arc::new(crate::fs_tools::GlobTool));
         registry.register(Arc::new(crate::grep::GrepTool));
-        registry.register(Arc::new(crate::fs_tools::WriteFileTool));
-        registry.register(Arc::new(crate::fs_tools::EditFileTool));
-        registry.register(Arc::new(crate::fs_tools::MultiEditTool));
+        registry.register(Arc::new(crate::fs_tools::WriteFileTool::new(reads.clone())));
+        registry.register(Arc::new(crate::fs_tools::EditFileTool::new(reads.clone())));
+        registry.register(Arc::new(crate::fs_tools::MultiEditTool::new(reads)));
         registry.register(Arc::new(crate::shell_tool::RunBashTool));
         registry.register(Arc::new(crate::ask_user::AskUserTool));
         registry.register(Arc::new(crate::write_tasks::WriteTasksTool));
