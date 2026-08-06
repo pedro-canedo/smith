@@ -79,6 +79,37 @@ package-manager metadata become the bottleneck.
 Templates contain placeholder checksums until the corresponding GitHub release
 exists. Do not publish a package-manager update with placeholder hashes.
 
+## The ten acceptance criteria
+
+Where each one is actually checked. "Mechanism" and "behaviour" are separated
+deliberately: several criteria are half a property of this code and half a
+property of a model's judgement, and only the first half can be a `cargo test`.
+
+| # | Criterion | Checked by |
+| --- | --- | --- |
+| 1 | Esc kills the child, session stays usable | `smith-core` cancel-safe tool loop tests + `smith-tools` process-group kill test |
+| 2 | Resize during streaming | `resizing_mid_stream_never_leaves_a_row_wider_than_the_pane` |
+| 3 | 200 messages compact, todos preserved | the compactor's pure carry-over function + the trigger test |
+| 4 | `--resume` restores transcript, todos, cost | the `turns` ledger round trip; the TUI no longer recomputes cost at all |
+| 5 | Ambiguous `edit_file` reports occurrences | mechanism: the error carries the count and an action. **Behaviour** (the model self-corrects) is not checked anywhere |
+| 6 | Injection in a file is reported | mechanism: `injection::scan`, the fence, and the end-to-end read. **Behaviour** (the model does not obey) is not checked anywhere |
+| 7 | 80x24, 16 colours, no Unicode | `every_row_fits_the_pane_at_80x24_in_ascii`, plus a per-preset WCAG AA sweep |
+| 8 | `NO_COLOR=1 … json \| jq` | the `acceptance` CI job, in the criterion's literal form |
+| 9 | A panic leaves the terminal clean | `tests/pty.rs`, under a real pseudo-terminal |
+| 10 | Idle CPU ≈ 0% | `an_idle_smith_does_no_work` — asserted on the predicate the event loop wakes on, which is where it is decided |
+
+### The gap, stated plainly
+
+Criteria 5 and 6 have their mechanisms tested and their behaviour untested.
+That is a deliberate split, not an oversight — "the model self-corrects" and
+"the model does not obey" are properties of a model's judgement, they vary
+between models and between versions of one model, and asserting them in
+`cargo test` would produce a suite that goes red when a provider ships an
+update. They belong in an eval suite run against real providers on a schedule,
+reported as a rate rather than a pass/fail. **No such suite exists yet**, and
+until it does nobody should read the table above as saying those two criteria
+are covered end to end.
+
 ## Deliberately not adopted
 
 Two items from the original roadmap were dropped after looking at what they
