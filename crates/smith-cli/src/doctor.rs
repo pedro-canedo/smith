@@ -626,8 +626,9 @@ async fn check_browser(config: &Config) -> Check {
             "web_search browser",
             "no Chromium-family browser found",
             "Run `smith setup` and accept the browser download (~100 MB), or install Chrome or \
-             Chromium yourself. Without one, web_search still works over plain HTTP, with weaker \
-             results.",
+             Chromium yourself. This is only a fallback: web_search's main free tier is plain \
+             HTTP, and the browser exists to reach the same endpoint from a host where that is \
+             intercepted or fingerprinted.",
         );
     };
 

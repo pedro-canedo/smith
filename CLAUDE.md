@@ -173,25 +173,60 @@ lives independently of the `Arc<dyn LlmProvider>`.
 
 ### Web search backends
 
-`web_search` (`smith-tools/src/web_search.rs`) tries three backends in order,
-each falling through to the next on error or an empty page:
+`web_search` (`smith-tools/src/web_search.rs`) tries five backends in order,
+each falling through to the next when it is unconfigured, blocked, or errors:
 
-1. **Exa** — paid, structured, the only tier that reports publication dates.
-   Needs `[exa] api_key` in `~/.smith/config.toml`.
-2. **Headless Chromium** (`smith-tools/src/chromium.rs`) — launches whatever
-   Chrome/Chromium-family browser is on `PATH` with `--headless --dump-dom`
-   against DuckDuckGo's HTML endpoint and scrapes the rendered DOM. Free, and
-   the reason `web_search` works with no key at all. `SMITH_CHROMIUM_PATH`
-   (or `CHROME_PATH`) overrides binary discovery. Every launch gets a
-   throwaway `--user-data-dir` so it never touches the user's real profile.
-3. **DuckDuckGo lite over plain HTTP** — no browser needed, weakest results.
+1. **SearXNG** (`smith-tools/src/searxng.rs`) — the user's own instance, set
+   via `[search] searxng_url`. First whenever configured, ahead of even a paid
+   key: it is the only backend with no shared IP reputation and no anti-bot
+   layer. Requires JSON output, which SearXNG ships **disabled** — the admin
+   must add `json` under `search: formats:` in `settings.yml`.
+2. **Exa** — paid, structured, reports real publication dates. Needs
+   `[exa] api_key`. Skipped entirely without one; the keyless tier now answers
+   HTTP 402, so probing it only cost a request per search.
+3. **Bing over RSS**, plain HTTP (`smith-tools/src/bing.rs`) — the free
+   workhorse, and what makes `web_search` work with no configuration at all.
+   `&format=rss` returns the same ten results as ~5 KB of stable XML rather
+   than ~122 KB of HTML, with real target URLs instead of Bing's `ck/a`
+   redirect wrapper.
+4. **Bing over RSS, through headless Chromium** (`smith-tools/src/chromium.rs`)
+   — the same feed on a different network path, for hosts where plain HTTP is
+   intercepted or fingerprinted. Chromium's XML viewer leaves the feed's markup
+   intact in the dumped DOM, so tiers 3 and 4 share one parser.
+5. **DuckDuckGo lite over plain HTTP** — last, and measured as blocked far more
+   often than not.
 
-The Chromium tier is best effort by design: no browser, a failed launch, or
-markup that changed shape all return `Err` and hand off to tier 3. Its parsing
-is a class-name scanner rather than an HTML parser, so drift costs results,
-never correctness. Only the pure halves are unit-tested; one `#[ignore]`d test
-(`chromium::tests::live_search_returns_three_usable_results`) exercises the
-real browser and network.
+Two things here are counterintuitive and load-bearing:
+
+- **The Bing `setmkt`/`setlang` parameters are not cosmetic.** Without them
+  Bing answers 200 with ten well-formed results that have nothing to do with
+  the query — structurally indistinguishable from success. `bing::looks_poisoned`
+  is the guard: the measured signature is *no* result matching *any* query term.
+  A poisoned response is retried under the machine's locale market before the
+  tier is written off.
+- **Bing's RSS `<pubDate>` is a crawl timestamp, not a publication date** (every
+  item carries today's date), so it is deliberately dropped. SearXNG and Exa are
+  the only tiers that contribute a recency signal.
+
+DuckDuckGo used to be tiers 2 and 3. It was demoted on evidence: its `html` and
+`lite` endpoints answer HTTP 202 with a 14 KB challenge page to a plain client
+*and* to a real headless browser, and its JavaScript endpoint renders no results
+at all under `--dump-dom` at any virtual time budget. `chromium.rs` is
+correspondingly now a generic page fetcher that knows nothing about result
+markup — the caller picks the URL and owns the parsing.
+
+Results are cached per session on the normalised query, so two near-identical
+searches in one turn cost one request. Failures distinguish three cases, and
+collapsing any of them is what previously ended with the model quietly answering
+from training data: "found nothing" (a backend ran), "TEMPORARILY BLOCKED —
+retry shortly" (`Unavailable::Transient`), and "UNAVAILABLE — nothing is set up"
+(`NotConfigured`/`Misconfigured`). None of them ever licenses answering from
+memory.
+
+Only the pure halves are unit-tested; two `#[ignore]`d tests
+(`web_search::tests::live_search_returns_results_relevant_to_the_query` and
+`chromium::tests::live_fetch_returns_a_parseable_search_feed`) exercise the real
+network and browser.
 
 ### The JSON action envelope
 

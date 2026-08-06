@@ -83,9 +83,9 @@ impl ToolRegistry {
         registry.register(Arc::new(crate::shell_tool::RunBashTool));
         registry.register(Arc::new(crate::ask_user::AskUserTool));
         registry.register(Arc::new(crate::write_tasks::WriteTasksTool));
-        // Keyless by default: tries Exa's hosted-free endpoint, then falls
-        // back to DuckDuckGo lite. A caller holding an Exa key upgrades this
-        // with `replace`.
+        // Unconfigured by default: Bing (free, no key) with DuckDuckGo behind
+        // it. A caller holding an Exa key or a SearXNG URL upgrades this with
+        // `replace`.
         registry.register(Arc::new(crate::web_search::WebSearchTool::new(None)));
         registry.register(Arc::new(crate::web_fetch::WebFetchTool::new()));
         registry

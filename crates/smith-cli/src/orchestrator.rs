@@ -123,6 +123,16 @@ fn secret_redactor(config: &Config) -> Redactor {
     Redactor::new(from_env.chain(from_config))
 }
 
+/// Collects the config `web_search` reads, in one place so the orchestrator and
+/// `doctor` cannot disagree about which backends are configured.
+pub(crate) fn web_search_settings(config: &Config) -> smith_tools::web_search::SearchSettings {
+    smith_tools::web_search::SearchSettings {
+        exa_api_key: config.exa.api_key.clone(),
+        searxng_url: config.search.searxng_url.clone(),
+        market: config.search.market.clone(),
+    }
+}
+
 pub struct Persistence {
     pub store: SessionStore,
     /// None until the first message is actually sent — see `resolve_session`.
@@ -507,11 +517,9 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     };
 
     let mut tools = ToolRegistry::with_builtin_tools();
-    if let Some(key) = config.exa.api_key.clone() {
-        tools.replace(Arc::new(smith_tools::web_search::WebSearchTool::new(Some(
-            key,
-        ))));
-    }
+    tools.replace(Arc::new(
+        smith_tools::web_search::WebSearchTool::with_settings(web_search_settings(&config)),
+    ));
     connect_mcp_servers(&config, &mut tools, &event_tx).await;
     let tools = Arc::new(tools);
 

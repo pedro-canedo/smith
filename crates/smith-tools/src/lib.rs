@@ -1,12 +1,14 @@
 //! Built-in tools (file, shell), the ToolRegistry, and the permission gate.
 
 pub mod ask_user;
+pub mod bing;
 pub mod checkpoint;
 pub mod chromium;
 pub mod fs_tools;
 pub mod grep;
 pub mod registry;
 pub mod schema_validate;
+pub mod searxng;
 pub mod shell_tool;
 pub mod staging;
 pub mod web_fetch;

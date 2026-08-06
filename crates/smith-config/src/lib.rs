@@ -35,6 +35,9 @@ pub struct Config {
     /// keyless endpoint first and falls back to DuckDuckGo lite.
     #[serde(default)]
     pub exa: ProviderSecrets,
+    /// `web_search` backend settings that are not credentials.
+    #[serde(default)]
+    pub search: SearchSettings,
     /// Third-party binaries `smith setup` provisioned into `~/.smith/runtime`.
     /// Must stay ahead of `mcp_servers`: TOML forbids a plain table after an
     /// array of tables, so a field serialized after it would produce a file
@@ -62,6 +65,29 @@ pub struct ProviderSecrets {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OllamaSettings {
     pub base_url: Option<String>,
+}
+
+/// `[search]` — how `web_search` looks things up.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchSettings {
+    /// Base URL of a SearXNG instance the user runs, e.g.
+    /// `https://searx.example.com`. When set it becomes the *first* backend
+    /// `web_search` tries, ahead of even a paid Exa key: it is the user's own
+    /// infrastructure, so it has no shared IP reputation, no anti-bot layer
+    /// and no rate limit they did not choose.
+    ///
+    /// The instance must have JSON output enabled — SearXNG ships with it off,
+    /// and answers `format=json` with HTTP 403 until `json` is added under
+    /// `search: formats:` in its `settings.yml`.
+    pub searxng_url: Option<String>,
+    /// Bing market tag for the free search tier, e.g. `en-US` or `pt-BR`.
+    ///
+    /// Not cosmetic: Bing answers a request whose market does not match the
+    /// query's language with ten well-formed results that have nothing to do
+    /// with the query. Defaults to `en-US`, which suits the English technical
+    /// queries an agent mostly issues; set it if yours are usually in another
+    /// language.
+    pub market: Option<String>,
 }
 
 /// Where `smith setup` put the runtimes it provisioned.
@@ -190,6 +216,13 @@ impl Config {
             target.api_key = incoming.api_key.or(target.api_key.take());
         }
         self.ollama.base_url = other.ollama.base_url.or(self.ollama.base_url.take());
+
+        let SearchSettings {
+            searxng_url,
+            market,
+        } = other.search;
+        self.search.searxng_url = searxng_url.or(self.search.searxng_url.take());
+        self.search.market = market.or(self.search.market.take());
 
         let RuntimeSettings {
             chromium_path,
