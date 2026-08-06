@@ -341,9 +341,10 @@ impl OrchestratorState {
         // edited mid-session take effect on `/model` and nowhere else.
         let subagents = self.agent.subagent_definitions().to_vec();
 
+        let scratch_dir = tool_ctx.scratch_dir();
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
             .with_system(SYSTEM_PROMPT)
-            .with_context_provider(context_provider(self.memory.clone()))
+            .with_context_provider(context_provider(self.memory.clone(), scratch_dir))
             .with_subagent_definitions(subagents)
             .with_limits(limits)
             .with_retry_policy(retry_policy)
@@ -560,6 +561,18 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                 .await;
         });
     }
+    {
+        // Stale sessions' scratch directories, same lifecycle as checkpoint
+        // objects: once per process, best-effort, never on the critical path.
+        // The running session's own directory is exempt by id, not by age —
+        // `--resume` legitimately reopens a session older than any TTL.
+        let project_root = tool_ctx.cwd.clone();
+        let keep = tool_ctx.session_id.clone();
+        tokio::spawn(async move {
+            smith_tools::scratch::sweep(&project_root, smith_tools::scratch::DEFAULT_TTL, &keep)
+                .await;
+        });
+    }
 
     // A definition that will not parse costs its own subagent and nothing
     // else — but it is said out loud, because a `task` call naming a subagent
@@ -569,10 +582,11 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         let _ = event_tx.send(AgentEvent::Error(format!("subagent {problem}")));
     }
 
+    let scratch_dir = tool_ctx.scratch_dir();
     let mut agent = Agent::new(provider, tools.clone(), model, tool_ctx)
         .with_checkpointer(checkpoints.clone())
         .with_system(SYSTEM_PROMPT)
-        .with_context_provider(context_provider(memory.clone()))
+        .with_context_provider(context_provider(memory.clone(), scratch_dir))
         .with_subagent_definitions(subagents)
         // Set explicitly (rather than left to `Agent`'s own default) so
         // `switch_model` has something to carry over and so `--max-turns` has

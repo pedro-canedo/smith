@@ -41,10 +41,12 @@ use tokio_util::sync::CancellationToken;
 const EXA_SEARCH_URL: &str = "https://api.exa.ai/search";
 const DUCKDUCKGO_LITE_URL: &str = "https://lite.duckduckgo.com/lite/";
 
-/// The top three results — title, URL and summary each — is what a synthesised
-/// answer actually needs; past that the extra rows mostly cost context. Callers
-/// wanting more say so with `num_results`.
-const DEFAULT_NUM_RESULTS: u64 = 3;
+/// Five results by default rather than three: with three, a model that does
+/// not find its answer in the snippets reliably re-searches with a reworded
+/// query — a whole extra round trip — where two more rows would have answered.
+/// The per-row cost (title, URL, summary) is small next to a second search.
+/// Callers wanting more or fewer say so with `num_results`.
+const DEFAULT_NUM_RESULTS: u64 = 5;
 const MAX_NUM_RESULTS: u64 = 10;
 
 /// Caps each backend attempt so a stalled request falls through to the next
@@ -196,7 +198,7 @@ impl Tool for WebSearchTool {
                 "query": {"type": "string"},
                 "num_results": {
                     "type": "integer",
-                    "description": "How many results to return (default 3, max 10)."
+                    "description": "How many results to return (default 5, max 10)."
                 }
             },
             "required": ["query"]

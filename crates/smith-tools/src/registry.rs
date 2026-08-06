@@ -132,6 +132,13 @@ impl ToolExecutor for ToolRegistry {
             .unwrap_or_default()
     }
 
+    /// An unknown tool answers `false` — never confined, so never exempted.
+    fn scratch_scoped(&self, name: &str, input: &serde_json::Value, ctx: &ToolContext) -> bool {
+        self.tools
+            .get(name)
+            .is_some_and(|t| t.scratch_scoped(input, ctx))
+    }
+
     /// The one place a tool call is checked against the schema the model was
     /// shown.
     ///
@@ -385,6 +392,36 @@ mod tests {
         assert!(registry
             .snapshot_paths("read_file", &serde_json::json!({"path": "a.txt"}), &ctx)
             .is_empty());
+    }
+
+    /// The scratch waiver, forwarded through the registry against the real
+    /// built-ins: the write tools vouch for a path inside this session's
+    /// scratch dir, and nothing else ever does — `run_bash` cannot bound its
+    /// writes, and an unknown name has no tool to vouch at all.
+    #[test]
+    fn scratch_scoped_forwards_to_the_write_tools_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::with_builtin_tools();
+        let ctx = ToolContext::new(dir.path(), "test");
+
+        let in_scratch = serde_json::json!({"path": ".smith/scratch/test/probe.py"});
+        for tool in ["write_file", "edit_file", "multi_edit"] {
+            assert!(
+                registry.scratch_scoped(tool, &in_scratch, &ctx),
+                "{tool} should vouch for a scratch-confined path"
+            );
+            assert!(
+                !registry.scratch_scoped(tool, &serde_json::json!({"path": "src/main.rs"}), &ctx),
+                "{tool} must not vouch for a project path"
+            );
+        }
+
+        assert!(!registry.scratch_scoped(
+            "run_bash",
+            &serde_json::json!({"command": "touch .smith/scratch/test/x"}),
+            &ctx
+        ));
+        assert!(!registry.scratch_scoped("no_such_tool", &in_scratch, &ctx));
     }
 
     /// A path the jail refuses yields nothing to snapshot, because that call

@@ -97,6 +97,28 @@ pub(crate) fn relative_to(root: &Path, path: &Path) -> String {
     }
 }
 
+/// Whether a call's `path` argument lands inside the session's scratch
+/// directory (`ToolContext::scratch_dir`) once `..` and symlinks are resolved.
+///
+/// The answer the write tools give for `Tool::scratch_scoped`, shared so the
+/// three of them cannot drift. It leans on `resolve` for exactly the same
+/// escape-closing the jail check does: a lexical `..` is normalised away
+/// before the prefix comparison, and a symlink inside scratch pointing
+/// elsewhere resolves to its target — which then fails the prefix check, so
+/// the call falls back to an ordinary permission prompt rather than being
+/// waived. Failing closed is the whole contract: any doubt costs one prompt,
+/// never one file.
+pub(crate) fn scratch_confined(input: &serde_json::Value, ctx: &ToolContext) -> bool {
+    let Some(path) = field_str(input, "path") else {
+        return false;
+    };
+    let Ok(resolved) = resolve(ctx, path) else {
+        return false;
+    };
+    let scratch_root = real_path(&lexical_normalize(&ctx.scratch_dir()));
+    resolved.starts_with(&scratch_root)
+}
+
 /// Drops `.` and resolves `..` textually, without touching the filesystem.
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -849,6 +871,10 @@ so read it first or use edit_file for a targeted change. Args: path (required), 
         snapshot_target(input, ctx)
     }
 
+    fn scratch_scoped(&self, input: &serde_json::Value, ctx: &ToolContext) -> bool {
+        scratch_confined(input, ctx)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -1035,6 +1061,10 @@ Never include read_file's line-number prefixes in old_str. Args: path, old_str, 
         snapshot_target(input, ctx)
     }
 
+    fn scratch_scoped(&self, input: &serde_json::Value, ctx: &ToolContext) -> bool {
+        scratch_confined(input, ctx)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -1125,6 +1155,10 @@ Args: path (required), edits (required array of {old_str, new_str, replace_all?}
 
     fn snapshot_paths(&self, input: &serde_json::Value, ctx: &ToolContext) -> Vec<PathBuf> {
         snapshot_target(input, ctx)
+    }
+
+    fn scratch_scoped(&self, input: &serde_json::Value, ctx: &ToolContext) -> bool {
+        scratch_confined(input, ctx)
     }
 
     async fn execute(
@@ -1245,6 +1279,66 @@ mod tests {
             )
             .await
             .content
+    }
+
+    /// The three write tools must agree on what counts as scratch-confined —
+    /// they share `scratch_confined`, and this pins the contract for all of
+    /// them at once.
+    #[test]
+    fn scratch_scoped_accepts_paths_inside_the_session_scratch_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(&dir);
+        let f = files();
+
+        let relative = serde_json::json!({"path": ".smith/scratch/test-session/probe.sh"});
+        let absolute = serde_json::json!({
+            "path": dir.path().join(".smith/scratch/test-session/data.json").to_string_lossy()
+        });
+        for input in [&relative, &absolute] {
+            assert!(f.write.scratch_scoped(input, &ctx), "write: {input}");
+            assert!(f.edit.scratch_scoped(input, &ctx), "edit: {input}");
+            assert!(f.multi.scratch_scoped(input, &ctx), "multi: {input}");
+        }
+    }
+
+    #[test]
+    fn scratch_scoped_refuses_everything_that_is_not_this_sessions_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(&dir);
+        let f = files();
+
+        for path in [
+            // An ordinary project file: the whole point of the exemption is
+            // that it never applies here.
+            "src/main.rs",
+            // Another session's scratch is another session's business.
+            ".smith/scratch/other-session/probe.sh",
+            // A lexical escape back out of scratch must not keep the waiver.
+            ".smith/scratch/test-session/../../../back-in-the-project.txt",
+            // The scratch *root* is shared between sessions, not scratch.
+            ".smith/scratch/loose-file.txt",
+        ] {
+            let input = serde_json::json!({"path": path});
+            assert!(!f.write.scratch_scoped(&input, &ctx), "{path}");
+        }
+        // No path at all: nothing to vouch for.
+        assert!(!f.write.scratch_scoped(&serde_json::json!({}), &ctx));
+    }
+
+    /// A symlink planted inside scratch pointing at the project must not turn
+    /// project writes prompt-free: resolution follows the link, the prefix
+    /// check fails, and the call falls back to an ordinary prompt.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_scoped_refuses_a_symlink_escaping_the_scratch_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(&dir);
+        let scratch = ctx.scratch_dir();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::os::unix::fs::symlink(dir.path(), scratch.join("escape")).unwrap();
+
+        let input = serde_json::json!({"path": ".smith/scratch/test-session/escape/victim.txt"});
+        assert!(!files().write.scratch_scoped(&input, &ctx));
     }
 
     #[tokio::test]

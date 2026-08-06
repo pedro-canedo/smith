@@ -3,6 +3,8 @@
 //! apart from `orchestrator.rs` (which drives the actual turns) so this half
 //! can be tuned and tested without touching any async/channel plumbing.
 
+use std::path::Path;
+
 use chrono::{DateTime, FixedOffset, Local};
 use smith_config::MemoryCache;
 use smith_core::Message;
@@ -15,7 +17,13 @@ use smith_core::Message;
 /// for a year that's already history and then reporting that nothing current
 /// turned up. Split from `environment_now` so the formatting is testable
 /// against a fixed instant instead of the wall clock.
-pub fn environment_block(now: DateTime<FixedOffset>) -> String {
+///
+/// `scratch_dir` is this session's throwaway-file directory
+/// (`ToolContext::scratch_dir`). Named here — with its exemption said out
+/// loud — rather than in the static prompt, because the path carries the
+/// session id and would otherwise break the byte-identical prefix the
+/// provider cache keys on.
+pub fn environment_block(now: DateTime<FixedOffset>, scratch_dir: &Path) -> String {
     format!(
         "## Environment\n\
          Current date: {weekday}, {date} (local time, UTC{offset}).\n\
@@ -24,16 +32,23 @@ pub fn environment_block(now: DateTime<FixedOffset>) -> String {
          your training data. Whenever you reason about \"current\", \"latest\", \"today\", \"this \
          year\", or how recent something is, use THIS date — not the most recent year you happen \
          to remember. Never put a remembered year into a web_search query: use the year above, or \
-         leave the year out entirely and let the results speak.",
+         leave the year out entirely and let the results speak.\n\
+         \n\
+         Scratch directory (this session's, for throwaway files): {scratch}\n\
+         Helper scripts, intermediate data, anything the user did not ask to keep — write it \
+         under exactly this directory, never into the project tree. Writes inside it skip the \
+         permission prompt, and it is cleaned up automatically after a few days. Files the user \
+         asked for still go in the project as usual.",
         weekday = now.format("%A"),
         date = now.format("%Y-%m-%d"),
         offset = now.format("%:z"),
+        scratch = scratch_dir.display(),
     )
 }
 
 /// `environment_block` for right now — the function handed to the `Agent`.
-pub fn environment_now() -> String {
-    environment_block(Local::now().fixed_offset())
+pub fn environment_now(scratch_dir: &Path) -> String {
+    environment_block(Local::now().fixed_offset(), scratch_dir)
 }
 
 /// The whole volatile half of the system prompt: environment context followed
@@ -58,9 +73,12 @@ pub fn environment_now() -> String {
 ///    conversation, and if a `SMITH.md` and the goal disagree the goal must
 ///    win — otherwise a file checked into the repo could countermand what the
 ///    user typed thirty seconds ago.
-pub fn context_provider(memory: MemoryCache) -> impl Fn() -> String + Send + Sync + 'static {
+pub fn context_provider(
+    memory: MemoryCache,
+    scratch_dir: std::path::PathBuf,
+) -> impl Fn() -> String + Send + Sync + 'static {
     move || {
-        let environment = environment_now();
+        let environment = environment_now(&scratch_dir);
         let memory = memory.render();
         if memory.trim().is_empty() {
             environment
@@ -80,6 +98,11 @@ Workflow:
 - After each tool result, briefly verify success or failure before the next mutation.
 - Do not produce large plans unless the user ran /plan.
 
+Deliverables:
+- The answer to a question or a research request is your reply in chat, in prose. Never create files (reports, HTML pages, notes, summaries, scripts) the user did not ask for. \"pesquise X\" / \"search for X\" / \"what is X\" means: search, then answer in chat. Zero writes.
+- Create a file only when the user named one, or the task cannot be done without one. If you think a file would genuinely help, say so in one sentence and let the user decide — never create it preemptively.
+- Throwaway files you need for your own work — a script to run once, intermediate data — go in the scratch directory named in the Environment section, never in the project tree. Writes there don't prompt for permission.
+
 Decisions & questions:
 - Prefer deciding yourself for low-risk, reversible choices (names of helpers, minor wording, obvious defaults).
 - When a choice is ambiguous or high-impact (architecture, deleting data, public API, irreversible ops), call ask_user with exactly three concrete options (option_a/b/c). The UI also offers free-text.
@@ -87,10 +110,11 @@ Decisions & questions:
 - Never ask the user to \"approve the plan\" in chat — plan approval is a separate UI. Once told the plan is approved, start implementing with tools immediately.
 
 Task tracking:
-- For any multi-step task (3+ steps), call write_tasks once at the start with the full step list (status: pending), then again whenever a step starts (in_progress) or finishes (completed) — always resend the full list, not a diff. Skip it for single-step or trivial requests.
+- For any multi-step task (3+ steps), call write_tasks once at the start with the full step list (status: pending), then again whenever a step starts (in_progress) or finishes (completed) — always resend the full list, not a diff. Skip it for single-step or trivial requests, and for questions or research — those are answered directly, not tracked.
 
 Research:
 - When you're not confident about something you're about to rely on (current events, a library's API/version/behavior, a fact you might be wrong about), call web_search to check before proceeding — don't guess, and don't tell the user to go search it themselves.
+- Match effort to the question. For a simple factual question: one web_search (refine the query at most once), then at most one or two web_fetch calls only if the snippets aren't enough, then answer. Fan out over more sources only when the user asked for depth or the sources disagree.
 - Prefer web_search over improvising shell pipelines against undocumented endpoints (e.g. scraping an API by hand with curl/jq) when you just need information, not a specific file on disk.
 - Once you've called web_search, answer from what the results actually say, not from training knowledge. This matters most for anything time-sensitive (news, current events, prices, who currently holds some position): your training data is stale and will be wrong there even when it sounds confident. Each result may carry a `published` date — use it to judge how current a source is, and prefer the most recent when sources disagree.
 - Build queries against the current date given in the Environment section, never against a year you remember. If a query came back empty or off-target, refine it once — correct or drop the year, reword it, go at the primary source — before concluding the information isn't out there.
@@ -278,14 +302,16 @@ mod system_prompt_composition_tests {
         let memory = MemoryCache::new(MemoryScope::new(None, tmp.path(), tmp.path()));
 
         let provider = Arc::new(ScriptedProvider::text("ok"));
+        let tool_ctx = ToolContext::new(tmp.path(), "test-session");
+        let scratch_dir = tool_ctx.scratch_dir();
         let mut agent = Agent::new(
             provider.clone(),
             Arc::new(ToolRegistry::with_builtin_tools()),
             "test-model".to_string(),
-            ToolContext::new(tmp.path(), "test-session"),
+            tool_ctx,
         )
         .with_system(super::SYSTEM_PROMPT)
-        .with_context_provider(super::context_provider(memory));
+        .with_context_provider(super::context_provider(memory, scratch_dir));
         agent.set_goal(goal.map(str::to_string));
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
@@ -356,10 +382,17 @@ mod environment_tests {
     use super::{environment_block, environment_now};
     use chrono::{FixedOffset, TimeZone};
 
+    fn scratch() -> std::path::PathBuf {
+        std::path::PathBuf::from("/project/.smith/scratch/test-session")
+    }
+
     #[test]
     fn environment_block_renders_weekday_iso_date_and_offset() {
         let brt = FixedOffset::west_opt(3 * 3600).unwrap();
-        let block = environment_block(brt.with_ymd_and_hms(2026, 8, 5, 14, 30, 0).unwrap());
+        let block = environment_block(
+            brt.with_ymd_and_hms(2026, 8, 5, 14, 30, 0).unwrap(),
+            &scratch(),
+        );
 
         assert!(block.contains("2026-08-05"), "missing ISO date: {block}");
         assert!(block.contains("Wednesday"), "missing weekday: {block}");
@@ -373,16 +406,34 @@ mod environment_tests {
                 .unwrap()
                 .with_ymd_and_hms(2026, 8, 5, 0, 0, 0)
                 .unwrap(),
+            &scratch(),
         );
         assert!(block.contains("LATER than your training data"));
         assert!(block.contains("web_search"));
     }
 
     #[test]
+    fn environment_block_names_the_scratch_dir_and_its_exemption() {
+        let block = environment_block(
+            FixedOffset::east_opt(0)
+                .unwrap()
+                .with_ymd_and_hms(2026, 8, 5, 0, 0, 0)
+                .unwrap(),
+            &scratch(),
+        );
+        assert!(
+            block.contains("/project/.smith/scratch/test-session"),
+            "missing scratch path: {block}"
+        );
+        assert!(block.contains("never into the project tree"));
+        assert!(block.contains("skip the permission prompt"));
+    }
+
+    #[test]
     fn context_provider_without_memory_is_just_the_environment() {
         let tmp = tempfile::tempdir().unwrap();
         let scope = smith_config::MemoryScope::new(None, tmp.path(), tmp.path());
-        let context = super::context_provider(smith_config::MemoryCache::new(scope))();
+        let context = super::context_provider(smith_config::MemoryCache::new(scope), scratch())();
         assert!(context.contains("## Environment"));
         assert!(!context.contains("## Project memory"));
         // No trailing separator left behind by the absent memory block.
@@ -394,7 +445,7 @@ mod environment_tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("SMITH.md"), "this project uses tabs").unwrap();
         let scope = smith_config::MemoryScope::new(None, tmp.path(), tmp.path());
-        let context = super::context_provider(smith_config::MemoryCache::new(scope))();
+        let context = super::context_provider(smith_config::MemoryCache::new(scope), scratch())();
 
         let environment = context.find("## Environment").expect("environment block");
         let memory = context.find("## Project memory").expect("memory block");
@@ -410,7 +461,7 @@ mod environment_tests {
         let path = tmp.path().join("SMITH.md");
         std::fs::write(&path, "the first rule").unwrap();
         let scope = smith_config::MemoryScope::new(None, tmp.path(), tmp.path());
-        let provider = super::context_provider(smith_config::MemoryCache::new(scope));
+        let provider = super::context_provider(smith_config::MemoryCache::new(scope), scratch());
 
         assert!(provider().contains("the first rule"));
         std::fs::write(&path, "a second rule, of a different length").unwrap();
@@ -421,7 +472,7 @@ mod environment_tests {
     fn environment_now_reports_a_plausible_current_date() {
         // Guards the wiring: `environment_now` must read the real clock, not
         // some constant baked in at build time.
-        let now = environment_now();
+        let now = environment_now(&scratch());
         let year = chrono::Local::now().format("%Y").to_string();
         assert!(now.contains(&year), "expected {year} in: {now}");
     }

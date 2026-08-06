@@ -268,6 +268,12 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Vec<std::path::PathBuf> {
         Vec::new()
     }
+    /// Forwards `Tool::scratch_scoped` for the named tool. Defaulted to
+    /// `false` — the safe answer — so executors without filesystem tools
+    /// compile unchanged and never accidentally waive a prompt.
+    fn scratch_scoped(&self, _name: &str, _input: &serde_json::Value, _ctx: &ToolContext) -> bool {
+        false
+    }
     async fn execute(
         &self,
         name: &str,
@@ -1512,9 +1518,18 @@ impl Agent {
             return result;
         }
 
+        // A call the tool itself vouches is confined to the session's scratch
+        // directory skips the prompt: there is no user work in there to
+        // protect, and prompting for throwaway files is exactly the friction
+        // that pushes the model into writing them into the project instead.
+        // Checked last — it can touch the filesystem (symlink resolution) and
+        // only matters when the call would otherwise prompt. Deliberately
+        // *after* the plan gate above: scratch writes are still side effects,
+        // and an unapproved plan blocks them like everything else.
         let needs_prompt = class != PermissionClass::ReadOnly
             && !self.allowed_session_tools.contains(name)
-            && !self.permission_policy.auto_allows(class);
+            && !self.permission_policy.auto_allows(class)
+            && !self.tools.scratch_scoped(name, &input, &self.tool_ctx);
 
         if needs_prompt {
             let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::WaitingPermission));
@@ -2910,6 +2925,128 @@ mod tests {
         assert!(
             executed.load(std::sync::atomic::Ordering::SeqCst),
             "tool should run once ungated (skip policy auto-allows it)"
+        );
+    }
+
+    /// Like `RecordingTools`, but vouches that every call is confined to the
+    /// session's scratch directory — the executor-side half of
+    /// `Tool::scratch_scoped`.
+    struct ScratchScopedTools {
+        executed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ScratchScopedTools {
+        fn tool_defs(&self) -> Vec<crate::message::ToolDefinition> {
+            Vec::new()
+        }
+
+        fn permission_class(&self, _name: &str) -> Option<PermissionClass> {
+            Some(PermissionClass::Mutating)
+        }
+
+        fn scratch_scoped(
+            &self,
+            _name: &str,
+            _input: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ToolResult::ok("wrote scratch")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scratch_scoped_call_skips_the_permission_prompt_under_ask() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(write_file_then_done());
+        let tools = Arc::new(ScratchScopedTools {
+            executed: executed.clone(),
+        });
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
+            .with_permission_policy(PermissionPolicy::Ask); // would normally prompt for Mutating
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        // Dropped up front: a prompt attempt now fails the call with
+        // "permission channel closed" instead of hanging the test, so a
+        // regression shows up as `executed == false`, not as a timeout.
+        drop(permission_rx);
+
+        agent
+            .run_turn(
+                "do it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            "a scratch-confined Mutating call must run without a prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plan_gate_still_blocks_scratch_scoped_calls() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(write_file_then_done());
+        let tools = Arc::new(ScratchScopedTools {
+            executed: executed.clone(),
+        });
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
+            .with_permission_policy(PermissionPolicy::Ask);
+        agent.set_plan_gated(true);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        agent
+            .run_turn(
+                "do it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the scratch exemption is about friction, not authority — an \
+             unapproved plan still blocks it"
+        );
+        let mut saw_blocked_result = false;
+        while let Ok(event) = events_rx.try_recv() {
+            if let AgentEvent::ToolCallResult {
+                is_error, output, ..
+            } = event
+            {
+                assert!(is_error);
+                assert!(output.contains("plan is awaiting approval"));
+                saw_blocked_result = true;
+            }
+        }
+        assert!(
+            saw_blocked_result,
+            "expected a blocked ToolCallResult event"
         );
     }
 

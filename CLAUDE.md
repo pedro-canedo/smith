@@ -102,6 +102,34 @@ regardless of `PermissionPolicy` — even `Skip` doesn't bypass an unapproved
 plan. Both checks happen in `Agent::run_one_tool`
 (`crates/smith-core/src/agent.rs`).
 
+### The scratch directory
+
+Each session gets `.smith/scratch/<session_id>/` (`ToolContext::scratch_dir`)
+for throwaway files — helper scripts, intermediate data. Its path is announced
+in the environment block (not the static prompt: it carries the session id and
+would break the prefix cache), and the system prompt tells the model project
+files are for user-requested deliverables only.
+
+The incentive is the design: a write the tool itself vouches is confined to
+scratch (`Tool::scratch_scoped`, forwarded via `ToolExecutor`, checked last in
+`run_one_tool`'s prompt decision) **skips the permission prompt**, so the
+compliant path is also the frictionless one. Only `write_file`/`edit_file`/
+`multi_edit` ever vouch, through one shared `fs_tools::scratch_confined`, which
+leans on the same jail resolution as everything else — a `..` or a symlink
+escaping scratch fails the prefix check and falls back to a normal prompt.
+Failing closed costs one prompt, never one file. `run_bash` and MCP tools can
+never vouch (they cannot bound their writes), and the default on both traits is
+`false`.
+
+Two deliberate non-exemptions: the **plan gate still blocks scratch writes**
+(the exemption is about friction, not authority — an explicit user freeze
+wins), and the read-before-overwrite gate applies inside scratch like anywhere
+else. Stale sessions' directories are swept at startup
+(`smith_tools::scratch::sweep`, 7-day TTL on the *newest* mtime anywhere in the
+tree — a directory's own mtime misses rewrites of existing files), spawned off
+the critical path exactly like the checkpoint sweep, and the current session is
+exempt by id, never by age (`--resume` reopens old sessions legitimately).
+
 ### Turn checkpoints and `/rewind`
 
 Before any tool above `ReadOnly` is dispatched, `Agent::run_one_tool` asks the

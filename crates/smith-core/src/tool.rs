@@ -128,6 +128,26 @@ impl ToolContext {
         self.progress.as_ref().map(ProgressReporter::id)
     }
 
+    /// This session's scratch directory: `.smith/scratch/<session_id>/`,
+    /// under the project root.
+    ///
+    /// The one place on disk where the model may put throwaway files — helper
+    /// scripts, intermediate data — without a permission prompt: a call a
+    /// tool reports as confined to this directory (`Tool::scratch_scoped`)
+    /// skips the prompt, so the compliant path is also the frictionless one.
+    /// Beside staging and checkpoints deliberately: it is session-scoped
+    /// state, already inside the tool jail, and already gitignored.
+    ///
+    /// Nothing here creates the directory — `write_file` creates parents as
+    /// for any other path — and stale sessions' directories are swept at
+    /// startup by the frontend, the same lifecycle as checkpoint objects.
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.cwd
+            .join(".smith")
+            .join("scratch")
+            .join(&self.session_id)
+    }
+
     /// Reports one line of progress while the tool is still running. A no-op
     /// when no channel is attached, so tools never have to branch on it.
     pub fn report_progress(&self, line: impl Into<String>) {
@@ -161,6 +181,23 @@ pub trait Tool: Send + Sync {
     /// mistaken for "it wrote nothing".
     fn snapshot_paths(&self, _input: &serde_json::Value, _ctx: &ToolContext) -> Vec<PathBuf> {
         Vec::new()
+    }
+
+    /// Whether this specific call writes only inside `ctx.scratch_dir()`.
+    ///
+    /// A scratch-confined call skips the permission prompt — the directory is
+    /// session-private, gitignored and swept, so there is no user work there
+    /// to protect — but it does **not** bypass the plan gate: the gate is an
+    /// explicit user-imposed freeze on side effects, and the exemption here
+    /// is about friction, not authority.
+    ///
+    /// The tool answers rather than the agent parsing arguments, for the same
+    /// reason as `snapshot_paths`: the argument shape belongs to the tool.
+    /// `false` is the only safe default — a tool that cannot bound its writes
+    /// from its arguments (`run_bash` above all) must never claim confinement,
+    /// and an unsure implementation costs one prompt, never one file.
+    fn scratch_scoped(&self, _input: &serde_json::Value, _ctx: &ToolContext) -> bool {
+        false
     }
 
     /// `cancel` is fired if the user interrupts the turn mid-execution
@@ -227,6 +264,15 @@ mod tests {
             Some(PermissionPolicy::Skip)
         );
         assert_eq!(PermissionPolicy::parse("bogus"), None);
+    }
+
+    #[test]
+    fn scratch_dir_is_session_scoped_and_under_the_project_smith_dir() {
+        let ctx = ToolContext::new("/project", "session-abc");
+        assert_eq!(
+            ctx.scratch_dir(),
+            PathBuf::from("/project/.smith/scratch/session-abc")
+        );
     }
 
     #[test]
