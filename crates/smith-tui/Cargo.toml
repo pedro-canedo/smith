@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 smith-core = { workspace = true }
 # Custom slash commands: their discovery, jail and argument substitution live

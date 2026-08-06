@@ -22,6 +22,27 @@ license = "MIT"
 # together with that job.
 rust-version = "1.88"
 
+# The gate lived only on CI's command line (`cargo clippy -- -D warnings`), so
+# a local `cargo clippy` was quieter than CI and you found out at push time.
+# Declaring it here means the manifest carries the rule and every invocation
+# obeys it. The five pointwise `#[allow(clippy::too_many_arguments)]` still
+# work — an allow on the item outranks a deny in the manifest.
+#
+# Deliberately not `pedantic` or `nursery`, and specifically not
+# `too_many_lines` or `cognitive_complexity`: the first defaults to 100 lines
+# and counts test functions under `--all-targets`, so turning it on means
+# writing a dozen `#[allow]`s for functions that are long by design; the second
+# is a nursery lint whose heuristic drifts between toolchains, which in a repo
+# with a pinned MSRV job means a Rust upgrade can redden CI for no change.
+# File size is measured instead, honestly, by `scripts/check-file-size.sh`.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# A debug print that reached main is a mistake, not a style choice. Note this
+# is a CLI whose job is printing, so `print_stdout`/`print_stderr` stay off.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [workspace.dependencies]
 smith-core = { path = "crates/smith-core" }
 smith-provider = { path = "crates/smith-provider" }
