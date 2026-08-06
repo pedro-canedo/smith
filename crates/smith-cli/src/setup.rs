@@ -23,6 +23,10 @@ use smith_config::{Config, DEFAULT_OLLAMA_BASE_URL, OLLAMA_HOST};
 
 use crate::runtime::{self, BrowserSource, HttpAssetSource};
 
+/// The curated OpenRouter free chain lives in `smith-store::models` — one
+/// source, shared with `/model` — rather than as a third copy here.
+use smith_store::models::OPENROUTER_MODELS;
+
 const ANTHROPIC_MODELS: &[&str] = &["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
 const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3"];
 const OLLAMA_MODELS: &[&str] = &[
@@ -114,6 +118,8 @@ pub async fn run(jump_to_model: bool) -> color_eyre::Result<()> {
                 let models = match provider.as_str() {
                     "anthropic" => ANTHROPIC_MODELS,
                     "openai" => OPENAI_MODELS,
+                    "openrouter" => OPENROUTER_MODELS,
+                    "9router" => &["auto"][..],
                     _ => OLLAMA_MODELS,
                 };
                 if let Some(model) = select_model(&theme, models)? {
@@ -175,6 +181,8 @@ async fn section_provider(theme: &ColorfulTheme, config: &mut Config) -> color_e
         return Ok(false);
     };
     match provider.as_str() {
+        "openrouter" => setup_openrouter(theme, config).await,
+        "9router" => setup_ninerouter(theme, config).await,
         "anthropic" => setup_api_provider(theme, config, "anthropic", ANTHROPIC_MODELS),
         "openai" => setup_api_provider(theme, config, "openai", OPENAI_MODELS),
         "ollama" => setup_ollama(theme, config).await,
@@ -183,7 +191,16 @@ async fn section_provider(theme: &ColorfulTheme, config: &mut Config) -> color_e
 }
 
 fn select_provider(theme: &ColorfulTheme) -> color_eyre::Result<Option<String>> {
-    let items = ["Anthropic (Claude)", "OpenAI", "Ollama (local)"];
+    // Free first, on purpose: the promise of `smith setup` is that a fresh
+    // install has working AI, and the free path is the one that needs no
+    // billing relationship to deliver it.
+    let items = [
+        "Free — OpenRouter (cloud, free models, needs a free account)",
+        "Free — 9Router (local gateway, auto-installed)",
+        "Anthropic (Claude)",
+        "OpenAI",
+        "Ollama (local)",
+    ];
     let idx = Select::with_theme(theme)
         .with_prompt("Provider")
         .items(&items)
@@ -191,8 +208,10 @@ fn select_provider(theme: &ColorfulTheme) -> color_eyre::Result<Option<String>> 
         .interact_opt()?;
     Ok(idx.map(|i| {
         match i {
-            0 => "anthropic",
-            1 => "openai",
+            0 => "openrouter",
+            1 => "9router",
+            2 => "anthropic",
+            3 => "openai",
             _ => "ollama",
         }
         .to_string()
@@ -262,6 +281,220 @@ fn select_model(theme: &ColorfulTheme, models: &[&str]) -> color_eyre::Result<Op
     } else {
         Ok(Some(models[idx].to_string()))
     }
+}
+
+/// The free cloud path. Walks the user through a free key, validates it live
+/// against the catalogue, and seeds both fallback layers.
+async fn setup_openrouter(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Result<bool> {
+    println!("OpenRouter aggregates many models behind one key; the `:free` ones cost nothing.");
+    println!("Create a free key at https://openrouter.ai/keys (a minute, no card).");
+    println!("Free-tier limits: 20 req/min; 50 free-model requests/day, or 1000/day after a");
+    println!("one-time $10 top-up. smith falls back automatically when the day runs out.\n");
+
+    let existing_key = config.openrouter.api_key.clone();
+    let prompt = match &existing_key {
+        Some(_) => "OpenRouter API key (already set — blank keeps it)".to_string(),
+        None => "OpenRouter API key".to_string(),
+    };
+    let entered: String = Password::with_theme(theme)
+        .with_prompt(prompt)
+        .allow_empty_password(true)
+        .interact()?;
+    let Some(key) = (if entered.is_empty() {
+        existing_key
+    } else {
+        Some(entered)
+    }) else {
+        println!("An API key is required — section left unchanged.");
+        return Ok(false);
+    };
+
+    // Validate the key against the live catalogue, and use the answer to
+    // refresh the curated chain: free models rotate, and a chain of retired
+    // ids would make the server-side fallback a no-op.
+    let base_url = config
+        .openrouter
+        .base_url
+        .clone()
+        .unwrap_or_else(|| smith_config::DEFAULT_OPENROUTER_BASE_URL.to_string());
+    let probe = smith_provider::OpenAiProvider::openrouter(key.clone(), base_url);
+    let live = probe.list_free_tool_models().await;
+
+    let chain: Vec<String> = if live.is_empty() {
+        println!("Could not reach the OpenRouter catalogue — using the built-in list.");
+        println!("(If the key is wrong you will see a 401 on the first message; re-run setup.)");
+        OPENROUTER_MODELS.iter().map(|m| m.to_string()).collect()
+    } else {
+        // Curated order first (it encodes quality), then whatever else is
+        // live — so a fully-rotated catalogue still yields a working chain.
+        let mut chain: Vec<String> = OPENROUTER_MODELS
+            .iter()
+            .map(|m| m.to_string())
+            .filter(|m| live.contains(m))
+            .collect();
+        for model in &live {
+            if !chain.contains(model) {
+                chain.push(model.clone());
+            }
+        }
+        println!(
+            "Key OK — {} free tool-capable models live right now.",
+            live.len()
+        );
+        chain
+    };
+
+    let Some(primary) = chain.first().cloned() else {
+        println!("No free tool-capable models available — section left unchanged.");
+        return Ok(false);
+    };
+    println!("Primary model: {primary}");
+    println!(
+        "Server-side fallback chain: {}",
+        chain
+            .iter()
+            .skip(1)
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    config.openrouter.api_key = Some(key);
+    config.openrouter.fallback_models = chain;
+    config.general.provider = Some("openrouter".to_string());
+    config.general.model = Some(primary);
+
+    // The second layer: where smith itself goes when the *account* quota
+    // dies. Offered, not imposed — but defaulted on, because the account
+    // limit is the one failure the server-side chain cannot absorb.
+    let wants_fallback = Confirm::with_theme(theme)
+        .with_prompt(
+            "Also fall back to other providers automatically when the daily quota runs out?",
+        )
+        .default(true)
+        .interact_opt()?
+        .unwrap_or(false);
+    if wants_fallback {
+        let mut providers = Vec::new();
+        if config.nine_router.api_key.is_some() {
+            providers.push("9router".to_string());
+        }
+        providers.push("ollama".to_string());
+        config.fallback.providers = providers;
+        println!(
+            "[fallback] providers = {:?} — entries without a working setup are skipped with an",
+            config.fallback.providers
+        );
+        println!("error naming what to configure. The 9Router section adds the local gateway.");
+    }
+    Ok(true)
+}
+
+/// The free local path: a private Node + the pinned 9router package, then the
+/// dashboard key. Failure is non-fatal and re-enterable, like the browser
+/// section.
+async fn setup_ninerouter(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Result<bool> {
+    let base_url = config
+        .nine_router
+        .base_url
+        .clone()
+        .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
+
+    let runtime_root = smith_config::runtime_dir()?;
+    if !crate::node_runtime::ninerouter_healthy(&base_url).await {
+        let confirmed = Confirm::with_theme(theme)
+            .with_prompt(format!(
+                "Download Node.js {} (~50 MB, one time, into ~/.smith/runtime) and install the \
+                 9router gateway?",
+                crate::node_runtime::NODE_VERSION
+            ))
+            .default(true)
+            .interact_opt()?
+            .unwrap_or(false);
+        if !confirmed {
+            return Ok(false);
+        }
+
+        let source = HttpAssetSource::new().map_err(color_eyre::eyre::Error::msg)?;
+        let mut out = Vec::new();
+        let node = crate::node_runtime::provision_node(&source, &runtime_root, &mut out)
+            .await
+            .map_err(color_eyre::eyre::Error::msg)?;
+        for line in &out {
+            println!("  {line}");
+        }
+        println!(
+            "  node {} ready{}",
+            node.reported_version,
+            if node.reused {
+                " (reused existing install)"
+            } else {
+                ""
+            }
+        );
+
+        let mut out = Vec::new();
+        let gateway =
+            crate::node_runtime::provision_ninerouter(&node.binary, &runtime_root, &mut out)
+                .await
+                .map_err(color_eyre::eyre::Error::msg)?;
+        println!(
+            "  9router@{} installed at {}{}",
+            gateway.version,
+            gateway.cli.display(),
+            if gateway.reused {
+                " (already present)"
+            } else {
+                ""
+            }
+        );
+
+        config.runtime.node_path = Some(node.binary.display().to_string());
+        config.runtime.node_version = Some(node.version);
+        config.runtime.ninerouter_dir = Some(runtime_root.join("9router").display().to_string());
+        config.runtime.ninerouter_version = Some(gateway.version);
+
+        println!("Starting the gateway…");
+        crate::node_runtime::ensure_ninerouter_running(config)
+            .await
+            .map_err(color_eyre::eyre::Error::msg)?;
+    }
+    println!("Gateway answering on {base_url}.");
+    println!("Open http://localhost:20128 in a browser, configure your upstream providers");
+    println!("there, and copy an API key from its dashboard.\n");
+
+    let existing_key = config.nine_router.api_key.clone();
+    let prompt = match &existing_key {
+        Some(_) => "9Router API key (already set — blank keeps it)".to_string(),
+        None => "9Router API key (from the local dashboard)".to_string(),
+    };
+    let entered: String = Password::with_theme(theme)
+        .with_prompt(prompt)
+        .allow_empty_password(true)
+        .interact()?;
+    let Some(key) = (if entered.is_empty() {
+        existing_key
+    } else {
+        Some(entered)
+    }) else {
+        println!("The gateway requires its dashboard key — section left unchanged.");
+        return Ok(false);
+    };
+
+    config.nine_router.api_key = Some(key);
+    if config.nine_router.base_url.is_none() {
+        config.nine_router.base_url = Some(base_url);
+    }
+    config.general.provider = Some("9router".to_string());
+    config.general.model = Some(
+        config
+            .nine_router
+            .model
+            .clone()
+            .unwrap_or_else(|| "auto".to_string()),
+    );
+    Ok(true)
 }
 
 async fn setup_ollama(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Result<bool> {

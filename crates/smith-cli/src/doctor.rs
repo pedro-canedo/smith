@@ -215,6 +215,14 @@ pub async fn diagnose(cwd: &Path, config: &Config) -> Report {
     // zero-cost path someone falls back to, and "can I use it?" is worth
     // answering before they need to.
     report.push(check_ollama(config).await);
+    // Only when 9router is actually in play (primary or fallback entry):
+    // unlike Ollama it is not a thing most machines have, and a permanent
+    // warn on every clean install would train people to ignore the report.
+    if provider == ProviderKind::NineRouter
+        || config.fallback.providers.iter().any(|p| p == "9router")
+    {
+        report.push(check_ninerouter(config).await);
+    }
     report.push(check_browser(config).await);
 
     let (writable, schema) = check_project_dir(cwd);
@@ -234,6 +242,48 @@ impl Report {
         for server in &config.mcp_servers {
             self.push(check_mcp_server(server).await);
         }
+    }
+}
+
+/// Whether the 9router gateway is installed and answering, with the remedy
+/// for each way it can not be.
+async fn check_ninerouter(config: &Config) -> Check {
+    let base_url = config
+        .nine_router
+        .base_url
+        .clone()
+        .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
+
+    if crate::node_runtime::ninerouter_healthy(&base_url).await {
+        return Check::ok("9router", format!("gateway answering on {base_url}"));
+    }
+
+    let node = crate::node_runtime::find_node(&config.runtime);
+    let installed = config
+        .runtime
+        .ninerouter_dir
+        .as_deref()
+        .map(|dir| crate::node_runtime::ninerouter_cli(std::path::Path::new(dir)).is_file())
+        .unwrap_or(false);
+
+    match (node.is_some(), installed) {
+        (false, _) => Check::fail(
+            "9router",
+            "no Node runtime for the gateway",
+            "Run `smith setup` and pick the 9Router option — it downloads a private Node \
+             into ~/.smith/runtime.",
+        ),
+        (true, false) => Check::fail(
+            "9router",
+            "the gateway package is not installed",
+            "Run `smith setup` and pick the 9Router option.",
+        ),
+        (true, true) => Check::warn(
+            "9router",
+            format!("installed but not answering on {base_url}"),
+            "smith starts it automatically at session start; if that keeps failing, run it by \
+             hand to see why: `node <ninerouter_dir>/node_modules/9router/cli.js`.",
+        ),
     }
 }
 

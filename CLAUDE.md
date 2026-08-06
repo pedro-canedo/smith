@@ -251,6 +251,26 @@ call running in a job that named no tools at all. `ask_user` is refused rather
 than answered — there is no user, and inventing one puts words in their
 mouth.
 
+### Free providers and the two-layer fallback
+
+OpenRouter and 9Router ride the OpenAI adapter as flavors (`openai.rs`);
+`id()` is flavor-driven — it prices turns and labels `turns.provider`, and it
+used to say "openai" for everyone including Ollama. Layer one is OpenRouter's
+own server-side chain (`models` + `route: "fallback"` in the body, held on the
+provider via `with_fallback_models`, never on `CompletionRequest`). Layer two
+is `FallbackProvider` (`smith-provider/src/fallback.rs`): on a quota-class
+death (402, 429 past the retry cap, daily-quota 429, or two strikes) it
+advances a sticky index and returns a *retryable* error, so the agent's
+existing `stream_with_retry` drives the next attempt into the next entry —
+nothing new retries. Accounting follows the survivor through
+`LlmProvider::effective_model`; capabilities delegate to the active entry so
+compaction follows the active model. `[fallback] providers` config; an
+unusable entry errs naming the fix (never a silent skip). The 9Router gateway
+plus a private Node are provisioned into `~/.smith/runtime/` by
+`node_runtime.rs` on the Chromium pattern (sha256 vs SHASUMS256.txt, staged,
+probe-before-rename), and the gateway is spawned detached at session start
+when in play.
+
 ### Provider/model switching mid-session
 
 `/model` (see `smith-cli/main.rs` `Action::SwitchModel` handling) can change

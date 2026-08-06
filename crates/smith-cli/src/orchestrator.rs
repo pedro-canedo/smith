@@ -128,10 +128,12 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
             ))
         }
         ProviderKind::NineRouter => {
-            // The dashboard key is required by the gateway; unlike Ollama
-            // there is no keyless path, so a missing one fails naming where
-            // the key lives rather than sending a placeholder that would
-            // bounce with a confusing 401.
+            // The dashboard key is required by the gateway — verified against
+            // 9router@0.5.50: `/v1/models` answers keyless (which is what the
+            // health check uses), but `/v1/chat/completions` is 401 "Missing
+            // API key". So a missing key fails here, naming where the key
+            // lives, rather than sending a placeholder that would bounce with
+            // a confusing 401 on the first message.
             let key = std::env::var("NINEROUTER_API_KEY")
                 .ok()
                 .or_else(|| config.nine_router.api_key.clone())
@@ -722,6 +724,19 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     // network handshakes overlap with everything below instead of preceding it.
     let mcp_connecting = start_mcp_connections(&config);
 
+    // The 9router gateway, if this session can reach for it (as primary or as
+    // a fallback entry), is brought up concurrently with everything else —
+    // same reasoning as the MCP connections above. A failure is an Error
+    // event *before* the first turn: visible, and the session still starts,
+    // because a fallback entry that stays dead simply strikes out and the
+    // chain moves past it.
+    let uses_ninerouter = provider_kind == ProviderKind::NineRouter
+        || config.fallback.providers.iter().any(|p| p == "9router");
+    let ninerouter_starting = uses_ninerouter.then(|| {
+        let config = config.clone();
+        tokio::spawn(async move { crate::node_runtime::ensure_ninerouter_running(&config).await })
+    });
+
     let provider = match provider_override {
         Some(p) => p,
         None => match build_provider_stack(provider_kind, &config) {
@@ -821,6 +836,11 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
     // The latest point the MCP registry can be joined: everything above ran
     // while the servers were connecting, and `Agent::new` needs the finished
     // tool registry. A panicked connect task costs MCP and nothing else.
+    if let Some(starting) = ninerouter_starting {
+        if let Ok(Err(e)) = starting.await {
+            let _ = event_tx.send(AgentEvent::Error(format!("9router: {e}")));
+        }
+    }
     let mcp = Arc::new(mcp_connecting.await.unwrap_or_default());
     register_mcp_tools(&mcp, &mut tools, &event_tx);
     let tools = Arc::new(tools);

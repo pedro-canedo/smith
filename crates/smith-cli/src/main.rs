@@ -1,6 +1,7 @@
 mod doctor;
 mod headless;
 mod logging;
+mod node_runtime;
 mod orchestrator;
 mod prompts;
 mod resources;

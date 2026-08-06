@@ -258,6 +258,14 @@ pub struct RuntimeSettings {
     /// can tell "already current" from "a newer build exists" without
     /// launching the binary.
     pub chromium_version: Option<String>,
+    /// Absolute path to the provisioned Node.js binary (for the 9Router
+    /// gateway), and the version it came from.
+    pub node_path: Option<String>,
+    pub node_version: Option<String>,
+    /// Directory the 9router npm package was installed into, and its pinned
+    /// version.
+    pub ninerouter_dir: Option<String>,
+    pub ninerouter_version: Option<String>,
 }
 
 /// One entry in `[[mcp_servers]]`: an MCP server smith should connect to at
@@ -451,9 +459,18 @@ impl Config {
         let RuntimeSettings {
             chromium_path,
             chromium_version,
+            node_path,
+            node_version,
+            ninerouter_dir,
+            ninerouter_version,
         } = other.runtime;
         self.runtime.chromium_path = chromium_path.or(self.runtime.chromium_path.take());
         self.runtime.chromium_version = chromium_version.or(self.runtime.chromium_version.take());
+        self.runtime.node_path = node_path.or(self.runtime.node_path.take());
+        self.runtime.node_version = node_version.or(self.runtime.node_version.take());
+        self.runtime.ninerouter_dir = ninerouter_dir.or(self.runtime.ninerouter_dir.take());
+        self.runtime.ninerouter_version =
+            ninerouter_version.or(self.runtime.ninerouter_version.take());
 
         // Hooks are **not** merged from the project layer, and that is a
         // security decision rather than an oversight. A hook is an arbitrary

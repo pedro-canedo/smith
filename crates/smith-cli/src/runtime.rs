@@ -218,6 +218,13 @@ pub struct Downloaded {
 pub trait AssetSource: Send + Sync {
     async fn manifest(&self) -> Result<String, String>;
 
+    /// Fetches a small text document (a checksum manifest, an index).
+    /// Defaulted to unsupported so existing fixtures only implement what
+    /// their test drives.
+    async fn text(&self, url: &str) -> Result<String, String> {
+        Err(format!("this source cannot fetch {url}"))
+    }
+
     /// Fetches `url` into `dest`, resuming if `dest` already holds a prefix.
     /// `progress` is called with (bytes on disk, total if known).
     async fn download(
@@ -925,6 +932,24 @@ impl HttpAssetSource {
 
 #[async_trait]
 impl AssetSource for HttpAssetSource {
+    async fn text(&self, url: &str) -> Result<String, String> {
+        let response = self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("could not reach {url}: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("{url} answered {status}"));
+        }
+        response
+            .text()
+            .await
+            .map_err(|e| format!("could not read {url}: {e}"))
+    }
+
     async fn manifest(&self) -> Result<String, String> {
         let response = self
             .client
@@ -1401,7 +1426,7 @@ mod tests {
     fn runtime_with(path: Option<&str>) -> smith_config::RuntimeSettings {
         smith_config::RuntimeSettings {
             chromium_path: path.map(str::to_string),
-            chromium_version: None,
+            ..Default::default()
         }
     }
 

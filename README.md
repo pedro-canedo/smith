@@ -196,6 +196,31 @@ overwrite it unless you explicitly use `--force`. It never claims to undo
 
 ## Providers and configuration
 
+### Free by default
+
+`smith setup` opens with two free options, and a fresh install is expected to
+end with working AI at $0:
+
+- **OpenRouter** — one free key (openrouter.ai/keys, no card) unlocks a set of
+  `:free` models. smith drives the best free tool-capable model and sends the
+  rest as a server-side fallback chain (`route: "fallback"`), so a model
+  hitting its limit is replaced by the next within the same request. Free-tier
+  account limits: 20 req/min, 50 free requests/day (1,000/day after a one-time
+  $10 top-up).
+- **9Router** — a local gateway (auto-installed by setup, along with a private
+  Node.js under `~/.smith/runtime/`) that fans out to 40+ upstream providers
+  with its own internal fallback. Configure upstreams and copy the API key
+  from its dashboard at `http://localhost:20128`.
+
+When the OpenRouter *account* quota runs dry mid-session, smith itself falls
+over to the next configured provider — `[fallback] providers = ["9router",
+"ollama"]` — without losing the conversation; the handover is shown as it
+happens, and the context gauge and compaction follow the new model's window.
+The chain is sticky for the session (`/model` resets it), and an entry that is
+configured but unusable fails naming what to fix rather than being silently
+skipped. Costs are recorded under the provider/model that actually served.
+
+
 The interactive wizard is the recommended starting point. For manual setup,
 `~/.smith/config.toml` can contain:
 
