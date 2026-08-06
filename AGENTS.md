@@ -15,12 +15,16 @@ cargo test -p smith-tui               # one crate
 cargo test -p smith-tui app::tests::plan_gate_changed_event_syncs_state  # one test
 ```
 
-Tests are inline `#[cfg(test)] mod tests` at the bottom of each source file —
-there are no separate test files.
+Tests are a `#[cfg(test)] mod tests` belonging to the module they cover:
+inline at the bottom of the file, or — past ~400 lines — in a sibling
+`<module>/tests.rs`. Both are child modules, so `use super::*` reaches private
+items and the test path is spelled the same either way. There are no
+integration tests except the two forced ones under `crates/smith-cli/tests/`.
 
 CI (and pre-commit) gate, in this order — all must pass:
 
 ```sh
+bash scripts/check-file-size.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
