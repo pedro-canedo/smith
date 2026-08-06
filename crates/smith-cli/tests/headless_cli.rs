@@ -14,6 +14,12 @@
 //! the assertion tool — reaching it proves the whole path in front of it
 //! (stdin read, prompt composed, headless frontend chosen over the TUI) ran,
 //! and it guarantees the suite never touches the network.
+//!
+//! Most cases therefore pass `--provider anthropic` explicitly. An empty HOME
+//! with no exported key is a *first run*, which stops earlier than the
+//! provider with its own message; naming a provider is what puts the run back
+//! on the path these tests are measuring. The one case that leaves it out is
+//! the one testing that first-run behaviour itself.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -37,8 +43,13 @@ fn smith(args: &[&str], input: &str) -> (Run, tempfile::TempDir) {
         .args(["--cwd", &project.path().to_string_lossy()])
         .args(args)
         .env("HOME", home.path())
+        // All four, not two: an exported key is one of the things that
+        // decides a run is not a first run, so leaving two of them visible
+        // would make these tests depend on the developer's shell.
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("NINEROUTER_API_KEY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -63,10 +74,18 @@ fn smith(args: &[&str], input: &str) -> (Run, tempfile::TempDir) {
     )
 }
 
-/// `cat error.log | smith -p "diagnose this"`, minus the provider.
+/// `cat error.log | smith -p "diagnose this"`, minus the key.
+///
+/// `--provider` is named on purpose. Without it a hermetic HOME is a *first
+/// run*, which now stops at "no provider configured" — earlier than this test
+/// is about. Naming one puts the run back on the path to the provider, where
+/// the missing key is the instrument.
 #[test]
 fn a_piped_prompt_is_read_and_the_run_gets_as_far_as_the_provider() {
-    let (run, _project) = smith(&["-p", "diagnose this"], "thread 'main' panicked\n");
+    let (run, _project) = smith(
+        &["--provider", "anthropic", "-p", "diagnose this"],
+        "thread 'main' panicked\n",
+    );
 
     assert_eq!(run.code, EXIT_USAGE, "stderr: {}", run.stderr);
     assert!(
@@ -81,7 +100,7 @@ fn a_piped_prompt_is_read_and_the_run_gets_as_far_as_the_provider() {
 /// actually read rather than the flag defaulting somewhere.
 #[test]
 fn stdin_alone_supplies_the_prompt() {
-    let (run, _project) = smith(&[], "explain this repository\n");
+    let (run, _project) = smith(&["--provider", "anthropic"], "explain this repository\n");
 
     assert_eq!(run.code, EXIT_USAGE, "stderr: {}", run.stderr);
     assert!(
@@ -95,7 +114,7 @@ fn stdin_alone_supplies_the_prompt() {
 /// is no prompt", instead of blocking on a terminal that isn't there.
 #[test]
 fn an_empty_pipe_and_no_flag_is_a_usage_error_not_a_hang() {
-    let (run, _project) = smith(&[], "");
+    let (run, _project) = smith(&["--provider", "anthropic"], "");
 
     assert_eq!(run.code, EXIT_USAGE, "stderr: {}", run.stderr);
     assert!(run.stderr.contains("no prompt"), "stderr: {}", run.stderr);
@@ -120,11 +139,40 @@ fn a_non_terminal_stdout_never_starts_the_tui() {
 /// `.smith/` in whichever directory the run decided it was about.
 #[test]
 fn cwd_moves_the_project_directory_the_run_operates_on() {
-    let (_run, project) = smith(&["-p", "hi"], "");
+    // Needs a provider for the same reason: the session store that creates
+    // `.smith/` is only reached once the run has something to talk to.
+    let (_run, project) = smith(&["--provider", "anthropic", "-p", "hi"], "");
 
     assert!(
         project.path().join(".smith").is_dir(),
         "the run did not treat --cwd as its project directory"
+    );
+}
+
+/// A machine with nothing configured and no terminal to ask on. It used to
+/// name Anthropic — a provider the user never mentioned — and tell them their
+/// key was missing. Now it says what is actually wrong and names every way
+/// out, and it must never try to open an interactive menu on a pipe.
+#[test]
+fn a_first_run_without_a_terminal_explains_itself_instead_of_prompting() {
+    let (run, _project) = smith(&["-p", "hi"], "");
+
+    assert_eq!(run.code, EXIT_USAGE, "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("no provider configured"),
+        "stderr: {}",
+        run.stderr
+    );
+    // All three escapes, because a message that names one is a message that
+    // sends everyone down the same path whether or not it suits them.
+    assert!(run.stderr.contains("smith setup"), "{}", run.stderr);
+    assert!(run.stderr.contains("--provider"), "{}", run.stderr);
+    assert!(run.stderr.contains("ANTHROPIC_API_KEY"), "{}", run.stderr);
+    // No key error: it never got as far as choosing a provider to blame.
+    assert!(
+        !run.stderr.contains("No Anthropic API key"),
+        "{}",
+        run.stderr
     );
 }
 

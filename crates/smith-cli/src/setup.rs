@@ -23,23 +23,11 @@ use smith_config::{Config, DEFAULT_OLLAMA_BASE_URL, OLLAMA_HOST};
 
 use crate::runtime::{self, BrowserSource, HttpAssetSource};
 
-/// The curated OpenRouter free chain lives in `smith-store::models` — one
-/// source, shared with `/model` — rather than as a third copy here.
-use smith_store::models::OPENROUTER_MODELS;
-
-const ANTHROPIC_MODELS: &[&str] = &["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
-const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3"];
-const OLLAMA_MODELS: &[&str] = &[
-    "llama3.3",
-    "llama3.2",
-    "qwen2.5",
-    "qwen3",
-    "mistral",
-    "gemma2",
-    "phi4",
-    "deepseek-r1",
-    "codellama",
-];
+/// Model lists live in `smith-store::models` — one source, shared with the
+/// runtime `/model` command. This file used to say that about the OpenRouter
+/// chain and then keep private copies of the other three, which is how the
+/// wizard and `/model` came to disagree about what Anthropic offers.
+use smith_store::models::{known_models, OPENROUTER_MODELS};
 
 /// What a text prompt should do to an optional setting: the sentinel `-`
 /// clears it, blank keeps it, anything else replaces it.
@@ -115,13 +103,10 @@ pub async fn run(jump_to_model: bool) -> color_eyre::Result<()> {
     if jump_to_model {
         match config.general.provider.clone() {
             Some(provider) => {
-                let models = match provider.as_str() {
-                    "anthropic" => ANTHROPIC_MODELS,
-                    "openai" => OPENAI_MODELS,
-                    "openrouter" => OPENROUTER_MODELS,
-                    "9router" => &["auto"][..],
-                    _ => OLLAMA_MODELS,
-                };
+                // `known_models` answers for every provider id and returns
+                // an empty slice for anything else, which `select_model`
+                // already renders as "Other (type a model name)".
+                let models = known_models(&provider);
                 if let Some(model) = select_model(&theme, models)? {
                     config.general.model = Some(model);
                     save(&config)?;
@@ -177,45 +162,114 @@ fn save(config: &Config) -> color_eyre::Result<()> {
 /// `Ok(true)` when the section completed and `config` changed; `Ok(false)`
 /// when the user backed out, in which case `config` is untouched.
 async fn section_provider(theme: &ColorfulTheme, config: &mut Config) -> color_eyre::Result<bool> {
-    let Some(provider) = select_provider(theme)? else {
+    let Some(provider) = select_provider(theme).await? else {
         return Ok(false);
     };
     match provider.as_str() {
         "openrouter" => setup_openrouter(theme, config).await,
         "9router" => setup_ninerouter(theme, config).await,
-        "anthropic" => setup_api_provider(theme, config, "anthropic", ANTHROPIC_MODELS),
-        "openai" => setup_api_provider(theme, config, "openai", OPENAI_MODELS),
+        "anthropic" => setup_api_provider(theme, config, "anthropic", known_models("anthropic")),
+        "openai" => setup_api_provider(theme, config, "openai", known_models("openai")),
         "ollama" => setup_ollama(theme, config).await,
         other => color_eyre::eyre::bail!("unknown provider: {other}"),
     }
 }
 
-fn select_provider(theme: &ColorfulTheme) -> color_eyre::Result<Option<String>> {
-    // Free first, on purpose: the promise of `smith setup` is that a fresh
-    // install has working AI, and the free path is the one that needs no
-    // billing relationship to deliver it.
+/// What a 500 ms probe found on this machine, which decides where the
+/// provider cursor starts and what the Ollama row says about itself.
+enum OllamaState {
+    /// Daemon answering, with this many models already pulled or linked.
+    Ready(usize),
+    /// Binary installed, daemon down — `ensure_ollama_running` handles that.
+    Installed,
+    Absent,
+}
+
+impl OllamaState {
+    async fn probe() -> Self {
+        match ollama_model_count().await {
+            Some(n) if n > 0 => Self::Ready(n),
+            // Answering with nothing pulled is not "ready": picking it would
+            // hand the user a model list with nothing in it.
+            Some(_) => Self::Installed,
+            None if ollama_binary_present() => Self::Installed,
+            None => Self::Absent,
+        }
+    }
+
+    fn row(&self) -> String {
+        match self {
+            Self::Ready(n) => {
+                format!("Ollama (local + cloud) — {n} models ready, no key needed")
+            }
+            Self::Installed => {
+                "Ollama (local + cloud) — daemon not running, smith will start it".to_string()
+            }
+            Self::Absent => "Ollama (local) — not installed".to_string(),
+        }
+    }
+
+    /// Ollama is row 0, so it is the cursor whenever it is usable at all.
+    fn cursor(&self) -> usize {
+        match self {
+            Self::Ready(_) | Self::Installed => 0,
+            Self::Absent => 1,
+        }
+    }
+}
+
+/// How many models `/api/tags` reports, or `None` if the daemon did not answer.
+async fn ollama_model_count() -> Option<usize> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .ok()?;
+    let body: serde_json::Value = client
+        .get(format!("{OLLAMA_HOST}/api/tags"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(body.get("models")?.as_array()?.len())
+}
+
+async fn select_provider(theme: &ColorfulTheme) -> color_eyre::Result<Option<String>> {
+    // Keyless first, then free-with-account. This used to be "free first", and
+    // both OpenRouter and 9Router are free — but both need the user to go make
+    // an account somewhere and carry a key back, and a first-time cursor should
+    // land on the option that can answer a question without leaving the
+    // terminal. Which one that is depends on the machine, so it is probed
+    // rather than assumed: on a box with no Ollama the cursor moves on instead
+    // of aiming the newcomer at a connection refused.
+    let ollama = OllamaState::probe().await;
     let items = [
-        "Free — OpenRouter (cloud, free models, needs a free account)",
-        "Free — 9Router (local gateway, auto-installed)",
-        "Anthropic (Claude)",
-        "OpenAI",
-        "Ollama (local)",
+        ollama.row(),
+        "Free — OpenRouter (cloud, free models, needs a free account)".to_string(),
+        "Anthropic (Claude)".to_string(),
+        "OpenAI".to_string(),
+        "9Router (advanced — local gateway, needs its own dashboard setup)".to_string(),
     ];
     let idx = Select::with_theme(theme)
         .with_prompt("Provider")
         .items(&items)
-        .default(0)
+        .default(ollama.cursor())
         .interact_opt()?;
-    Ok(idx.map(|i| {
-        match i {
-            0 => "openrouter",
-            1 => "9router",
-            2 => "anthropic",
-            3 => "openai",
-            _ => "ollama",
-        }
-        .to_string()
-    }))
+    Ok(idx.map(|i| provider_at(i).to_string()))
+}
+
+/// The menu's row order, in one place so the labels above and the ids here
+/// cannot drift apart — they did once, and a mis-ordered arm sends someone
+/// into the wrong provider's setup with no sign anything went wrong.
+fn provider_at(index: usize) -> &'static str {
+    match index {
+        0 => "ollama",
+        1 => "openrouter",
+        2 => "anthropic",
+        3 => "openai",
+        _ => "9router",
+    }
 }
 
 fn setup_api_provider(
@@ -455,6 +509,14 @@ async fn setup_ninerouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
         config.runtime.ninerouter_dir = Some(runtime_root.join("9router").display().to_string());
         config.runtime.ninerouter_version = Some(gateway.version);
 
+        // Persisted before the gateway is asked to start, not after the section
+        // completes. Fifty megabytes were downloaded, verified and unpacked;
+        // that happened whether or not the next step works, and a `?` on the
+        // start used to throw the record of it away — leaving an install on
+        // disk that the config could not see and `smith doctor` reported as
+        // missing. The rest of the section still saves the ordinary way.
+        save(config)?;
+
         println!("Starting the gateway…");
         crate::node_runtime::ensure_ninerouter_running(config)
             .await
@@ -504,7 +566,7 @@ async fn setup_ollama(theme: &ColorfulTheme, config: &mut Config) -> color_eyre:
         return Ok(false);
     }
 
-    let Some(model) = select_model(theme, OLLAMA_MODELS)? else {
+    let Some(model) = select_model(theme, known_models("ollama"))? else {
         return Ok(false);
     };
 
@@ -793,6 +855,66 @@ async fn ollama_reachable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Row order and the id table are two lists that have to agree. They are
+    /// next to each other in the file, which is exactly the kind of pairing
+    /// that drifts — and a drifted arm drops someone into another provider's
+    /// setup with nothing looking wrong.
+    #[test]
+    fn the_provider_menu_rows_and_their_ids_line_up() {
+        assert_eq!(provider_at(0), "ollama");
+        assert_eq!(provider_at(1), "openrouter");
+        assert_eq!(provider_at(2), "anthropic");
+        assert_eq!(provider_at(3), "openai");
+        assert_eq!(provider_at(4), "9router");
+
+        // Every id the menu can produce has to be one `section_provider`
+        // dispatches on, and one `known_models` answers for.
+        for i in 0..5 {
+            let id = provider_at(i);
+            assert!(
+                smith_store::models::is_known_provider(id),
+                "menu row {i} yields unknown provider {id}"
+            );
+        }
+    }
+
+    /// Ollama sits at row 0, so a usable Ollama is the cursor. A machine
+    /// without it must move on rather than aim a newcomer at a connection
+    /// refused on 127.0.0.1:11434.
+    #[test]
+    fn the_cursor_lands_on_ollama_only_when_ollama_could_answer() {
+        assert_eq!(OllamaState::Ready(7).cursor(), 0);
+        assert_eq!(OllamaState::Installed.cursor(), 0);
+        assert_eq!(OllamaState::Absent.cursor(), 1);
+        assert_eq!(provider_at(OllamaState::Absent.cursor()), "openrouter");
+    }
+
+    /// The row says what the probe found, because "no key needed" is only
+    /// true when there is something to run.
+    #[test]
+    fn the_ollama_row_reports_what_the_probe_found() {
+        let ready = OllamaState::Ready(7).row();
+        assert!(ready.contains('7'), "{ready}");
+        assert!(ready.contains("no key needed"), "{ready}");
+
+        assert!(OllamaState::Installed.row().contains("not running"));
+
+        let absent = OllamaState::Absent.row();
+        assert!(absent.contains("not installed"), "{absent}");
+        assert!(
+            !absent.contains("no key needed"),
+            "a machine without ollama must not be promised a keyless provider: {absent}"
+        );
+    }
+
+    /// A daemon answering with an empty list is not ready: choosing it hands
+    /// the user a model picker with nothing in it.
+    #[test]
+    fn a_daemon_with_no_models_is_not_reported_as_ready() {
+        assert!(matches!(OllamaState::Ready(0).cursor(), 0));
+        assert!(!OllamaState::Installed.row().contains("models ready"));
+    }
 
     #[test]
     fn apply_optional_keeps_clears_and_replaces() {

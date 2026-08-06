@@ -495,6 +495,16 @@ impl Config {
     /// Writes the **global** file. Project overrides are hand-edited on
     /// purpose: `/model --save` saving into whatever repo you happened to be
     /// in would be a surprise, and a bad one if the value was a key.
+    ///
+    /// Written to a sibling temp file and renamed over the target, because
+    /// this is the only file holding the user's API keys and a truncating
+    /// write has a window where it holds none of them. A crash, a full disk or
+    /// two `smith setup` runs racing each other all land in that window. The
+    /// rename is same-directory, so it is atomic everywhere smith runs.
+    ///
+    /// The 0600 goes on the temp file *before* any content does — a file that
+    /// is briefly world-readable while it holds a key is the whole problem,
+    /// just narrower.
     pub fn save(&self) -> Result<(), ConfigError> {
         let dir = config_dir()?;
         std::fs::create_dir_all(&dir)?;
@@ -502,11 +512,43 @@ impl Config {
 
         let path = config_path()?;
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(&path, text)?;
-        set_permissions(&path, 0o600)?;
+        write_private_atomic(&path, &text)?;
 
         Ok(())
     }
+}
+
+/// Writes `text` to `path` through a sibling temp file, 0600 before content.
+///
+/// Split out of `save` so it can be tested at all: `save` resolves its own
+/// path from the home directory, and a test that exercised it would write to
+/// the developer's real `~/.smith/config.toml`.
+fn write_private_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    // Per-process name so concurrent saves cannot share a temp file. They
+    // still race on the rename, and that is fine: last writer wins with a
+    // whole file, which is what the truncating write could not promise.
+    let temp = path.with_extension(format!("toml.{}.new", std::process::id()));
+
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        set_permissions(&temp, 0o600)?;
+        {
+            use std::io::Write;
+            file.write_all(text.as_bytes())?;
+            // Durable before it is visible: a rename that publishes a file
+            // whose bytes are still in the page cache is a rename that can
+            // publish an empty config after a power cut.
+            file.sync_all()?;
+        }
+        std::fs::rename(&temp, path)
+    })();
+
+    if let Err(e) = write {
+        // Never leave a half-written file holding a key beside the real one.
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    set_permissions(path, 0o600)
 }
 
 #[cfg(unix)]
@@ -933,5 +975,47 @@ mod tests {
     fn load_layered_is_fine_with_no_project_file() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Config::load_layered(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn a_saved_config_leaves_no_temp_file_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_private_atomic(&path, "provider = \"ollama\"\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "provider = \"ollama\"\n"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.toml")
+            .collect();
+        assert!(leftovers.is_empty(), "temp file survived: {leftovers:?}");
+    }
+
+    /// The point of the rename: a reader either sees the whole old file or the
+    /// whole new one. A truncating write has a window where it sees neither,
+    /// and this is the only file holding the user's API keys.
+    #[test]
+    fn a_rewrite_never_leaves_the_file_shorter_than_either_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_private_atomic(&path, "a = 1\nb = 2\nc = 3\n").unwrap();
+        write_private_atomic(&path, "a = 9\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a = 9\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_config_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_private_atomic(&path, "api_key = \"sk-secret\"\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
     }
 }
