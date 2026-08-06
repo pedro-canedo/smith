@@ -754,6 +754,12 @@ async fn run_headless(cli: Cli) -> u8 {
     // config file written months ago would silently widen what a CI job may
     // do. Forcing `ask` makes the flag the single gate.
     opts.permission_policy = smith_core::PermissionPolicy::Ask;
+    // …and this closes the two ways a call could still skip that gate. Both
+    // exemptions exist to avoid interrupting a human: a write confined to the
+    // scratch directory, and `task`, whose child can only read. Neither
+    // argument survives without a human — the channel answers instantly from
+    // a list — while both left a call running in a job that named no tools.
+    opts.unattended = true;
     if let Some(max_turns) = cli.max_turns {
         opts.limits.max_turns = max_turns;
     }

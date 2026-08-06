@@ -96,6 +96,25 @@ pub struct ToolContext {
     /// Stable id for this chat session — used for on-disk staging under
     /// `.smith/staging/<session_id>/`.
     pub session_id: String,
+    /// Who is doing the reading, for the read-before-overwrite guard.
+    ///
+    /// **Not the same thing as `session_id`, and the difference is the whole
+    /// point.** `session_id` names on-disk state that belongs to the project
+    /// run: the staging directory, the scratch directory, the checkpoint
+    /// stream `/rewind` walks. A subagent shares all of those — it is working
+    /// in the same tree, and a checkpoint it took must be findable from the
+    /// parent's `/rewind`.
+    ///
+    /// What it does *not* share is knowledge. It has its own conversation and
+    /// its own context window; a file it read is a file the parent has never
+    /// seen. Keying the read set on `session_id` therefore let a subagent's
+    /// `read_file` satisfy the parent's overwrite guard — the guard exists
+    /// precisely to stop the model clobbering a file it has not looked at,
+    /// and delegating a read was enough to walk around it.
+    ///
+    /// Defaults to the session id, so a plain session behaves exactly as
+    /// before.
+    pub reader_id: String,
     /// Progress channel for the call currently executing, stamped on by
     /// `Agent::run_one_tool`. `None` on the agent's own session-long context
     /// and anywhere a context is built outside a tool call, so a tool must
@@ -106,11 +125,29 @@ pub struct ToolContext {
 
 impl ToolContext {
     pub fn new(cwd: impl Into<PathBuf>, session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
         Self {
             cwd: cwd.into(),
-            session_id: session_id.into(),
+            reader_id: session_id.clone(),
+            session_id,
             progress: None,
         }
+    }
+
+    /// The same on-disk session, read by somebody else.
+    ///
+    /// `label` distinguishes one delegate from the next, so two subagents in
+    /// one turn do not unlock each other's writes either.
+    pub fn for_delegate(&self, label: &str) -> Self {
+        Self {
+            reader_id: format!("{}::{label}", self.session_id),
+            ..self.clone()
+        }
+    }
+
+    /// Whose reads count for the overwrite guard.
+    pub fn reader_id(&self) -> &str {
+        &self.reader_id
     }
 
     /// A copy of this context scoped to one tool call. The agent keeps a

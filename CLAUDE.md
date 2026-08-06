@@ -239,11 +239,17 @@ clap's own bad-flag code), `3` stopped by a safety cap. `3` is distinct from
 `1` because they warrant opposite reactions in CI — a failure is a bug, a cap
 is a budget to raise with all prior work intact.
 
-Permissions deny by default; `--allowed-tools` is the only gate, and headless
+Nothing that writes, runs a command, or spawns an agent happens without
+`--allowed-tools` naming it; the read-only tools run unlisted, which is what
+the flag's own help promises. Headless
 forces `PermissionPolicy::Ask` regardless of saved config (a stored `skip`
 would auto-allow tools before they ever reach the channel `--allowed-tools`
-inspects). `ask_user` is refused rather than answered — there is no user, and
-inventing one puts words in their mouth.
+inspects), and sets `Agent::with_unattended(true)`, which turns off the two
+prompt exemptions whose only justification is sparing a human an
+interruption: a write confined to `.smith/scratch/`, and `task`. Both left a
+call running in a job that named no tools at all. `ask_user` is refused rather
+than answered — there is no user, and inventing one puts words in their
+mouth.
 
 ### Provider/model switching mid-session
 

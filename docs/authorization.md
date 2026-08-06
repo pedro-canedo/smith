@@ -203,10 +203,16 @@ as known — and the child's transcript is **discarded**; the parent only ever
 sees a summary report. So the parent can now `write_file` over a file whose
 contents no agent in the conversation still has. Delegation launders the gate.
 
-The fix is one line (give the child a derived session id, e.g.
-`<session>#sub<n>`), and the only other consumers of `session_id` are staging,
-scratch and checkpoints — none of which a read-only child touches. Not applied
-here because it is outside the change this document accompanies; it should be.
+**Fixed.** Not by deriving a session id, which was the obvious move and the
+wrong one: `session_id` also names the staging directory, the scratch
+directory and the checkpoint stream `/rewind` walks, and a child that ever
+gains a write tool would have quietly put its checkpoints somewhere the
+parent's `/rewind` does not look. The two identities are genuinely different,
+so `ToolContext` now carries both — `session_id` for on-disk state, `reader_id`
+for what has been read — and `ToolContext::for_delegate` changes only the
+second. `ReadSet` keys on `reader_id`, which defaults to the session id, so an
+ordinary session behaves exactly as before. Two subagents in one turn do not
+unlock each other either.
 
 ### B. `--allowed-tools` is not deny-by-default
 
@@ -227,13 +233,36 @@ Calls that never reach the channel:
   rung 4, so a `Mutating` call runs in a headless job that listed no tools at
   all.
 
-The last one is the sharp edge: it is the only case where a tool that mutates
-the filesystem runs in headless without being named. It is confined to a
-gitignored scratch directory, so the blast radius is small — but "deny by
-default" is the wrong description of the mechanism, and a user reading the flag
-would not predict it. Either the flag should be consulted at rung 4 (before the
-prompt decision, not as its answer), or the documentation should say
-"`--allowed-tools` answers prompts" instead of "denies by default".
+**Fixed, for the two cases that mattered.**
+
+Both exemptions were justified by the same thing: not interrupting a human.
+The scratch exemption exists because prompting for throwaway files is what
+pushes the model into writing them into the project instead; `task` skips the
+gate because the user is watching and the child can only read. Neither
+argument survives when nobody is at the terminal — the channel answers
+instantly from a list, so there is no friction to spare — while both left a
+call running in a job that named no tools at all.
+
+`Agent::with_unattended(true)`, set by the headless frontend, therefore turns
+both off:
+
+- a scratch-confined `Mutating` call goes to the channel like any other, so
+  `--allowed-tools` decides it;
+- `task` must be named. It is classed `ReadOnly` because a child's own tools
+  are, which is right interactively and wrong unattended: "spawn a whole agent
+  and spend the user's money" is not what a reader expects `--allowed-tools`
+  to leave open.
+
+Carried across `/model` alongside the limits and the redactor, for the same
+reason: a switch that quietly re-enabled the exemptions would be the least
+visible way to lose the only gate a headless run has.
+
+The remaining `ReadOnly` tools — `read_file`, `list_dir`, `glob`, `grep`,
+`web_search` — still run unlisted, and that is intended rather than
+outstanding: the flag's own help says "tools a non-interactive run may use
+**beyond the read-only ones**". What was wrong was `CLAUDE.md` calling it "the
+only gate"; the accurate statement is that nothing that writes, runs a
+command, or spawns an agent happens without it.
 
 ### C. Three tools are never schema-checked
 

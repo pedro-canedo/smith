@@ -495,7 +495,7 @@ Args: path (required), offset (1-based first line, optional), limit (max lines, 
             // read before `write_file` would be a demand no read could
             // satisfy — the model would loop between the two forever.
             self.reads.record_whole(
-                &ctx.session_id,
+                ctx.reader_id(),
                 &full,
                 &crate::checkpoint::hash_bytes(&bytes),
             );
@@ -513,7 +513,7 @@ Args: path (required), offset (1-based first line, optional), limit (max lines, 
         let total = lines.len();
         if total == 0 {
             self.reads.record_whole(
-                &ctx.session_id,
+                ctx.reader_id(),
                 &full,
                 &crate::checkpoint::hash_bytes(&bytes),
             );
@@ -597,7 +597,7 @@ Args: path (required), offset (1-based first line, optional), limit (max lines, 
         // point of the gate is that nothing is destroyed unseen.
         if !clipped && !lossy {
             self.reads.record_read(
-                &ctx.session_id,
+                ctx.reader_id(),
                 &full,
                 &crate::checkpoint::hash_bytes(&bytes),
                 total,
@@ -912,7 +912,7 @@ so read it first or use edit_file for a targeted change. Args: path (required), 
                     Err(e) => return ToolResult::error(format!("failed to read {path}: {e}")),
                 };
                 let knowledge = self.reads.knowledge(
-                    &ctx.session_id,
+                    ctx.reader_id(),
                     &full,
                     &crate::checkpoint::hash_bytes(&existing),
                 );
@@ -935,7 +935,7 @@ so read it first or use edit_file for a targeted change. Args: path (required), 
         // second write to the same path in one turn would be refused for a
         // file only smith itself has ever touched.
         self.reads.record_whole(
-            &ctx.session_id,
+            ctx.reader_id(),
             &full,
             &crate::checkpoint::hash_bytes(content.as_bytes()),
         );
@@ -1005,7 +1005,7 @@ async fn apply_and_diff(
         return ToolResult::error(e);
     }
     reads.carry_forward(
-        &ctx.session_id,
+        ctx.reader_id(),
         full,
         &crate::checkpoint::hash_bytes(original.as_bytes()),
         &crate::checkpoint::hash_bytes(updated.as_bytes()),
@@ -2102,6 +2102,76 @@ mod tests {
             before.as_bytes(),
             "a refused write still changed the file"
         );
+    }
+
+    /// A delegated read is not the parent's read.
+    ///
+    /// `read_before_overwrite` exists to stop the model replacing a file it
+    /// has never looked at. A subagent has its own conversation and its own
+    /// context window, so a file it read is a file the parent still has not
+    /// seen — but both used to share one read set, keyed on the session id,
+    /// so `task("read a.txt")` was enough to unlock the parent's `write_file`.
+    #[tokio::test]
+    async fn a_subagents_read_does_not_unlock_the_parents_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = ctx(&dir);
+        let child = parent.for_delegate("task.call_1");
+        let before = "the user's actual work\n";
+        std::fs::write(dir.path().join("a.txt"), before).unwrap();
+
+        // One `Files` registry, as the real subagent has: it wraps the
+        // parent's tools rather than building its own.
+        let files = files();
+
+        let seen = read(&files, &child, serde_json::json!({"path": "a.txt"})).await;
+        assert!(!seen.is_error, "{}", seen.content);
+
+        let result = write(&files, &parent, "a.txt", "hallucinated replacement").await;
+        assert!(
+            result.is_error,
+            "the delegate's read unlocked the parent's write: {}",
+            result.content
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            before.as_bytes()
+        );
+    }
+
+    /// …and two delegates do not unlock each other either.
+    #[tokio::test]
+    async fn one_subagent_does_not_unlock_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = ctx(&dir);
+        let first = parent.for_delegate("task.call_1");
+        let second = parent.for_delegate("task.call_2");
+        std::fs::write(dir.path().join("a.txt"), "original\n").unwrap();
+
+        let files = files();
+        read(&files, &first, serde_json::json!({"path": "a.txt"})).await;
+        let result = write(&files, &second, "a.txt", "replacement").await;
+        assert!(result.is_error, "{}", result.content);
+    }
+
+    /// The delegate is a different *reader*, not a different session: its
+    /// staging, scratch and checkpoints must stay where the parent's
+    /// `/rewind` can find them.
+    #[test]
+    fn a_delegate_keeps_the_sessions_on_disk_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = ctx(&dir);
+        let child = parent.for_delegate("task.call_1");
+        assert_eq!(child.session_id, parent.session_id);
+        assert_eq!(child.cwd, parent.cwd);
+        assert_ne!(child.reader_id(), parent.reader_id());
+    }
+
+    /// A plain session is unaffected: reader and session are the same id.
+    #[test]
+    fn an_ordinary_session_reads_as_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(&dir);
+        assert_eq!(ctx.reader_id(), ctx.session_id);
     }
 
     #[tokio::test]

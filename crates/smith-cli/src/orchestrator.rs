@@ -376,6 +376,7 @@ impl OrchestratorState {
         // Read from disk once at startup; re-reading here would let a file
         // edited mid-session take effect on `/model` and nowhere else.
         let subagents = self.agent.subagent_definitions().to_vec();
+        let unattended = self.agent.unattended();
 
         let scratch_dir = tool_ctx.scratch_dir();
         let mut agent = Agent::new(new_provider, self.tools.clone(), model.clone(), tool_ctx)
@@ -393,7 +394,11 @@ impl OrchestratorState {
             // and with the same failure mode if forgotten: a hook the user
             // believes is enforcing a policy, silently gone since `/model`.
             .with_hooks(hook_set(config))
-            .with_permission_policy(permission_policy);
+            .with_permission_policy(permission_policy)
+            // Carried over for the same reason the limits and the redactor are:
+            // a `/model` switch that quietly re-enabled the exemptions would be
+            // the least visible way to lose the only gate a headless run has.
+            .with_unattended(unattended);
         if let Some(checkpointer) = checkpointer {
             agent = agent.with_checkpointer(checkpointer);
         }
@@ -503,6 +508,10 @@ pub struct OrchestratorOptions {
     /// prompt. Resolved by the frontend (it owns `--persona`) and never
     /// re-read here — see `prompts::system_prompt_with`.
     pub persona: Option<smith_config::Persona>,
+    /// True when nobody is at the terminal. Set by the headless frontend; it
+    /// turns off the two prompt exemptions that only make sense when a human
+    /// would otherwise be interrupted — see `Agent::with_unattended`.
+    pub unattended: bool,
 }
 
 impl OrchestratorOptions {
@@ -518,6 +527,7 @@ impl OrchestratorOptions {
             limits: TurnLimits::default(),
             provider: None,
             persona: None,
+            unattended: false,
         }
     }
 }
@@ -543,6 +553,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         limits,
         provider: provider_override,
         persona,
+        unattended,
     } = opts;
     let OrchestratorChannels {
         mut action_rx,
@@ -675,7 +686,11 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         .with_retry_policy(RetryPolicy::default())
         .with_redactor(secret_redactor(&config))
         .with_hooks(hook_set(&config))
-        .with_permission_policy(permission_policy);
+        .with_permission_policy(permission_policy)
+        // Headless. Turns off the two prompt exemptions whose justification is
+        // "do not interrupt the user" — there is no user to interrupt, and
+        // `--allowed-tools` is the only gate the run has.
+        .with_unattended(unattended);
     agent.set_goal(initial_goal);
     let seeded_tasks = crate::last_write_tasks_call(&initial_messages);
     if !initial_messages.is_empty() {

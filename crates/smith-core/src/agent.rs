@@ -431,6 +431,10 @@ pub struct Agent {
     /// How many agents deep this one is: 0 for the one the user talks to, 1
     /// for a child it spawned via `task`. See [`subagent::MAX_DEPTH`].
     subagent_depth: u32,
+    /// True when no human is watching — a headless run. See the two places
+    /// that read it: the scratch-write exemption and the `task` gate, both of
+    /// which are justified by interactive friction that does not exist here.
+    unattended: bool,
     /// Child agents this one may spawn, beyond the built-in general-purpose
     /// one. Loaded from `~/.smith/agents/*.md` by the frontend — `smith-core`
     /// has no notion of a home directory.
@@ -496,6 +500,7 @@ impl Agent {
             pending_notes: Vec::new(),
             reasoning_tags_stripped: 0,
             subagent_depth: 0,
+            unattended: false,
             subagent_definitions: Vec::new(),
             subagent_tool_budget: 0,
             turn_deadline: None,
@@ -548,6 +553,16 @@ impl Agent {
     }
 
     /// 0 for the agent the user talks to; 1 inside a subagent.
+    /// Marks this agent as running with nobody at the terminal.
+    pub fn with_unattended(mut self, unattended: bool) -> Self {
+        self.unattended = unattended;
+        self
+    }
+
+    pub fn unattended(&self) -> bool {
+        self.unattended
+    }
+
     pub fn subagent_depth(&self) -> u32 {
         self.subagent_depth
     }
@@ -1643,6 +1658,21 @@ impl Agent {
         // and unforgeable from the tool side. Its own tools are read-only, so
         // like `ask_user` it is exempt from the plan gate and the prompt.
         if name == subagent::TASK_TOOL {
+            // `task` is classed `ReadOnly` because a child's own tools are,
+            // and interactively that is right: the user is watching, and the
+            // child can only look. Unattended, nobody is watching and the
+            // child spends the user's money — so it has to be named like
+            // anything else. `--allowed-tools` is the only control a headless
+            // run has, and "spawn a whole agent" is not what a reader expects
+            // it to leave open.
+            if self.unattended && !self.allowed_session_tools.contains(name) {
+                if let Err(refusal) = self
+                    .request_permission(id, name, &input, events, permission_tx)
+                    .await
+                {
+                    return refusal;
+                }
+            }
             return self.run_task(id, input, events, cancel).await;
         }
 
@@ -1657,42 +1687,70 @@ impl Agent {
         let needs_prompt = class != PermissionClass::ReadOnly
             && !self.allowed_session_tools.contains(name)
             && !self.permission_policy.auto_allows(class)
-            && !self.tools.scratch_scoped(name, &input, &self.tool_ctx);
+            // The scratch exemption is a *friction* argument: prompting for
+            // throwaway files is what pushes the model into writing them into
+            // the project instead. Unattended there is no friction to spare —
+            // the channel answers instantly from `--allowed-tools` — so the
+            // exemption buys nothing and costs the only gate a headless run
+            // has. It was the one case where a Mutating tool ran in a job that
+            // named no tools at all.
+            && (self.unattended || !self.tools.scratch_scoped(name, &input, &self.tool_ctx));
 
         if needs_prompt {
-            let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::WaitingPermission));
-            let detail = format_permission_detail(name, &input);
-            let (tx, rx) = oneshot::channel();
-            let _ = events.send(AgentEvent::PermissionPromptNeeded(PermissionRequest {
-                tool_call_id: id.to_string(),
-                tool_name: name.to_string(),
-                detail: detail.clone(),
-            }));
-            let sent = permission_tx.send(PermissionAsk {
-                request: PermissionRequest {
-                    tool_call_id: id.to_string(),
-                    tool_name: name.to_string(),
-                    detail,
-                },
-                respond_to: tx,
-            });
-            if sent.is_err() {
-                return ToolResult::error("permission channel closed");
-            }
-            let decision = rx.await.unwrap_or(PermissionDecision::Deny);
-            match decision {
-                PermissionDecision::Deny => {
-                    return ToolResult::error("User denied permission to run this tool.");
-                }
-                PermissionDecision::AllowSession => {
-                    self.allowed_session_tools.insert(name.to_string());
-                }
-                PermissionDecision::AllowOnce => {}
+            if let Err(refusal) = self
+                .request_permission(id, name, &input, events, permission_tx)
+                .await
+            {
+                return refusal;
             }
         }
 
         self.dispatch_tool(id, name, input, class, events, cancel)
             .await
+    }
+
+    /// Puts one call to the permission channel and folds the answer back in.
+    ///
+    /// `Err` is the refusal to return to the model; `Ok` means proceed. Split
+    /// out because two callers need it: the ordinary class-based check, and
+    /// `task` under an unattended run, where there is no other gate at all.
+    async fn request_permission(
+        &mut self,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        permission_tx: &mpsc::UnboundedSender<PermissionAsk>,
+    ) -> Result<(), ToolResult> {
+        let _ = events.send(AgentEvent::PhaseChanged(AgentPhase::WaitingPermission));
+        let detail = format_permission_detail(name, input);
+        let (tx, rx) = oneshot::channel();
+        let _ = events.send(AgentEvent::PermissionPromptNeeded(PermissionRequest {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            detail: detail.clone(),
+        }));
+        let sent = permission_tx.send(PermissionAsk {
+            request: PermissionRequest {
+                tool_call_id: id.to_string(),
+                tool_name: name.to_string(),
+                detail,
+            },
+            respond_to: tx,
+        });
+        if sent.is_err() {
+            return Err(ToolResult::error("permission channel closed"));
+        }
+        match rx.await.unwrap_or(PermissionDecision::Deny) {
+            PermissionDecision::Deny => Err(ToolResult::error(
+                "User denied permission to run this tool.",
+            )),
+            PermissionDecision::AllowSession => {
+                self.allowed_session_tools.insert(name.to_string());
+                Ok(())
+            }
+            PermissionDecision::AllowOnce => Ok(()),
+        }
     }
 
     /// Runs the `PreToolUse` chain for one call, answering with the arguments
@@ -2291,7 +2349,14 @@ impl Agent {
                     allowed.clone(),
                 )),
                 def.model.clone().unwrap_or_else(|| self.model.clone()),
-                self.tool_ctx.clone(),
+                // The same session on disk — staging, scratch and checkpoints
+                // all stay where the parent's `/rewind` can find them — but a
+                // *different reader*. A subagent has its own conversation and
+                // its own context window, so a file it read is a file the
+                // parent has still never seen. Sharing the read set let a
+                // delegated `read_file` satisfy the parent's overwrite guard,
+                // which is exactly the guard's job to prevent.
+                self.tool_ctx.for_delegate(&format!("task.{}", id)),
             )
             .with_system(subagent::child_system_prompt(&def, &allowed))
             .with_limits(limits)
@@ -3268,6 +3333,203 @@ mod tests {
             executed.load(std::sync::atomic::Ordering::SeqCst),
             "a scratch-confined Mutating call must run without a prompt"
         );
+    }
+
+    /// `task` is classed `ReadOnly` because a child's own tools are, and it
+    /// therefore never reached the permission channel — the only place
+    /// `--allowed-tools` can see a call. Unattended, that left "spawn a whole
+    /// agent and spend the user's money" available to a job that named no
+    /// tools at all.
+    #[tokio::test]
+    async fn task_must_be_named_when_nobody_is_watching() {
+        let provider = Arc::new(
+            ScriptedProvider::tool_call_then_text(
+                "call_1",
+                subagent::TASK_TOOL,
+                serde_json::json!({"description": "look", "prompt": "read the repo"}),
+                "done",
+            )
+            .with_id("anthropic"),
+        );
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(
+            provider,
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            tool_ctx,
+        )
+        .with_permission_policy(PermissionPolicy::Ask)
+        .with_unattended(true);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, mut permission_rx) = mpsc::unbounded_channel::<PermissionAsk>();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        // Answer the way `--allowed-tools` does when the tool is not listed.
+        tokio::spawn(async move {
+            while let Some(ask) = permission_rx.recv().await {
+                let _ = ask.respond_to.send(PermissionDecision::Deny);
+            }
+        });
+
+        agent
+            .run_turn(
+                "delegate it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event);
+        }
+        let asked = events.iter().any(|e| {
+            matches!(e, AgentEvent::PermissionPromptNeeded(r) if r.tool_name == subagent::TASK_TOOL)
+        });
+        assert!(asked, "task never reached the gate: {events:?}");
+        // A refused call returns its error to the model through the history
+        // rather than a `ToolCallResult` event, so the thing to assert is that
+        // no child was ever spawned: `run_task` announces itself with a
+        // "<name>: started" progress line before anything else.
+        let spawned = events.iter().any(
+            |e| matches!(e, AgentEvent::ToolProgress { line, .. } if line.contains("started")),
+        );
+        assert!(!spawned, "a child agent was spawned anyway: {events:?}");
+
+        // And the model is told, so it can react rather than silently retry.
+        let refusal = agent.history().iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(b, ContentBlock::ToolResult { content, is_error, .. }
+                    if *is_error && content.contains("denied permission"))
+            })
+        });
+        assert!(
+            refusal,
+            "the model was never told why: {:?}",
+            agent.history()
+        );
+    }
+
+    /// Interactively it stays ungated: the user is watching, the child can
+    /// only read, and a prompt per delegation would be pure friction.
+    #[tokio::test]
+    async fn task_is_not_gated_with_a_user_present() {
+        let provider = Arc::new(
+            ScriptedProvider::tool_call_then_text(
+                "call_1",
+                subagent::TASK_TOOL,
+                serde_json::json!({"description": "look", "prompt": "read the repo"}),
+                "done",
+            )
+            .with_id("anthropic"),
+        );
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(
+            provider,
+            Arc::new(NoTools),
+            "fake-model".to_string(),
+            tool_ctx,
+        )
+        .with_permission_policy(PermissionPolicy::Ask)
+        .with_unattended(false);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, _permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+
+        agent
+            .run_turn(
+                "delegate it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let mut asked = false;
+        while let Ok(event) = events_rx.try_recv() {
+            if matches!(&event, AgentEvent::PermissionPromptNeeded(r) if r.tool_name == subagent::TASK_TOOL)
+            {
+                asked = true;
+            }
+        }
+        assert!(!asked, "a delegation prompted with the user right there");
+    }
+
+    /// The scratch exemption is a friction argument, and unattended there is
+    /// no friction to spare. It was the one case where a Mutating tool ran in
+    /// a headless job that named no tools at all: `--allowed-tools` is
+    /// answered on the permission channel, and this call never reached it.
+    #[tokio::test]
+    async fn a_scratch_scoped_call_is_still_gated_when_nobody_is_watching() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(write_file_then_done());
+        let tools = Arc::new(ScratchScopedTools {
+            executed: executed.clone(),
+        });
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
+            .with_permission_policy(PermissionPolicy::Ask)
+            .with_unattended(true);
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        // Same trick as the test above: with the receiver gone, reaching the
+        // channel fails the call rather than hanging, so "it asked" and "it
+        // ran anyway" are distinguishable.
+        drop(permission_rx);
+
+        agent
+            .run_turn(
+                "do it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "a scratch write ran unattended without ever reaching the gate"
+        );
+    }
+
+    /// …and the interactive behaviour is unchanged, which is the whole reason
+    /// the flag exists rather than the exemption simply being deleted.
+    #[tokio::test]
+    async fn the_scratch_exemption_still_applies_with_a_user_present() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(write_file_then_done());
+        let tools = Arc::new(ScratchScopedTools {
+            executed: executed.clone(),
+        });
+        let tool_ctx = ToolContext::new(".", "test-session");
+        let mut agent = Agent::new(provider, tools, "fake-model".to_string(), tool_ctx)
+            .with_permission_policy(PermissionPolicy::Ask)
+            .with_unattended(false);
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (permission_tx, permission_rx) = mpsc::unbounded_channel();
+        let (question_tx, _question_rx) = mpsc::unbounded_channel();
+        drop(permission_rx);
+
+        agent
+            .run_turn(
+                "do it".to_string(),
+                events_tx,
+                permission_tx,
+                question_tx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(executed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
