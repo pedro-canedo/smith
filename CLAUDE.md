@@ -245,40 +245,58 @@ lives independently of the `Arc<dyn LlmProvider>`.
 
 ### Web search backends
 
-`web_search` (`smith-tools/src/web_search.rs`) tries five backends in order,
+`web_search` (`smith-tools/src/web_search.rs`) tries seven backends in order,
 each falling through to the next when it is unconfigured, blocked, or errors:
 
 1. **SearXNG** (`smith-tools/src/searxng.rs`) — the user's own instance, set
    via `[search] searxng_url`. First whenever configured, ahead of even a paid
    key: it is the only backend with no shared IP reputation and no anti-bot
    layer. Requires JSON output, which SearXNG ships **disabled** — the admin
-   must add `json` under `search: formats:` in `settings.yml`.
+   must add `json` under `search: formats:` in `settings.yml`. Public SearXNG
+   instances were measured and don't work here: they answer JSON requests
+   with anti-bot challenges or 429s.
 2. **Exa** — paid, structured, reports real publication dates. Needs
    `[exa] api_key`. Skipped entirely without one; the keyless tier now answers
    HTTP 402, so probing it only cost a request per search.
-3. **Bing over RSS**, plain HTTP (`smith-tools/src/bing.rs`) — the free
+3. **Tavily** — structured, agent-oriented, free tier (1,000 credits/month, no
+   card). Needs `[tavily] api_key`; skipped without one, like Exa. (Brave was
+   evaluated and rejected: it killed its free tier in February 2026.)
+4. **Bing over RSS**, plain HTTP (`smith-tools/src/bing.rs`) — the free
    workhorse, and what makes `web_search` work with no configuration at all.
    `&format=rss` returns the same ten results as ~5 KB of stable XML rather
    than ~122 KB of HTML, with real target URLs instead of Bing's `ck/a`
    redirect wrapper.
-4. **Bing over RSS, through headless Chromium** (`smith-tools/src/chromium.rs`)
+5. **Bing over RSS, through headless Chromium** (`smith-tools/src/chromium.rs`)
    — the same feed on a different network path, for hosts where plain HTTP is
    intercepted or fingerprinted. Chromium's XML viewer leaves the feed's markup
-   intact in the dumped DOM, so tiers 3 and 4 share one parser.
-5. **DuckDuckGo lite over plain HTTP** — last, and measured as blocked far more
+   intact in the dumped DOM, so tiers 4 and 5 share one parser.
+6. **Google News RSS** (`smith-tools/src/google_news.rs`) — keyless, no
+   anti-bot layer, and the only free tier with *real* publication dates. A news
+   index: it backstops current-events queries when the Bing tiers fumble, and
+   legitimately has nothing for technical ones. Its `<link>`s are
+   `news.google.com` redirects, so the publisher rides in the title/snippet.
+7. **DuckDuckGo lite over plain HTTP** — last, and measured as blocked far more
    often than not.
 
-Two things here are counterintuitive and load-bearing:
+Three things here are counterintuitive and load-bearing:
 
-- **The Bing `setmkt`/`setlang` parameters are not cosmetic.** Without them
-  Bing answers 200 with ten well-formed results that have nothing to do with
-  the query — structurally indistinguishable from success. `bing::looks_poisoned`
-  is the guard: the measured signature is *no* result matching *any* query term.
-  A poisoned response is retried under the machine's locale market before the
-  tier is written off.
+- **The Bing market has to match the *query's* language, not the machine's.**
+  A Portuguese query under `setmkt=en-US` gets ten well-formed results about
+  nothing (measured 3/3: American Idol, job boards) — structurally
+  indistinguishable from success. `language::detect`
+  (`smith-tools/src/language.rs`) guesses the query's language from function
+  words and unique characters (pt/es today), and that market outranks even a
+  configured one in `bing::markets_to_try`. The machine locale is the *last*
+  fallback — WSL2 ships `LANG=C.UTF-8`, which names no market at all.
+- **`bing::judge_relevance` grades responses, not just rejects them.**
+  `Poisoned` (no result matches any query term) is retried under the next
+  market; `Weak` (exactly one distinct term of a 3+-term query matched — the
+  signature of "Mega Sena" returning MEGA, the file host) is kept as a
+  fallback while a better market gets a try, and only returned when nothing
+  scores `Good`.
 - **Bing's RSS `<pubDate>` is a crawl timestamp, not a publication date** (every
-  item carries today's date), so it is deliberately dropped. SearXNG and Exa are
-  the only tiers that contribute a recency signal.
+  item carries today's date), so it is deliberately dropped. SearXNG, Exa,
+  Tavily and Google News are the tiers that contribute a recency signal.
 
 DuckDuckGo used to be tiers 2 and 3. It was demoted on evidence: its `html` and
 `lite` endpoints answer HTTP 202 with a 14 KB challenge page to a plain client

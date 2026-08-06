@@ -2139,23 +2139,79 @@ impl App {
     }
 }
 
-/// Short, human-readable summary of what a tool call is doing, for the
-/// activity widget — e.g. "Reading src/main.rs" rather than a raw JSON blob.
+/// The friendly header labels of a tool card, one per lifecycle state.
+///
+/// The card's header is these labels, never the raw tool name — `web_search`
+/// reads as "Searching the web…" while it spins and "Search completed" once
+/// it lands; the raw name stays available in the verbose body (Ctrl+T or
+/// Enter on the card). The call's *target* (path, query, command) is not part
+/// of the label: the renderer appends it from `tool_input`, so the label can
+/// stay a constant verb phrase.
+pub(crate) struct ToolLabels {
+    pub(crate) running: String,
+    pub(crate) done: String,
+    pub(crate) failed: String,
+}
+
+/// Labels for `tool_name`, including the `mcp__server__tool` bridge naming.
+///
+/// MCP and unknown tools land on the same fallback: the prettified name with
+/// generic verbs around it.
+pub(crate) fn tool_labels(tool_name: &str) -> ToolLabels {
+    let (running, done, failed) = match tool_name {
+        "web_search" => ("Searching the web…", "Search completed", "Search failed"),
+        "web_fetch" => ("Fetching page…", "Page fetched", "Fetch failed"),
+        "read_file" => ("Reading", "Read", "Could not read"),
+        "write_file" => ("Writing", "Wrote", "Write failed"),
+        "edit_file" | "multi_edit" => ("Editing", "Edited", "Edit failed"),
+        "list_dir" => ("Listing", "Listed", "Could not list"),
+        "glob" | "grep" => ("Searching", "Searched", "Search failed"),
+        "run_bash" => ("Running command…", "Command completed", "Command failed"),
+        "task" => ("Delegating…", "Delegated", "Delegation failed"),
+        "write_tasks" => ("Updating tasks…", "Tasks updated", "Task update failed"),
+        other => {
+            let pretty = pretty_tool_name(other);
+            return ToolLabels {
+                running: format!("Calling {pretty}…"),
+                done: format!("{pretty} completed"),
+                failed: format!("{pretty} failed"),
+            };
+        }
+    };
+    ToolLabels {
+        running: running.to_string(),
+        done: done.to_string(),
+        failed: failed.to_string(),
+    }
+}
+
+/// `mcp__server__tool` → `server · tool`; anything else passes through.
+fn pretty_tool_name(name: &str) -> String {
+    name.strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .map(|(server, tool)| format!("{server} · {tool}"))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Short, human-readable summary of what a tool call is doing — the
+/// running-state label plus its target, kept as the tool line's `text` for
+/// anything that reads lines as plain strings (tests, future exports).
 fn activity_label(tool_name: &str, input: &serde_json::Value) -> String {
     let field = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or_default();
-    let label = match tool_name {
-        "read_file" => format!("Reading {}", field("path")),
-        "write_file" => format!("Writing {}", field("path")),
-        "edit_file" => format!("Editing {}", field("path")),
-        "list_dir" => format!("Listing {}", field("path")),
-        "glob" => format!("Searching {}", field("pattern")),
-        "grep" => format!("Searching for {}", field("pattern")),
-        "task" => format!("Delegating: {}", field("description")),
-        "multi_edit" => format!("Editing {}", field("path")),
-        "run_bash" => format!("Running {}", field("command")),
-        "write_tasks" => "Updating task list".to_string(),
-        "web_search" => format!("Searching \"{}\"", field("query")),
-        other => format!("Calling {other}"),
+    let target = match tool_name {
+        "read_file" | "write_file" | "edit_file" | "multi_edit" | "list_dir" => field("path"),
+        "glob" | "grep" => field("pattern"),
+        "task" => field("description"),
+        "run_bash" => field("command"),
+        "web_search" => field("query"),
+        "web_fetch" => field("url"),
+        _ => "",
+    };
+    let running = tool_labels(tool_name).running;
+    let label = if target.is_empty() {
+        running
+    } else {
+        format!("{running} {target}")
     };
     truncate(&label, MAX_LABEL_CHARS)
 }
@@ -2180,6 +2236,33 @@ fn looks_like_approval_request(text: &str) -> bool {
 mod tests {
     use super::*;
     use smith_core::TaskStatus;
+
+    #[test]
+    fn tool_labels_cover_the_builtin_lifecycles() {
+        let search = tool_labels("web_search");
+        assert_eq!(search.running, "Searching the web…");
+        assert_eq!(search.done, "Search completed");
+        assert_eq!(search.failed, "Search failed");
+
+        let read = tool_labels("read_file");
+        assert_eq!(read.running, "Reading");
+        assert_eq!(read.done, "Read");
+
+        let bash = tool_labels("run_bash");
+        assert_eq!(bash.running, "Running command…");
+        assert_eq!(bash.done, "Command completed");
+    }
+
+    #[test]
+    fn tool_labels_prettify_mcp_names_and_pass_unknowns_through() {
+        let mcp = tool_labels("mcp__github__create_issue");
+        assert_eq!(mcp.running, "Calling github · create_issue…");
+        assert_eq!(mcp.done, "github · create_issue completed");
+        assert_eq!(mcp.failed, "github · create_issue failed");
+
+        let unknown = tool_labels("frobnicate");
+        assert_eq!(unknown.running, "Calling frobnicate…");
+    }
 
     fn test_app() -> App {
         app_with_commands(SlashRegistry::builtin())

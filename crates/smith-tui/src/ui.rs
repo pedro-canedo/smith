@@ -543,6 +543,16 @@ fn tool_card(
         Some(ActivityStatus::Error) => (theme.icon_error().to_string(), theme.danger()),
     };
 
+    // The header speaks in activity labels, not tool names: "Searching the
+    // web…" while running, "Search completed" when done, "Search failed" on
+    // error. The raw name (`web_search`) moves to the verbose body.
+    let labels = crate::app::tool_labels(&name);
+    let (header_label, running_header) = match line.tool_status() {
+        Some(ActivityStatus::Running) | None => (labels.running, true),
+        Some(ActivityStatus::Done) => (labels.done, false),
+        Some(ActivityStatus::Error) => (labels.failed, false),
+    };
+
     let mut left = Vec::new();
     if selected {
         left.push(Span::styled(
@@ -552,11 +562,18 @@ fn tool_card(
     }
     left.extend([
         Span::styled(format!("{icon} "), icon_style),
-        Span::styled(name.clone(), theme.bold()),
+        Span::styled(header_label, theme.bold()),
     ]);
     if !target.is_empty() {
+        // Running reads as a sentence ("Reading src/main.rs"); a settled card
+        // separates verdict from target ("Read · src/main.rs").
+        let separator = if running_header {
+            " "
+        } else {
+            theme.separator()
+        };
         left.push(Span::styled(
-            format!(" {target}"),
+            format!("{separator}{target}"),
             match name.as_str() {
                 "run_bash" => theme.text(),
                 _ => theme.amber(),
@@ -603,6 +620,19 @@ fn tool_card(
             let row = Line::from(Span::styled(target.clone(), theme.amber()));
             out.extend(panel::inset(&[row], w, theme.overlay_bg()));
         }
+        // The newest `ToolProgress` line, so a long call visibly moves
+        // instead of sitting on a spinner (`set_progress` keeps only the
+        // latest). Before this, the line was stored and never shown.
+        if let Some(progress) = line.tool_output().and_then(|o| o.lines().next_back()) {
+            let row = Line::from(vec![
+                Span::styled("… ", theme.disabled()),
+                Span::styled(
+                    truncate_chars(progress, w.saturating_sub(6)),
+                    theme.secondary(),
+                ),
+            ]);
+            out.extend(panel::inset(&[row], w, theme.overlay_bg()));
+        }
     }
 
     // Errors always surface the tail of the failure output.
@@ -619,6 +649,13 @@ fn tool_card(
 
     // Verbose: full input + output (+ a real diff for edit_file).
     if verbose && finished {
+        // The raw tool name lives here now that the header speaks in
+        // friendly labels — verbose is exactly the "what actually ran" view.
+        out.extend(panel::inset(
+            &[Line::from(Span::styled(name.clone(), theme.disabled()))],
+            w,
+            theme.overlay_bg(),
+        ));
         match name.as_str() {
             "edit_file" => {
                 let old = tool_field(line, "old_str").unwrap_or("");
@@ -709,6 +746,7 @@ fn tool_target(line: &ChatLine) -> String {
         "multi_edit" => tool_field(line, "path"),
         "run_bash" => tool_field(line, "command"),
         "web_search" => tool_field(line, "query"),
+        "web_fetch" => tool_field(line, "url"),
         _ => None,
     }
     .unwrap_or_default();
@@ -1525,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_card_header_shows_name_target_and_duration() {
+    fn tool_card_header_shows_friendly_label_target_and_duration() {
         let theme = Theme::ansi();
         let lines = tool_card(
             &theme,
@@ -1536,9 +1574,110 @@ mod tests {
         );
         let header = lines[0].to_string();
         assert!(header.contains("✓"), "{header}");
-        assert!(header.contains("read_file"), "{header}");
-        assert!(header.contains("src/main.rs"), "{header}");
+        // Friendly label, not the raw tool name — that moved to verbose.
+        assert!(header.contains("Read · src/main.rs"), "{header}");
+        assert!(!header.contains("read_file"), "{header}");
         assert!(header.contains("400ms"), "{header}");
+    }
+
+    /// The three lifecycle states speak different labels — running reads as a
+    /// sentence, done as a verdict, error as a failure — and web_search never
+    /// shows its raw name outside verbose.
+    #[test]
+    fn tool_card_labels_follow_the_lifecycle() {
+        let theme = Theme::ansi();
+        let search = |status| {
+            ChatLine::test_tool(
+                "web_search",
+                status,
+                serde_json::json!({"query": "mega sena"}),
+                Some("results"),
+            )
+        };
+
+        let running =
+            tool_card(&theme, &search(ActivityStatus::Running), 60, false, 0)[0].to_string();
+        assert!(
+            running.contains("Searching the web… mega sena"),
+            "{running}"
+        );
+
+        let done = tool_card(&theme, &search(ActivityStatus::Done), 60, false, 0)[0].to_string();
+        assert!(done.contains("Search completed · mega sena"), "{done}");
+
+        let failed = tool_card(&theme, &search(ActivityStatus::Error), 60, false, 0)[0].to_string();
+        assert!(failed.contains("Search failed · mega sena"), "{failed}");
+
+        for header in [running, done, failed] {
+            assert!(!header.contains("web_search"), "{header}");
+        }
+    }
+
+    /// The raw tool name is still reachable — in the verbose body, where
+    /// "what actually ran" belongs.
+    #[test]
+    fn tool_card_verbose_body_carries_the_raw_tool_name() {
+        let theme = Theme::ansi();
+        let compact: String = tool_card(
+            &theme,
+            &tool_line("read_file", ActivityStatus::Done),
+            60,
+            false,
+            0,
+        )
+        .iter()
+        .map(Line::to_string)
+        .collect();
+        assert!(!compact.contains("read_file"), "{compact}");
+
+        let verbose: String = tool_card(
+            &theme,
+            &tool_line("read_file", ActivityStatus::Done),
+            60,
+            true,
+            0,
+        )
+        .iter()
+        .map(Line::to_string)
+        .collect();
+        assert!(verbose.contains("read_file"), "{verbose}");
+    }
+
+    /// An MCP-bridged tool gets the server · tool reading, not the raw
+    /// `mcp__` mangling.
+    #[test]
+    fn tool_card_prettifies_mcp_tool_names() {
+        let theme = Theme::ansi();
+        let line = ChatLine::test_tool(
+            "mcp__github__create_issue",
+            ActivityStatus::Done,
+            serde_json::json!({}),
+            Some("done"),
+        );
+        let header = tool_card(&theme, &line, 60, false, 0)[0].to_string();
+        assert!(
+            header.contains("github · create_issue completed"),
+            "{header}"
+        );
+        assert!(!header.contains("mcp__"), "{header}");
+    }
+
+    /// The newest ToolProgress line shows on the running card — before this
+    /// it was stored by `set_progress` and never rendered.
+    #[test]
+    fn tool_card_running_shows_the_latest_progress_line() {
+        let theme = Theme::ansi();
+        let line = ChatLine::test_tool(
+            "web_search",
+            ActivityStatus::Running,
+            serde_json::json!({"query": "mega sena"}),
+            Some("trying Bing…"),
+        );
+        let text: String = tool_card(&theme, &line, 60, false, 0)
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        assert!(text.contains("trying Bing…"), "{text}");
     }
 
     #[test]

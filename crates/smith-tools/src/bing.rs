@@ -67,7 +67,7 @@ pub(crate) fn search_url(query: &str, market: &str) -> Result<String, String> {
 ///
 /// Falls back to the whole string so a caller that configured a bare `en`
 /// still sends something coherent rather than an empty parameter.
-fn language_of(market: &str) -> &str {
+pub(crate) fn language_of(market: &str) -> &str {
     market
         .split('-')
         .next()
@@ -77,25 +77,45 @@ fn language_of(market: &str) -> &str {
 
 /// The markets to attempt, in order, for one search.
 ///
-/// The second entry exists because the market has to match the *query's*
-/// language, not the user's: an English query under `pt-BR` and a Portuguese
-/// query under `en-US` were both poisoned in testing, while each under its own
-/// market was correct. Since the query language is not known up front, a
-/// poisoned first attempt is retried under the machine's locale before the
-/// backend is written off. Duplicates are dropped so the common case costs one
-/// request.
-pub(crate) fn markets_to_try(configured: Option<&str>, locale: Option<&str>) -> Vec<String> {
-    let primary = configured
+/// The ordering encodes one measured fact: the market has to match the
+/// *query's* language, not the user's. An English query under `pt-BR` and a
+/// Portuguese query under `en-US` were both poisoned in testing, while each
+/// under its own market was correct. So:
+///
+/// 1. The market of the language the query itself appears to be written in
+///    ([`crate::language::detect`]) — the only signal that tracks the actual
+///    request. When it fires, it outranks even a configured market: a user
+///    who set `en-GB` still wants their Portuguese query answered, not
+///    poisoned.
+/// 2. The configured market, or [`DEFAULT_MARKET`].
+/// 3. The machine's locale. Last because it is the weakest proxy — and on
+///    WSL2's stock `LANG=C.UTF-8` it does not exist at all, which is exactly
+///    how the locale-only fallback shipped earlier never fired in practice.
+///
+/// Duplicates are dropped so the common case still costs one request.
+pub(crate) fn markets_to_try(
+    configured: Option<&str>,
+    locale: Option<&str>,
+    query: &str,
+) -> Vec<String> {
+    let configured_or_default = configured
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .unwrap_or(DEFAULT_MARKET)
         .to_string();
 
-    let mut markets = vec![primary.clone()];
-    if let Some(fallback) = locale.and_then(market_from_locale) {
-        if fallback != primary {
-            markets.push(fallback);
+    let mut markets: Vec<String> = Vec::new();
+    let mut push = |m: String| {
+        if !markets.contains(&m) {
+            markets.push(m);
         }
+    };
+    if let Some(language) = crate::language::detect(query) {
+        push(language.bing_market().to_string());
+    }
+    push(configured_or_default);
+    if let Some(from_locale) = locale.and_then(market_from_locale) {
+        push(from_locale);
     }
     markets
 }
@@ -179,31 +199,75 @@ fn element(item: &str, name: &str) -> Option<String> {
     Some(decode_html_entities(raw.trim()))
 }
 
-/// Whether a result set is Bing's poisoned response rather than a real answer.
+/// How much a result set has to do with the query it claims to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relevance {
+    /// Bing's poisoned response: not one result echoes one query term.
+    Poisoned,
+    /// One lone term matched out of a rich query — the signature of a
+    /// coincidence, not an answer ("Mega Sena" matching only MEGA, the cloud
+    /// storage). Usable as a last resort, but worth another market first.
+    Weak,
+    /// Nothing suggests the engine ignored the query.
+    Good,
+}
+
+/// Judges a result set against its query.
 ///
-/// The measured signature is absolute: a poisoned set has **no** result whose
-/// title, URL or snippet contains **any** term from the query, across all ten
+/// The poisoned signature is absolute and measured: **no** result whose
+/// title, URL or snippet contains **any** term from the query, across all
 /// rows, while a genuine set matches on most of them. Requiring total absence
-/// rather than a ratio is what keeps this from discarding real results for an
-/// obscure query, where a legitimate answer may echo very little of the
-/// wording back.
+/// is what keeps this from discarding real results for an obscure query,
+/// where a legitimate answer may echo very little of the wording back.
 ///
-/// A short result set is never judged: one or two rows can honestly miss every
-/// term, and there is not enough evidence there to overrule the engine.
-pub(crate) fn looks_poisoned(query: &str, results: &[SearchResult]) -> bool {
+/// `Weak` exists because total absence proved *too* lax on one measured case:
+/// a poisoned set for "resultado da mega sena" sailed through on rows about
+/// MEGA, the file host — one coincidental term out of three. A set that
+/// matches exactly one distinct term of a three-plus-term query is not called
+/// poisoned (it could still be the obscure-query case), but the caller is
+/// told it is weak evidence, worth one more market before settling.
+///
+/// Abstentions stay as they were: a short result set (< 3 rows) or a query
+/// with no usable terms is `Good`, because there is not enough evidence to
+/// overrule the engine.
+pub(crate) fn judge_relevance(query: &str, results: &[SearchResult]) -> Relevance {
     const MIN_RESULTS_TO_JUDGE: usize = 3;
+    /// A query needs this many distinct terms before a single match reads as
+    /// coincidence: with two, one match is half the query echoed back.
+    const MIN_TERMS_FOR_WEAK: usize = 3;
 
     if results.len() < MIN_RESULTS_TO_JUDGE {
-        return false;
+        return Relevance::Good;
     }
-    let terms = query_terms(query);
+    let mut terms = query_terms(query);
+    terms.sort();
+    terms.dedup();
     if terms.is_empty() {
-        return false;
+        return Relevance::Good;
     }
-    !results.iter().any(|r| {
-        let haystack = format!("{} {} {}", r.title, r.url, r.snippet).to_lowercase();
-        terms.iter().any(|t| haystack.contains(t))
-    })
+
+    let haystacks: Vec<String> = results
+        .iter()
+        .map(|r| format!("{} {} {}", r.title, r.url, r.snippet).to_lowercase())
+        .collect();
+    let matched = terms
+        .iter()
+        .filter(|t| haystacks.iter().any(|h| h.contains(*t)))
+        .count();
+
+    match matched {
+        0 => Relevance::Poisoned,
+        1 if terms.len() >= MIN_TERMS_FOR_WEAK => Relevance::Weak,
+        _ => Relevance::Good,
+    }
+}
+
+/// Whether a result set is Bing's poisoned response rather than a real answer.
+/// Kept as the tests' vocabulary; production code reads the full verdict from
+/// [`judge_relevance`].
+#[cfg(test)]
+pub(crate) fn looks_poisoned(query: &str, results: &[SearchResult]) -> bool {
+    judge_relevance(query, results) == Relevance::Poisoned
 }
 
 /// The query's content words, lowercased.
@@ -456,17 +520,80 @@ mod tests {
         assert!(!looks_poisoned("ratatui crate docs", &results));
     }
 
+    /// The Mega Sena case, verbatim: a poisoned set that dodged the
+    /// total-absence rule because MEGA (the file host) echoes one term.
+    #[test]
+    fn one_coincidental_term_out_of_a_rich_query_is_judged_weak() {
+        let results: Vec<SearchResult> = (0..4)
+            .map(|n| SearchResult {
+                title: "MEGA - Secure Cloud Storage".into(),
+                url: format!("https://mega.nz/{n}"),
+                snippet: "Free encrypted file hosting".into(),
+                published: None,
+            })
+            .collect();
+        assert_eq!(
+            judge_relevance("resultado da mega sena", &results),
+            Relevance::Weak
+        );
+        // Weak is deliberately not poisoned: still usable as a last resort.
+        assert!(!looks_poisoned("resultado da mega sena", &results));
+    }
+
+    /// The obscure-query protection survives: one matched term of a
+    /// two-term query is half the query, not a coincidence.
+    #[test]
+    fn one_term_of_a_two_term_query_is_still_good() {
+        let results: Vec<SearchResult> = (0..4)
+            .map(|n| SearchResult {
+                title: "Ratatui".into(),
+                url: format!("https://ratatui.rs/{n}"),
+                snippet: String::new(),
+                published: None,
+            })
+            .collect();
+        assert_eq!(
+            judge_relevance("ratatui widgets", &results),
+            Relevance::Good
+        );
+    }
+
+    /// Repeated words must not count as distinct evidence for `Weak`.
+    #[test]
+    fn duplicate_query_terms_are_counted_once() {
+        let results: Vec<SearchResult> = (0..3)
+            .map(|n| SearchResult {
+                title: "MEGA cloud".into(),
+                url: format!("https://mega.nz/{n}"),
+                snippet: String::new(),
+                published: None,
+            })
+            .collect();
+        // Terms dedup to {mega, sena}: two distinct terms, one matched — the
+        // two-term protection applies, not the three-term weak rule.
+        assert_eq!(
+            judge_relevance("mega mega sena sena", &results),
+            Relevance::Good
+        );
+    }
+
     // ---- market selection --------------------------------------------------
+
+    /// A neutral query for market tests — detection must not fire on it.
+    const EN_QUERY: &str = "ratatui crate docs";
 
     #[test]
     fn the_default_market_is_used_when_nothing_is_configured() {
-        assert_eq!(markets_to_try(None, None), vec![DEFAULT_MARKET.to_string()]);
+        assert_eq!(
+            markets_to_try(None, None, EN_QUERY),
+            vec![DEFAULT_MARKET.to_string()]
+        );
     }
 
     #[test]
     fn a_configured_market_wins_and_the_locale_becomes_the_retry() {
         assert_eq!(
-            markets_to_try(Some("en-GB"), Some("pt_BR.UTF-8")),
+            markets_to_try(Some("en-GB"), Some("pt_BR.UTF-8"), EN_QUERY),
             vec!["en-GB".to_string(), "pt-BR".to_string()]
         );
     }
@@ -475,12 +602,35 @@ mod tests {
     #[test]
     fn a_locale_matching_the_primary_market_is_not_retried() {
         assert_eq!(
-            markets_to_try(None, Some("en_US.UTF-8")),
+            markets_to_try(None, Some("en_US.UTF-8"), EN_QUERY),
             vec!["en-US".to_string()]
         );
         assert_eq!(
-            markets_to_try(Some("  "), Some("en_US.UTF-8")),
+            markets_to_try(Some("  "), Some("en_US.UTF-8"), EN_QUERY),
             vec!["en-US".to_string()]
+        );
+    }
+
+    /// The fix for the measured failure: a Portuguese query outranks both the
+    /// default market and a configured one, and works with no locale at all
+    /// (WSL2's `LANG=C.UTF-8`).
+    #[test]
+    fn the_querys_own_language_outranks_everything() {
+        assert_eq!(
+            markets_to_try(None, None, "resultado da mega sena"),
+            vec!["pt-BR".to_string(), "en-US".to_string()]
+        );
+        assert_eq!(
+            markets_to_try(Some("en-GB"), None, "últimos resultados do campeonato"),
+            vec!["pt-BR".to_string(), "en-GB".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_detected_language_matching_the_configured_market_dedups() {
+        assert_eq!(
+            markets_to_try(Some("pt-BR"), Some("pt_BR.UTF-8"), "resultado da mega sena"),
+            vec!["pt-BR".to_string()]
         );
     }
 

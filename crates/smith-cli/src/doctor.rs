@@ -188,13 +188,19 @@ pub async fn run() -> u8 {
 ///
 /// Mirrors `orchestrator::secret_redactor`, which is private to that module.
 fn redactor_for(config: &Config) -> Redactor {
-    let from_env = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "EXA_API_KEY"]
-        .into_iter()
-        .filter_map(|k| std::env::var(k).ok());
+    let from_env = [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "EXA_API_KEY",
+        "TAVILY_API_KEY",
+    ]
+    .into_iter()
+    .filter_map(|k| std::env::var(k).ok());
     let from_config = [
         config.anthropic.api_key.clone(),
         config.openai.api_key.clone(),
         config.exa.api_key.clone(),
+        config.tavily.api_key.clone(),
     ]
     .into_iter()
     .flatten();

@@ -10,10 +10,17 @@
 //! 2. **Exa** (`[exa] api_key`) — paid, structured, reports real publication
 //!    dates. Skipped entirely without a key: Exa's keyless tier now answers
 //!    HTTP 402, so probing it only spent a request per search to be refused.
-//! 3. **Bing over RSS**, plain HTTP — the free workhorse. See [`crate::bing`].
-//! 4. **Bing over RSS**, through a headless browser — the same query on a
+//! 3. **Tavily** (`[tavily] api_key`) — structured, agent-oriented, and its
+//!    free tier (1,000 credits/month, no card) is the cheapest key there is.
+//!    Skipped without a key, like Exa.
+//! 4. **Bing over RSS**, plain HTTP — the free workhorse. See [`crate::bing`].
+//! 5. **Bing over RSS**, through a headless browser — the same query on a
 //!    different network path, for hosts where plain HTTP is intercepted.
-//! 5. **DuckDuckGo lite** — last, and measured as blocked far more often than
+//! 6. **Google News RSS** — keyless, no anti-bot layer, and the only free
+//!    tier with real publication dates; a news index, so it backstops the
+//!    current-events queries Bing fumbles rather than replacing it. See
+//!    [`crate::google_news`].
+//! 7. **DuckDuckGo lite** — last, and measured as blocked far more often than
 //!    not; kept only because it costs one request on a path where everything
 //!    else has already failed.
 //!
@@ -39,6 +46,7 @@ use smith_core::{PermissionClass, Tool, ToolContext, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 const EXA_SEARCH_URL: &str = "https://api.exa.ai/search";
+const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
 const DUCKDUCKGO_LITE_URL: &str = "https://lite.duckduckgo.com/lite/";
 
 /// Five results by default rather than three: with three, a model that does
@@ -134,6 +142,8 @@ impl Unavailable {
 #[derive(Debug, Clone, Default)]
 pub struct SearchSettings {
     pub exa_api_key: Option<String>,
+    /// API key for Tavily (https://app.tavily.com) — free tier available.
+    pub tavily_api_key: Option<String>,
     /// Base URL of a SearXNG instance, e.g. `https://searx.example.com`.
     pub searxng_url: Option<String>,
     /// Bing market tag, e.g. `en-US`. See [`crate::bing::DEFAULT_MARKET`].
@@ -214,7 +224,7 @@ impl Tool for WebSearchTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
         cancel: CancellationToken,
     ) -> ToolResult {
         let query = input
@@ -245,7 +255,7 @@ impl Tool for WebSearchTool {
             ));
         }
 
-        match self.run_backends(query, num_results, &cancel).await {
+        match self.run_backends(query, num_results, ctx, &cancel).await {
             Ok((source, results)) => {
                 self.remember(query, &source, &results);
                 ToolResult::ok(format_results(&source, query, &today, &results))
@@ -261,16 +271,22 @@ impl WebSearchTool {
     /// The first backend that *runs* wins, even when it found nothing —
     /// "searched and found nothing" is a real answer and must not be retried
     /// against a weaker engine as if it were a failure.
+    ///
+    /// Each attempted tier reports one progress line through `ctx`, so the
+    /// card in the TUI shows *which* backend a slow search is waiting on
+    /// instead of a bare spinner. A no-op when nothing is attached.
     async fn run_backends(
         &self,
         query: &str,
         limit: usize,
+        ctx: &ToolContext,
         cancel: &CancellationToken,
     ) -> Result<(String, Vec<SearchResult>), Vec<(&'static str, Unavailable)>> {
         let mut failures: Vec<(&'static str, Unavailable)> = Vec::new();
 
         macro_rules! tier {
             ($label:expr, $call:expr) => {
+                ctx.report_progress(format!("trying {}…", $label));
                 match $call {
                     Ok(results) => return Ok(($label.to_string(), results)),
                     Err(e) => failures.push(($label, e)),
@@ -302,11 +318,22 @@ impl WebSearchTool {
             )),
         }
 
+        match &self.settings.tavily_api_key {
+            Some(key) if !key.trim().is_empty() => {
+                tier!("Tavily", self.search_tavily(key, query, limit).await);
+            }
+            _ => failures.push((
+                "Tavily",
+                Unavailable::NotConfigured("no `[tavily] api_key` configured".into()),
+            )),
+        }
+
         tier!("Bing", self.search_bing(query, limit, cancel).await);
         tier!(
             "Bing via headless browser",
             self.search_bing_browser(query, limit, cancel).await
         );
+        tier!("Google News", self.search_google_news(query, limit).await);
         tier!(
             "DuckDuckGo",
             search_duckduckgo_lite(&self.client, query, limit).await
@@ -317,9 +344,15 @@ impl WebSearchTool {
 
     /// Bing over plain HTTP, retried across markets and then over time.
     ///
-    /// Both retries answer measured failures: a market that does not match the
+    /// The retries answer measured failures: a market that does not match the
     /// query's language yields a poisoned result set, and a transport error or
     /// a 429 clears on its own. Attempts stop at [`BING_MAX_ATTEMPTS`].
+    ///
+    /// A `Weak` set — one coincidentally-matching term, see
+    /// [`crate::bing::Relevance`] — is kept as a fallback while the next
+    /// market gets a try, with no backoff in between (weakness is a relevance
+    /// judgement, not a throttle). It is only returned once every market has
+    /// had its chance to do better.
     async fn search_bing(
         &self,
         query: &str,
@@ -329,20 +362,31 @@ impl WebSearchTool {
         let markets = crate::bing::markets_to_try(
             self.settings.market.as_deref(),
             system_locale().as_deref(),
+            query,
         );
 
+        let mut weak_fallback: Option<Vec<SearchResult>> = None;
         let mut last = Unavailable::Transient("no attempt was made".into());
         for attempt in 1..=BING_MAX_ATTEMPTS {
             // Cycle the markets, so a second pass re-tries the primary one
             // after a pause rather than giving a third market a turn.
             let market = &markets[(attempt as usize - 1) % markets.len()];
             match self.bing_once(query, market, limit).await {
-                Ok(results) => return Ok(results),
+                Ok((results, crate::bing::Relevance::Good)) => return Ok(results),
+                Ok((results, _weak)) => {
+                    // First weak set wins the fallback slot: it came from the
+                    // best-ranked market.
+                    weak_fallback.get_or_insert(results);
+                    continue;
+                }
                 Err(e) => last = e,
             }
             if attempt < BING_MAX_ATTEMPTS && !sleep_backoff(attempt, cancel).await {
                 return Err(Unavailable::Transient("cancelled".into()));
             }
+        }
+        if let Some(results) = weak_fallback {
+            return Ok(results);
         }
         Err(last)
     }
@@ -352,8 +396,9 @@ impl WebSearchTool {
         query: &str,
         market: &str,
         limit: usize,
-    ) -> Result<Vec<SearchResult>, Unavailable> {
+    ) -> Result<(Vec<SearchResult>, crate::bing::Relevance), Unavailable> {
         let url = crate::bing::search_url(query, market).map_err(Unavailable::Misconfigured)?;
+        let language = crate::bing::language_of(market);
         let resp = self
             .client
             .get(&url)
@@ -362,7 +407,9 @@ impl WebSearchTool {
                 "Accept",
                 "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
             )
-            .header("Accept-Language", "en-US,en;q=0.9")
+            // Coherent with the market being tried — an `en-US` header on a
+            // `pt-BR` request is one more mismatched signal.
+            .header("Accept-Language", format!("{market},{language};q=0.9"))
             .send()
             .await
             .map_err(|e| Unavailable::Transient(format!("could not reach Bing: {e}")))?;
@@ -404,13 +451,90 @@ impl WebSearchTool {
         let market = crate::bing::markets_to_try(
             self.settings.market.as_deref(),
             system_locale().as_deref(),
+            query,
         )
         .swap_remove(0);
         let url = crate::bing::search_url(query, &market).map_err(Unavailable::Misconfigured)?;
         let dom = crate::chromium::fetch(&url, cancel)
             .await
             .map_err(Unavailable::Transient)?;
-        classify_bing(query, &dom, limit, &market)
+        // One browser launch is expensive enough that a weak set is taken
+        // as-is rather than paying for a second one.
+        classify_bing(query, &dom, limit, &market).map(|(results, _relevance)| results)
+    }
+
+    /// Google News' RSS search — keyless, and the one free tier whose
+    /// `published` dates are real. See [`crate::google_news`].
+    async fn search_google_news(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, Unavailable> {
+        let url = crate::google_news::search_url(query).map_err(Unavailable::Misconfigured)?;
+        let resp = self
+            .client
+            .get(&url)
+            .header("User-Agent", BROWSER_USER_AGENT)
+            .header(
+                "Accept",
+                "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+            )
+            .send()
+            .await
+            .map_err(|e| Unavailable::Transient(format!("could not reach Google News: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Unavailable::Transient(format!(
+                "Google News returned HTTP {status}"
+            )));
+        }
+        let body = resp.text().await.map_err(|e| {
+            Unavailable::Transient(format!("could not read Google News' response: {e}"))
+        })?;
+        // No poison check here: Google News answers an off-topic query with
+        // an empty feed, not with unrelated results — and empty is a real
+        // answer ("no news about this"), reported as such.
+        Ok(crate::google_news::parse_rss(&body, limit))
+    }
+
+    /// Tavily's search API. `Err` carries why, same contract as Exa.
+    async fn search_tavily(
+        &self,
+        key: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, Unavailable> {
+        let resp = self
+            .client
+            .post(TAVILY_SEARCH_URL)
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "query": query,
+                "max_results": limit,
+            }))
+            .send()
+            .await
+            .map_err(|e| Unavailable::Transient(format!("could not reach Tavily: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                401 | 403 => {
+                    Unavailable::Misconfigured("the configured API key was rejected".into())
+                }
+                432 | 433 => {
+                    Unavailable::Misconfigured("the account's plan limit was exceeded".into())
+                }
+                429 => Unavailable::Transient("rate limited".into()),
+                _ => Unavailable::Transient(format!("HTTP {status}")),
+            });
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Unavailable::Transient(e.to_string()))?;
+        Ok(parse_tavily_response(&body, limit))
     }
 
     /// `Err` carries why this tier could not answer, so the caller can tell
@@ -493,42 +617,35 @@ impl WebSearchTool {
     }
 }
 
-/// Turns a Bing response body into results or a reason.
+/// Turns a Bing response body into results-with-a-verdict or a reason.
 ///
 /// Split out so the plain-HTTP and browser tiers cannot drift on what counts
-/// as a poisoned page.
+/// as a poisoned page. A poisoned set is an error (retry under another
+/// market); a merely `Weak` one is handed back with its verdict so the caller
+/// decides whether it can afford another attempt.
 fn classify_bing(
     query: &str,
     body: &str,
     limit: usize,
     market: &str,
-) -> Result<Vec<SearchResult>, Unavailable> {
+) -> Result<(Vec<SearchResult>, crate::bing::Relevance), Unavailable> {
     // Parse the whole feed, not just `limit` rows: poison detection is a
     // judgement about the response, and ten rows make it far surer than three.
-    let all = crate::bing::parse_rss(body, MAX_NUM_RESULTS as usize);
+    let mut all = crate::bing::parse_rss(body, MAX_NUM_RESULTS as usize);
     if all.is_empty() {
         return Err(Unavailable::Transient(
             "the response carried no results (challenge page or block)".into(),
         ));
     }
-    if crate::bing::looks_poisoned(query, &all) {
+    let relevance = crate::bing::judge_relevance(query, &all);
+    if relevance == crate::bing::Relevance::Poisoned {
         return Err(Unavailable::Transient(format!(
             "the `{market}` market returned results unrelated to the query, which is how Bing \
              answers a request it is throttling"
         )));
     }
-    all.truncate_to(limit)
-}
-
-trait TruncateTo {
-    fn truncate_to(self, limit: usize) -> Result<Vec<SearchResult>, Unavailable>;
-}
-
-impl TruncateTo for Vec<SearchResult> {
-    fn truncate_to(mut self, limit: usize) -> Result<Vec<SearchResult>, Unavailable> {
-        self.truncate(limit);
-        Ok(self)
-    }
+    all.truncate(limit);
+    Ok((all, relevance))
 }
 
 /// The machine's locale, used only as a *second* Bing market to try.
@@ -632,6 +749,8 @@ fn failure_message(failures: &[(&str, Unavailable)]) -> String {
          `search: formats:` in its settings.yml);\n\
          - install Chromium or Google Chrome (free; smith drives it headlessly), or point \
          SMITH_CHROMIUM_PATH at an existing binary;\n\
+         - set a Tavily API key (free tier): add `[tavily]` with `api_key = \"...\"` to \
+         ~/.smith/config.toml (https://app.tavily.com);\n\
          - set an Exa API key: add `[exa]` with `api_key = \"...\"` to ~/.smith/config.toml \
          (https://dashboard.exa.ai)."
     )
@@ -654,6 +773,42 @@ fn parse_exa_response(body: &serde_json::Value, limit: usize) -> Vec<SearchResul
                 title,
                 url,
                 snippet: snippet.to_string(),
+                published,
+            })
+        })
+        .take(limit)
+        .collect()
+}
+
+fn parse_tavily_response(body: &serde_json::Value, limit: usize) -> Vec<SearchResult> {
+    body.get("results")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let title = r.get("title").and_then(|v| v.as_str())?.to_string();
+            let url = r.get("url").and_then(|v| v.as_str())?.to_string();
+            // Tavily's `content` is an extracted passage that can run long;
+            // cap it near Exa's 500-character contract so one result cannot
+            // crowd the rest out of context.
+            let mut snippet = r
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if snippet.chars().count() > 500 {
+                snippet = snippet.chars().take(500).collect::<String>() + "…";
+            }
+            // Only present on news-topic searches, absent otherwise.
+            let published = r
+                .get("published_date")
+                .and_then(|v| v.as_str())
+                .and_then(normalize_published);
+            Some(SearchResult {
+                title,
+                url,
+                snippet,
                 published,
             })
         })
@@ -1176,9 +1331,25 @@ mod tests {
             ("Ratatui docs", "https://docs.rs/ratatui"),
             ("Ratatui tutorial", "https://ratatui.rs/tutorials/"),
         ]);
-        let results = classify_bing("ratatui crate docs", &xml, 2, "en-US").unwrap();
+        let (results, relevance) = classify_bing("ratatui crate docs", &xml, 2, "en-US").unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "Ratatui");
+        assert_eq!(relevance, crate::bing::Relevance::Good);
+    }
+
+    /// A set that matches one lone term of a rich query comes back usable but
+    /// flagged, so `search_bing` can prefer another market over settling.
+    #[test]
+    fn a_weakly_matching_bing_feed_carries_its_verdict() {
+        let xml = feed(&[
+            ("MEGA - Cloud Storage", "https://mega.nz/a"),
+            ("MEGA Pricing", "https://mega.nz/b"),
+            ("MEGA Login", "https://mega.nz/c"),
+        ]);
+        let (results, relevance) =
+            classify_bing("resultado da mega sena", &xml, 3, "en-US").unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(relevance, crate::bing::Relevance::Weak);
     }
 
     /// A challenge page and a poisoned result set are both transient — the

@@ -45,6 +45,11 @@ pub struct Config {
     /// keyless endpoint first and falls back to DuckDuckGo lite.
     #[serde(default)]
     pub exa: ProviderSecrets,
+    /// API key for Tavily (https://app.tavily.com), a `web_search` backend
+    /// with a free tier (1,000 credits/month, no card). Optional — without it
+    /// the tier is skipped, exactly like Exa.
+    #[serde(default)]
+    pub tavily: ProviderSecrets,
     /// `web_search` backend settings that are not credentials.
     #[serde(default)]
     pub search: SearchSettings,
@@ -294,6 +299,7 @@ impl Config {
             (&mut self.anthropic, other.anthropic),
             (&mut self.openai, other.openai),
             (&mut self.exa, other.exa),
+            (&mut self.tavily, other.tavily),
         ] {
             target.api_key = incoming.api_key.or(target.api_key.take());
         }

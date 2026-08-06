@@ -108,14 +108,20 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
 /// the live one for a given provider (`build_provider` prefers the env var)
 /// and a stale value in the other is still a real secret worth hiding.
 fn secret_redactor(config: &Config) -> Redactor {
-    let from_env = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "EXA_API_KEY"]
-        .into_iter()
-        .filter_map(|k| std::env::var(k).ok());
+    let from_env = [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "EXA_API_KEY",
+        "TAVILY_API_KEY",
+    ]
+    .into_iter()
+    .filter_map(|k| std::env::var(k).ok());
 
     let from_config = [
         config.anthropic.api_key.clone(),
         config.openai.api_key.clone(),
         config.exa.api_key.clone(),
+        config.tavily.api_key.clone(),
     ]
     .into_iter()
     .flatten();
@@ -162,6 +168,7 @@ fn hook_set(config: &Config) -> Arc<smith_core::HookSet> {
 pub(crate) fn web_search_settings(config: &Config) -> smith_tools::web_search::SearchSettings {
     smith_tools::web_search::SearchSettings {
         exa_api_key: config.exa.api_key.clone(),
+        tavily_api_key: config.tavily.api_key.clone(),
         searxng_url: config.search.searxng_url.clone(),
         market: config.search.market.clone(),
     }
