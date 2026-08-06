@@ -1,0 +1,24 @@
+{
+  "version": "0.1.0",
+  "description": "Terminal AI coding agent",
+  "homepage": "https://github.com/pedro-canedo/smith",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/pedro-canedo/smith/releases/download/v0.1.0/smith-0.1.0-x86_64-pc-windows-msvc.zip",
+      "hash": "REPLACE_WITH_X86_64_PC_WINDOWS_MSVC_SHA256"
+    }
+  },
+  "bin": "smith-0.1.0-x86_64-pc-windows-msvc/smith.exe",
+  "checkver": {
+    "github": "https://github.com/pedro-canedo/smith"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/pedro-canedo/smith/releases/download/v$version/smith-$version-x86_64-pc-windows-msvc.zip"
+      }
+    },
+    "bin": "smith-$version-x86_64-pc-windows-msvc/smith.exe"
+  }
+}

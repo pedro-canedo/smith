@@ -38,7 +38,12 @@ pub fn restore() -> io::Result<()> {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
     let raw = disable_raw_mode();
-    let screen = execute!(io::stdout(), Show, DisableBracketedPaste, LeaveAlternateScreen);
+    let screen = execute!(
+        io::stdout(),
+        Show,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     raw.and(screen)?;
     Ok(())
 }

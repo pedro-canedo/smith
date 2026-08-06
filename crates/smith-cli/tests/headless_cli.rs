@@ -224,7 +224,10 @@ fn an_induced_tui_panic_restores_the_pty() {
         .rfind("\x1b[?25h")
         .unwrap_or_else(|| panic!("cursor was never shown again: {text:?}"));
     assert!(entered < left, "leave must follow enter: {text:?}");
-    assert!(entered < cursor, "cursor restore must follow enter: {text:?}");
+    assert!(
+        entered < cursor,
+        "cursor restore must follow enter: {text:?}"
+    );
 
     fn termios(fd: i32) -> libc::termios {
         let mut termios = MaybeUninit::<libc::termios>::uninit();

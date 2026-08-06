@@ -26,7 +26,7 @@ use orchestrator::{
 const GENERIC_TIP: &str = "run `smith setup` to add or change your provider or model";
 
 #[derive(Debug, Parser)]
-#[command(name = "smith", about = "A terminal AI coding agent")]
+#[command(name = "smith", version, about = "A terminal AI coding agent")]
 struct Cli {
     /// Which LLM provider to talk to (overrides the saved config).
     #[arg(long, value_enum)]

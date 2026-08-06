@@ -1883,7 +1883,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let text = screen_text(&terminal);
-        assert!(text.is_ascii(), "non-ASCII bytes in 80x24 ASCII render: {text:?}");
+        assert!(
+            text.is_ascii(),
+            "non-ASCII bytes in 80x24 ASCII render: {text:?}"
+        );
         let buf = terminal.backend().buffer();
 
         let mut bubble_rows = 0;

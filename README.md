@@ -149,6 +149,14 @@ smith --provider ollama --model qwen2.5
 smith --resume <session-id>
 ```
 
+Accessibility and plain terminal modes:
+
+```sh
+smith --ascii                 # TUI with ASCII glyphs only
+smith --plain -p "summarize"  # linear stdout, no TUI chrome, no colour
+TERM=dumb smith -p "task"     # automatically uses the non-interactive frontend
+```
+
 ## Usage
 
 ### Keys
@@ -238,9 +246,15 @@ api_key = "sk-..."
 [ollama]
 base_url = "http://127.0.0.1:11434/v1"
 
-# Optional: primary web_search backend. Without a key, web_search falls back
-# to Exa's keyless endpoint and then to DuckDuckGo Lite.
+# Optional web_search backends. SearXNG is tried first when configured.
+[search]
+searxng_url = "https://searx.example.com"
+# backend = "searxng"          # optional pin: searxng | exa | tavily | bing | bing-browser | google-news | duckduckgo
+
 [exa]
+api_key = "..."
+
+[tavily]
 api_key = "..."
 
 # Any stdio-transport MCP server. Its tools are pulled in at startup and, like
@@ -273,6 +287,9 @@ SQLite, or `ratatui`.
 The TUI never talks to providers or tools directly — only through `Action` and
 `AgentEvent` channels. [`CLAUDE.md`](CLAUDE.md) has the long-form narrative;
 [`AGENTS.md`](AGENTS.md) is the short version.
+
+User extension points are documented in [`docs/extensions.md`](docs/extensions.md):
+subagents, slash commands, skills, personas, hooks, and SearXNG setup.
 
 ## Contributing
 
