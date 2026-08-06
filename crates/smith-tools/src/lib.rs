@@ -7,6 +7,7 @@ pub mod chromium;
 pub mod fs_tools;
 pub mod google_news;
 pub mod grep;
+pub mod injection;
 pub(crate) mod language;
 pub mod registry;
 pub mod schema_validate;
