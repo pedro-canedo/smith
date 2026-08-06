@@ -270,6 +270,29 @@ Smith loads project extensions from `.smith/` and user extensions from
 | Subagents | Specialized model roles | [extensions](docs/extensions.md) |
 | Hooks | JSON-in/JSON-out policy and lifecycle hooks | [hooks](docs/hooks.md) |
 | SearXNG | Self-hosted web search | [extensions](docs/extensions.md) |
+| Themes | `[theme]` palette and per-token colours | [design system](docs/design-system.md) |
+| Key bindings | `[keys]` remaps the panel shortcuts | [design system](docs/design-system.md) |
+
+### Keys
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+B` | Show or hide the sidebar |
+| `Shift+Tab` | Cycle the sidebar tab (Session / Tasks / Vitals) |
+| `Ctrl+O` | Enter or leave tool-card focus |
+| `Ctrl+L` | Diagnostics panel (also written to `~/.smith/logs/`) |
+| `Ctrl+J` | Newline without submitting |
+| `Up` / `Down` | Walk the prompt history, once past the edge of the input |
+| `@` | Complete a file path from the project |
+| Wheel / click | Scroll, and select a tool card |
+
+The five bindings above the arrows are remappable, because the defaults
+collide with common terminal setups — `Ctrl+B` is tmux's own prefix:
+
+```toml
+[keys]
+toggle_sidebar = "ctrl+t"
+```
 
 Example command:
 
@@ -298,6 +321,7 @@ smith [OPTIONS] [COMMAND]
 | `--output-format <text\|json\|stream-json>` | Select headless output |
 | `--plain` | Screen-reader-friendly linear output |
 | `--ascii` | Force ASCII UI glyphs |
+| `--theme <dark\|light\|high_contrast>` | Select the palette |
 | `--cwd <DIR>` | Run against another project directory |
 | `--allowed-tools <LIST>` | Allow named tools in headless mode |
 | `--persona <NAME>` | Select an output style |
