@@ -1882,6 +1882,8 @@ mod tests {
         let width = 60u16;
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = screen_text(&terminal);
+        assert!(text.is_ascii(), "non-ASCII bytes in 80x24 ASCII render: {text:?}");
         let buf = terminal.backend().buffer();
 
         let mut bubble_rows = 0;
@@ -1910,6 +1912,7 @@ mod tests {
             idle_hint: IdleHint::Tip(String::new()),
             initial_lines: Vec::new(),
             permission_policy: smith_core::PermissionPolicy::default(),
+            theme: Theme::ansi(),
             goal: None,
             tasks: Vec::new(),
             commands: crate::slash::SlashRegistry::builtin(),

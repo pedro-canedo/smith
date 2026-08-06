@@ -34,6 +34,7 @@ pub async fn run(
     mut question_asks: mpsc::UnboundedReceiver<QuestionAsk>,
 ) -> color_eyre::Result<()> {
     let mut term = terminal::init()?;
+    let _restore = terminal::RestoreGuard::armed();
     let mut app = App::new(config);
     let mut crossterm_events = EventStream::new();
     let mut pending_permission: Option<oneshot::Sender<smith_core::PermissionDecision>> = None;
@@ -107,6 +108,15 @@ pub async fn run(
         }
     }
 
-    terminal::restore()?;
     Ok(())
+}
+
+/// Debug-only crash path used by the PTY regression test. It has to live on
+/// the TUI side so the process has really entered raw mode and the alternate
+/// screen before the panic happens.
+#[cfg(debug_assertions)]
+pub fn panic_after_terminal_init_for_test() -> color_eyre::Result<()> {
+    let _term = terminal::init()?;
+    let _restore = terminal::RestoreGuard::armed();
+    panic!("smith debug panic requested by --panic-now");
 }

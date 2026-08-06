@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 
+use crossterm::cursor::Show;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -36,9 +37,27 @@ pub fn restore() -> io::Result<()> {
     if keyboard_enhancement_available() {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
-    disable_raw_mode()?;
-    execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
+    let raw = disable_raw_mode();
+    let screen = execute!(io::stdout(), Show, DisableBracketedPaste, LeaveAlternateScreen);
+    raw.and(screen)?;
     Ok(())
+}
+
+/// Restores the terminal on every non-panic early return from the TUI loop.
+/// The panic hook covers unwinding; this guard covers ordinary `Err` paths.
+#[must_use]
+pub struct RestoreGuard;
+
+impl RestoreGuard {
+    pub fn armed() -> Self {
+        Self
+    }
+}
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        let _ = restore();
+    }
 }
 
 fn keyboard_enhancement_available() -> bool {

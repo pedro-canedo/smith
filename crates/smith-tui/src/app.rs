@@ -451,6 +451,9 @@ pub struct TuiConfig {
     pub idle_hint: IdleHint,
     pub initial_lines: Vec<ChatLine>,
     pub permission_policy: PermissionPolicy,
+    /// Theme selected by the CLI before the TUI starts. This is how flags such
+    /// as `--ascii` affect glyph capability without mutating process env.
+    pub theme: Theme,
     /// Loaded from `.smith/goal.md` at startup (if any).
     pub goal: Option<String>,
     /// Restored from a resumed session's last `write_tasks` call, if any.
@@ -550,7 +553,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: TuiConfig) -> Self {
-        let theme = Theme::detect();
+        let theme = config.theme;
         Self {
             input: TextInput::new(&theme),
             lines: config.initial_lines,
@@ -2278,6 +2281,7 @@ mod tests {
             idle_hint: IdleHint::Tip("test".to_string()),
             initial_lines: Vec::new(),
             permission_policy: PermissionPolicy::default(),
+            theme: Theme::ansi(),
             goal: None,
             tasks: Vec::new(),
             commands,

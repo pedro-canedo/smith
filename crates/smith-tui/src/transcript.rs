@@ -317,6 +317,7 @@ mod tests {
             idle_hint: crate::app::IdleHint::Tip(String::new()),
             initial_lines: Vec::new(),
             permission_policy: smith_core::PermissionPolicy::default(),
+            theme: crate::Theme::ansi(),
             goal: None,
             tasks: Vec::new(),
             commands: crate::slash::SlashRegistry::builtin(),
