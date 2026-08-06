@@ -98,17 +98,22 @@ property of a model's judgement, and only the first half can be a `cargo test`.
 | 9 | A panic leaves the terminal clean | `tests/pty.rs`, under a real pseudo-terminal |
 | 10 | Idle CPU ≈ 0% | `an_idle_smith_does_no_work` — asserted on the predicate the event loop wakes on, which is where it is decided |
 
-### The gap, stated plainly
+### The behavioral halves of 5 and 6
 
-Criteria 5 and 6 have their mechanisms tested and their behaviour untested.
-That is a deliberate split, not an oversight — "the model self-corrects" and
-"the model does not obey" are properties of a model's judgement, they vary
-between models and between versions of one model, and asserting them in
-`cargo test` would produce a suite that goes red when a provider ships an
-update. They belong in an eval suite run against real providers on a schedule,
-reported as a rate rather than a pass/fail. **No such suite exists yet**, and
-until it does nobody should read the table above as saying those two criteria
-are covered end to end.
+Their mechanisms are unit-tested; "the model self-corrects" and "the model
+does not obey" are properties of a model's judgement, vary between models and
+between versions of one model, and would make a `cargo test` suite go red
+whenever a provider ships an update.
+
+They live in **`evals/`** instead — real turns through the real binary against
+a real provider, reported as a rate per model, results committed under
+`evals/results/` so a number is comparable across smith versions. Deliberately
+not in CI and deliberately without a pass threshold: see `evals/README.md` for
+why, including the fixture that was written to force the ambiguity error and
+then deleted for measuring itself rather than the model.
+
+Re-run and commit new numbers whenever a prompt change could move either
+behavior.
 
 ## Deliberately not adopted
 

@@ -227,6 +227,20 @@ row and folded into every request's system prompt via
 Both live under the project's `.smith/` directory (gitignored), separate from
 the global `~/.smith/config.toml`.
 
+### Behavioral evals (`evals/`)
+
+Acceptance criteria #5 and #6 are each half mechanism and half model
+judgement. The mechanisms are unit-tested; the judgement halves — does the
+model recover from an ambiguous `edit_file`, does it obey an injection found
+in a file — are measured by `evals/run.py` against a real provider and
+reported as a rate, never as a pass/fail. They are out of CI on purpose: a
+suite that goes red when a provider ships a model update trains people to
+ignore it. Results are committed under `evals/results/` so a number is
+comparable across smith versions; re-run and commit when a change to
+`prompts.rs` could move either behavior. `evals/README.md` records what was
+tried and rejected — notably a fixture engineered to force the ambiguity
+error, deleted because it measured the fixture rather than the model.
+
 ### Headless mode
 
 `smith -p "task"` runs one turn without a terminal. `--output-format` is
