@@ -134,6 +134,14 @@ impl TextInput {
         self.area.set_block(block);
     }
 
+    /// Raises or lowers the growth ceiling. Set per frame from the terminal
+    /// height rather than once at construction: a resize has to be able to
+    /// give the prompt rows back, and the widget clamps to whatever bound it
+    /// is holding when it measures.
+    pub fn set_max_rows(&mut self, rows: u16) {
+        self.area.set_max_rows(rows.max(INPUT_MIN_ROWS));
+    }
+
     pub fn set_placeholder(&mut self, text: &str) {
         self.area.set_placeholder_text(text);
     }

@@ -283,7 +283,10 @@ pub(super) fn draw_model_picker(
     theme: &Theme,
     area: Rect,
 ) {
-    let outer = clamp_width(area, 76.min(area.width));
+    // Centred like every other modal — `clamp_width` left it against the
+    // left edge, which on a wide terminal put the picker somewhere the other
+    // three popups never appear.
+    let outer = page_column(area, 76.min(area.width));
     // What the frame can spare, then what the list actually has to show: a
     // box that keeps its full height for three models is mostly blank rows,
     // and the hint at the bottom drifts away from the row it describes.

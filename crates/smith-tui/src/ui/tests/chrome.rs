@@ -19,7 +19,28 @@ fn input_box_grows_with_content_then_caps() {
     );
 
     app.input.set(&"palavra ".repeat(400));
-    assert_eq!(input_height(&mut app, frame(60, 30)), INPUT_MAX_ROWS);
+    assert_eq!(input_height(&mut app, frame(60, 30)), input_max_rows(30));
+}
+
+/// The ceiling follows the terminal. A flat ten rows was over 40% of an
+/// 80x24 window and a sixth of a full-screen one, so the same draft was
+/// cramped in the small terminal and lost in the big one.
+#[test]
+fn the_prompts_ceiling_grows_with_the_terminal_and_then_stops() {
+    let mut app = test_app();
+    app.input.set(&"palavra ".repeat(400));
+
+    let short = input_height(&mut app, frame(60, 24));
+    let tall = input_height(&mut app, frame(60, 50));
+    assert!(
+        tall > short,
+        "a taller terminal must offer a taller prompt: {short} vs {tall}"
+    );
+    // ...but never the whole screen: the transcript is what the rows are for.
+    assert_eq!(
+        input_height(&mut app, frame(60, 200)),
+        INPUT_MAX_ROWS_CEILING
+    );
 }
 
 #[test]
@@ -217,4 +238,48 @@ fn the_selected_suggestion_stays_on_screen_past_the_first_windowful() {
         text.contains(&picked),
         "the selected suggestion `{picked}` was not drawn:\n{text}"
     );
+}
+
+/// The reading measure is a *measure*, not a left margin. Capping the width
+/// and keeping `x` left every pane hugging the left edge with the rest of a
+/// wide terminal blank beside it — half the screen of dead space on a
+/// full-screen window, which reads as a bug rather than as a margin.
+#[test]
+fn the_app_column_centres_on_a_wide_terminal_and_does_not_move_on_a_narrow_one() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let column_of = |w: u16| -> (u16, u16) {
+        let mut app = app_with_context(w);
+        app.lines
+            .push(ChatLine::new(ChatRole::User, "layout".to_string()));
+        let mut t = Terminal::new(TestBackend::new(w, 20)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        // The input box's own borders are the column's edges.
+        let row = 18;
+        let first = (0..w)
+            .find(|x| buf.cell((*x, row)).unwrap().symbol() != " ")
+            .unwrap();
+        let last = (0..w)
+            .rev()
+            .find(|x| buf.cell((*x, row)).unwrap().symbol() != " ")
+            .unwrap();
+        (first, last)
+    };
+
+    // Wide: the column is capped and the slack is split evenly.
+    let (first, last) = column_of(180);
+    let width = last - first + 1;
+    assert_eq!(width, MAX_CONTENT_WIDTH + SIDEBAR_WIDTH, "column width");
+    assert_eq!(first, (180 - width) / 2, "left margin");
+    assert_eq!(180 - 1 - last, first, "margins must match");
+
+    // At or below the cap nothing moves: a narrow terminal lays out exactly
+    // as it did before there was a column at all.
+    for w in [100u16, 80, 60] {
+        let (first, last) = column_of(w);
+        assert_eq!(first, 0, "w={w} grew a margin it cannot afford");
+        assert_eq!(last, w - 1, "w={w} left a gap at the right edge");
+    }
 }

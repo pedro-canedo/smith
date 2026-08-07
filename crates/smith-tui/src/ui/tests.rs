@@ -17,7 +17,7 @@ mod modals;
 mod sidebar;
 
 // Fixtures, and the layout tests — those exercise ui.rs itself:
-// `vertical_layout`, `clamp_width`, `wanted_input_rows`, the tiers.
+// `vertical_layout`, `page_column`, `wanted_input_rows`, the tiers.
 
 /// Rows the input box actually *gets* once `vertical_layout` has protected
 /// the transcript's floor. `draw` composes the two itself (it also has a
@@ -28,30 +28,30 @@ fn input_height(app: &mut App, frame_area: Rect) -> u16 {
     vertical_layout(frame_area.height, wanted, 0, 0, false).input
 }
 
+/// The column is a measure with margins, not a left-aligned cap.
 #[test]
-fn clamp_width_shrinks_a_wide_area_and_leaves_position_alone() {
-    let area = Rect {
+fn page_column_centres_what_it_caps_and_leaves_a_narrow_area_alone() {
+    let wide = Rect {
         x: 3,
         y: 5,
         width: 220,
         height: 40,
     };
-    let clamped = clamp_width(area, MAX_CONTENT_WIDTH);
-    assert_eq!(clamped.width, MAX_CONTENT_WIDTH);
-    assert_eq!(clamped.x, 3);
-    assert_eq!(clamped.y, 5);
-    assert_eq!(clamped.height, 40);
-}
+    let column = page_column(wide, MAX_CONTENT_WIDTH);
+    assert_eq!(column.width, MAX_CONTENT_WIDTH);
+    assert_eq!(column.x, 3 + (220 - MAX_CONTENT_WIDTH) / 2);
+    assert_eq!(column.y, 5);
+    assert_eq!(column.height, 40);
 
-#[test]
-fn clamp_width_leaves_a_narrower_area_untouched() {
-    let area = Rect {
+    let narrow = Rect {
         x: 0,
         y: 0,
         width: 60,
         height: 10,
     };
-    assert_eq!(clamp_width(area, MAX_CONTENT_WIDTH).width, 60);
+    let column = page_column(narrow, MAX_CONTENT_WIDTH);
+    assert_eq!(column.width, 60, "never widens past the area");
+    assert_eq!(column.x, 0, "and never shifts what already fits");
 }
 
 fn tool_line(name: &str, status: ActivityStatus) -> ChatLine {
@@ -240,14 +240,14 @@ fn resizing_mid_stream_never_leaves_a_row_wider_than_the_pane() {
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
 
-        let pane = clamp_width(
+        let pane = page_column(
             Rect {
                 x: 0,
                 y: 0,
                 width,
                 height: 24,
             },
-            MAX_CONTENT_WIDTH,
+            page_width(width, width >= SIDEBAR_MIN_TERMINAL_WIDTH),
         );
         let pane_right = if width >= SIDEBAR_MIN_TERMINAL_WIDTH {
             pane.width - SIDEBAR_WIDTH - 1

@@ -56,6 +56,40 @@ const MIN_GAUGE_WIDTH: u16 = 16;
 /// reasonable margin.
 const MAX_CONTENT_WIDTH: u16 = 100;
 
+/// The app's column: the reading measure, plus the sidebar when it is drawn.
+///
+/// The cap is a reading measure, so it does not grow with the terminal — but
+/// what the terminal *does* get to decide is where the column sits. See
+/// [`page_column`].
+fn page_width(terminal_width: u16, with_sidebar: bool) -> u16 {
+    let wanted = if with_sidebar {
+        MAX_CONTENT_WIDTH + SIDEBAR_WIDTH
+    } else {
+        MAX_CONTENT_WIDTH
+    };
+    terminal_width.min(wanted)
+}
+
+/// Centres the app's column in `area`.
+///
+/// The measure used to be applied by capping the width and keeping `x`, which
+/// left every pane hugging the left edge with the remainder of a wide
+/// terminal blank beside it — on a full-screen 200-column window that is half
+/// the screen of dead space, and it reads as a bug rather than as a margin.
+/// Splitting the slack evenly turns the same cap into a deliberate layout: a
+/// centred column with a margin on each side, which is what the width is for.
+///
+/// Below the cap nothing moves — the slack is zero, so a narrow terminal is
+/// laid out exactly as before.
+fn page_column(area: Rect, width: u16) -> Rect {
+    let width = width.min(area.width);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        width,
+        ..area
+    }
+}
+
 /// Splits a transcript pane into the text column and the one-column gutter
 /// its scrollbar lives in.
 ///
@@ -212,9 +246,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (app.queued.len().min(MAX_QUEUE_ROWS) as u16) + 1
     };
 
+    // Whether the sidebar is drawn is a question about the *terminal* — does
+    // it have the columns — so it is asked before the page column narrows
+    // anything, and answered once for both the width and the draw below.
+    let sidebar_shown =
+        !is_idle && whole_screen.width >= SIDEBAR_MIN_TERMINAL_WIDTH && app.sidebar_visible;
+    let page = page_column(whole_screen, page_width(whole_screen.width, sidebar_shown));
+
     let layout = vertical_layout(
-        frame.area().height,
-        wanted_input_rows(app, frame.area()),
+        page.height,
+        wanted_input_rows(app, page),
         wanted_suggest,
         wanted_queue,
         strip_wanted,
@@ -228,7 +269,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(layout.input),
             Constraint::Length(layout.status),
         ])
-        .areas(frame.area());
+        .areas(page);
     // A modal takes over the interface — the transcript behind it must not
     // stay on screen too. Left up, its unwrapped-at-full-width lines poke
     // out on both sides of the centered popup and compete with it for
@@ -239,7 +280,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if is_idle {
         draw_idle(frame, &*app, message_area);
-    } else if message_area.width >= SIDEBAR_MIN_TERMINAL_WIDTH && app.sidebar_visible {
+    } else if sidebar_shown {
         let [chat_area, sidebar_area] =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)])
                 .areas(message_area);
@@ -247,35 +288,42 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, chat_area);
             frame.render_widget(Block::new().style(theme.base_bg()), chat_area);
         } else {
-            draw_transcript(frame, app, clamp_width(chat_area, MAX_CONTENT_WIDTH));
+            draw_transcript(frame, app, chat_area);
         }
         draw_sidebar(frame, &*app, sidebar_area);
     } else if modal_open {
         frame.render_widget(Clear, message_area);
         frame.render_widget(Block::new().style(theme.base_bg()), message_area);
     } else {
-        draw_transcript(frame, app, clamp_width(message_area, MAX_CONTENT_WIDTH));
+        draw_transcript(frame, app, message_area);
     }
 
     if layout.strip > 0 {
-        draw_context_strip(frame, &*app, clamp_width(strip_area, MAX_CONTENT_WIDTH));
+        draw_context_strip(frame, &*app, strip_area);
     }
 
     if layout.suggest > 0 {
-        draw_slash_suggestions(
-            frame,
-            app,
-            &suggestions,
-            clamp_width(suggest_area, MAX_CONTENT_WIDTH),
-        );
+        draw_slash_suggestions(frame, app, &suggestions, suggest_area);
     }
 
     if layout.queue > 0 {
-        draw_queue(frame, &*app, clamp_width(queue_area, MAX_CONTENT_WIDTH));
+        draw_queue(frame, &*app, queue_area);
     }
 
-    draw_input(frame, app, clamp_width(input_area, MAX_CONTENT_WIDTH));
-    draw_status_bar(frame, &*app, footer_area);
+    draw_input(frame, app, input_area);
+    // Full width, unlike everything above it: the status bar is the window's
+    // own chrome rather than part of the document, and a footer that stopped
+    // at the column's edge would leave the terminal's corners bare while
+    // claiming to be a bar.
+    draw_status_bar(
+        frame,
+        &*app,
+        Rect {
+            x: whole_screen.x,
+            width: whole_screen.width,
+            ..footer_area
+        },
+    );
 
     // The overlay yields to a real modal rather than stacking above it: a
     // permission prompt is a question the agent is blocked on, and hiding it
@@ -293,24 +341,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Caps `area` to `max_width`, left-aligned — the leftover space (on a wide
-/// terminal) is simply left blank rather than stretching content into it.
-fn clamp_width(area: Rect, max_width: u16) -> Rect {
-    Rect {
-        width: area.width.min(max_width),
-        ..area
-    }
-}
-
 /// Rows the input box *wants*: it grows with the text up to `INPUT_MAX_ROWS`
 /// and then scrolls internally, the way a modern CLI prompt behaves.
 ///
 /// There's no circularity here — the box's width comes from the whole frame,
 /// which is known before the vertical split that consumes this height.
-fn wanted_input_rows(app: &mut App, frame_area: Rect) -> u16 {
-    let width = clamp_width(frame_area, MAX_CONTENT_WIDTH).width;
-    app.input.outer_rows(width)
+fn wanted_input_rows(app: &mut App, page: Rect) -> u16 {
+    // The ceiling moves with the terminal before the measurement, because the
+    // widget clamps to it internally — asking after the fact would measure a
+    // box that was already cut to the old bound.
+    app.input.set_max_rows(input_max_rows(page.height));
+    app.input.outer_rows(page.width)
 }
+
+/// Rows the prompt may grow to at this terminal height.
+///
+/// It was a flat ten, which is over 40% of an 80x24 terminal and a sixth of a
+/// full-screen one: the same draft was cramped in the small window and lost
+/// in the big one. Two fifths of the height tracks both, and the ceiling
+/// keeps a very tall terminal from handing the prompt half the screen it
+/// will never use — the transcript is the thing worth the rows.
+fn input_max_rows(terminal_height: u16) -> u16 {
+    (terminal_height * 2 / 5).clamp(INPUT_MIN_ROWS, INPUT_MAX_ROWS_CEILING)
+}
+
+/// Upper bound on [`input_max_rows`], however tall the terminal is.
+const INPUT_MAX_ROWS_CEILING: u16 = 20;
 
 fn center_vertically(area: Rect, height: u16) -> Rect {
     let height = height.min(area.height);
