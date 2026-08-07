@@ -6,10 +6,11 @@
 # Every entry below is the same debt — a module that still holds more than one
 # concern. Splitting them is planned work, not a discovery.
 
-# `run_turn` (387 lines) and the tool-dispatch funnel around it. Twelve
-# cohesive groups have been mapped; `ReasoningFilter` and the text-tool-call
-# recovery are already `Agent`-free and come out first.
-crates/smith-core/src/agent.rs
+# The production module came apart into `agent/` — eleven submodules, none
+# over 580 lines. What is left here is the test file, still one block covering
+# all eleven. It splits along the same seams, one section per commit, and the
+# explicit import header added at its top is what each of those commits chips
+# away at.
 crates/smith-core/src/agent/tests.rs
 
 # `on_key` (435 lines) and `on_agent_event` (25 arms) in one impl, plus the

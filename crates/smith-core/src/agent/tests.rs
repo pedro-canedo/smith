@@ -1,8 +1,24 @@
 use super::*;
+// `use super::*` reaches only what `agent.rs` itself still names. Everything
+// the split moved into a sibling module — and every type the parent no longer
+// mentions — has to be imported here by its own path. These go away section by
+// section as the tests move next to their subject.
+use super::fallback::resolve_tool_name;
+use super::reasoning::ReasoningFilter;
+use super::subagents::finish_subagent;
+use super::tools::MAX_CONCURRENT_TOOLS;
+use crate::context::estimate_messages_tokens;
+use crate::event::{AgentEvent, PermissionDecision, TaskStatus, TurnLimitKind};
+use crate::message::{Role, StopReason, StreamEvent, ToolDefinition};
+use crate::provider::ProviderError;
 use crate::testkit::{
     empty_reply, text_reply, tool_call_reply, tool_calls_reply, ScriptedProvider, ScriptedResponse,
 };
+use crate::tool::{PermissionClass, ToolResult};
+use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 /// The agent retries an empty turn twice before giving up, so a provider
 /// that only ever returns nothing has to be scripted for all three.
