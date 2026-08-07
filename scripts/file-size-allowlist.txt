@@ -6,10 +6,6 @@
 # Every entry below is the same debt — a module that still holds more than one
 # concern. Splitting them is planned work, not a discovery.
 
-# The production module came apart into `app/` — seven submodules, none over
-# 723 lines. What is left is the test file, still one block covering all seven.
-crates/smith-tui/src/app/tests.rs
-
 # The composition layer: layout arithmetic, tool cards, sidebar, modals.
 crates/smith-tui/src/ui.rs
 # Follows its module. Splitting the tests before the production file would
