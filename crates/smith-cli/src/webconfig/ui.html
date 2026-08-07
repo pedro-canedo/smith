@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>smith setup</title>
+<style>
+/* Ember, transcribed from crates/smith-tui/src/theme.rs::truecolor().
+   A test asserts these match; see webconfig/tests.rs. The TUI idioms are
+   translated rather than replaced: the assistant gutter becomes a left
+   border, key chips become pills, section labels stay uppercase secondary. */
+:root {
+  --base:#101215; --raised:#16181c; --overlay:#1e2126; --hover:#262a30;
+  --primary:#e2e5e9; --secondary:#949aa3; --disabled:#727882;
+  --ember:#ff8c3c; --amber:#ffbe5a; --success:#58ce80; --danger:#f36666;
+  --warning:#facc15; --info:#56b6ff; --plan:#c684ff;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --base:#faf9f7; --raised:#f2f0ec; --overlay:#e8e5e0; --hover:#dcd8d1;
+    --primary:#1c1b19; --secondary:#55524e; --disabled:#76726c;
+    --ember:#a03600; --amber:#7c4e00; --success:#136638; --danger:#ae1c1c;
+    --warning:#7c5200; --info:#1454ac; --plan:#6c30a2;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin:0; background:var(--base); color:var(--primary);
+  font:14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.wrap { max-width:900px; margin:0 auto; padding:32px 20px 80px; }
+h1 { font-size:20px; margin:0 0 4px; color:var(--ember); letter-spacing:.5px; }
+.sub { color:var(--secondary); margin:0 0 28px; }
+h2 {
+  font-size:11px; text-transform:uppercase; letter-spacing:1.5px;
+  color:var(--secondary); margin:32px 0 10px; font-weight:700;
+}
+.card {
+  background:var(--raised); border-left:3px solid var(--overlay);
+  padding:14px 16px; margin-bottom:8px; border-radius:0 4px 4px 0;
+}
+.card.on { border-left-color:var(--ember); }
+.card-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.name { font-weight:700; }
+.pill {
+  font-size:11px; padding:2px 8px; border-radius:10px;
+  background:var(--overlay); color:var(--secondary);
+}
+.pill.ok { color:var(--success); }
+.pill.bad { color:var(--danger); }
+.pill.warn { color:var(--warning); }
+.meta { color:var(--disabled); font-size:12px; margin-top:6px; }
+label { display:block; color:var(--secondary); font-size:12px; margin:12px 0 4px; }
+input, select {
+  width:100%; background:var(--overlay); color:var(--primary);
+  border:1px solid transparent; border-radius:3px; padding:8px 10px;
+  font:inherit;
+}
+input:focus, select:focus { outline:none; border-color:var(--ember); }
+button {
+  background:var(--overlay); color:var(--primary); border:none;
+  border-radius:3px; padding:7px 14px; font:inherit; cursor:pointer;
+}
+button:hover { background:var(--hover); }
+button.primary { background:var(--ember); color:var(--base); font-weight:700; }
+button.ghost { color:var(--secondary); }
+.row { display:flex; gap:8px; align-items:center; margin-top:12px; flex-wrap:wrap; }
+.note {
+  background:var(--overlay); color:var(--secondary);
+  padding:10px 12px; border-radius:3px; font-size:12px; margin-top:12px;
+}
+.note.bad { color:var(--danger); }
+.note.ok { color:var(--success); }
+footer { margin-top:40px; color:var(--disabled); font-size:12px; }
+code { color:var(--amber); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>smith setup</h1>
+  <p class="sub">Configuring <code id="path">~/.smith/config.toml</code>. Nothing leaves this machine.</p>
+
+  <h2>Provider</h2>
+  <div id="providers"></div>
+
+  <h2>Model</h2>
+  <div class="card">
+    <select id="model"><option>—</option></select>
+    <div class="meta" id="model-meta">Pick a provider first.</div>
+  </div>
+
+  <h2>Permissions</h2>
+  <div class="card">
+    <select id="policy">
+      <option value="ask">ask — prompt before every mutating tool (default)</option>
+      <option value="session">session — allow a tool for the rest of the session</option>
+      <option value="skip">skip — never prompt (an unapproved plan still blocks)</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <button class="primary" id="save">Save</button>
+    <button class="ghost" id="done">Done — stop the server</button>
+    <span id="status" class="meta"></span>
+  </div>
+
+  <footer>
+    Keys are written, never read back — this page is told whether one is set,
+    not what it is. Generated file: hand-written comments in
+    <code>config.toml</code> are not preserved.
+  </footer>
+</div>
+
+<script>
+// The token arrives once, in the URL, and is taken out of the address bar,
+// the history entry and any referrer immediately. Every call after this
+// carries it in a header, which a cross-site page cannot set.
+const TOKEN = new URLSearchParams(location.search).get('t') || '';
+history.replaceState(null, '', '/');
+
+const $ = id => document.getElementById(id);
+const api = async (path, options = {}) => {
+  const res = await fetch(path, {
+    ...options,
+    headers: { 'X-Smith-Token': TOKEN, ...(options.body ? {'Content-Type':'application/json'} : {}) },
+  });
+  return res.json();
+};
+
+const PROVIDERS = [
+  ['ollama',     'Ollama',      'local + cloud, no key needed'],
+  ['openrouter', 'OpenRouter',  'free models, needs a free account'],
+  ['anthropic',  'Anthropic',   'Claude'],
+  ['openai',     'OpenAI',      ''],
+  ['9router',    '9Router',     'local gateway, needs its own dashboard'],
+];
+const KEY_FIELD = {
+  anthropic: 'anthropic_api_key', openai: 'openai_api_key',
+  openrouter: 'openrouter_api_key', '9router': 'ninerouter_api_key',
+};
+
+let state = null;
+let chosen = null;
+
+function pill(p) {
+  if (p.source === 'not needed') return '<span class="pill ok">no key needed</span>';
+  if (!p.key_set) return '<span class="pill bad">needs key</span>';
+  if (p.source === 'environment') return '<span class="pill warn">key from environment</span>';
+  return '<span class="pill ok">key set</span>';
+}
+
+function render() {
+  $('path').textContent = state.config_path || '~/.smith/config.toml';
+  $('policy').value = state.permission_policy || 'ask';
+  $('providers').innerHTML = PROVIDERS.map(([id, name, hint]) => {
+    const p = state.providers[id] || {};
+    const on = id === chosen;
+    const field = KEY_FIELD[id];
+    return `<div class="card ${on ? 'on' : ''}">
+      <div class="card-head">
+        <input type="radio" name="provider" value="${id}" ${on ? 'checked' : ''} style="width:auto">
+        <span class="name">${name}</span> ${pill(p)}
+        <span class="meta" style="margin:0">${hint}</span>
+        <button data-test="${id}" style="margin-left:auto">Test</button>
+      </div>
+      ${on && field ? `<label>API key ${p.key_set ? '(set — blank keeps it)' : ''}</label>
+        <input type="password" id="key-${id}" placeholder="${p.key_set ? '••••••••' : 'paste key'}">` : ''}
+      <div class="meta" id="test-${id}"></div>
+    </div>`;
+  }).join('');
+
+  document.querySelectorAll('input[name=provider]').forEach(el =>
+    el.onchange = () => { chosen = el.value; render(); loadModels(); });
+  document.querySelectorAll('[data-test]').forEach(el =>
+    el.onclick = async () => {
+      const id = el.dataset.test;
+      $(`test-${id}`).textContent = 'testing…';
+      const r = await api('/api/test', { method:'POST', body: JSON.stringify({ provider:id }) });
+      $(`test-${id}`).innerHTML = r.ok
+        ? `<span class="pill ok">${r.detail}</span>`
+        : `<span class="pill bad">${r.error}</span>`;
+    });
+}
+
+async function loadModels() {
+  if (!chosen) return;
+  $('model-meta').textContent = 'reading the catalogue…';
+  const r = await api('/api/models?provider=' + encodeURIComponent(chosen));
+  if (!r.ok) { $('model-meta').textContent = r.error || 'could not read it'; return; }
+  $('model').innerHTML = r.models.map(m =>
+    `<option value="${m.id}" ${m.id === state.model ? 'selected' : ''}>${m.detail}</option>`
+  ).join('') || '<option>—</option>';
+  const toolless = r.models.filter(m => !m.tools).length;
+  $('model-meta').textContent = `${r.models.length} available` +
+    (toolless ? ` · ${toolless} cannot call tools` : '');
+}
+
+$('save').onclick = async () => {
+  const body = { provider: chosen, model: $('model').value, permission_policy: $('policy').value };
+  const field = KEY_FIELD[chosen];
+  if (field && $(`key-${chosen}`)) body[field] = $(`key-${chosen}`).value;
+  const r = await api('/api/config', { method:'POST', body: JSON.stringify(body) });
+  $('status').innerHTML = r.ok
+    ? `<span class="pill ok">saved ${r.saved.length} field(s)</span>`
+    : `<span class="pill bad">${r.error}</span>`;
+  if (r.ok) { state = await api('/api/state'); render(); }
+};
+
+$('done').onclick = async () => {
+  await api('/api/close', { method:'POST', body:'{}' });
+  document.body.innerHTML =
+    '<div class="wrap"><h1>smith setup</h1><p class="sub">Done — you can close this tab.</p></div>';
+};
+
+(async () => {
+  state = await api('/api/state');
+  chosen = state.provider;
+  render();
+  loadModels();
+})();
+</script>
+</body>
+</html>
