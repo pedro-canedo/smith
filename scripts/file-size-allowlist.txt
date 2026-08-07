@@ -6,9 +6,8 @@
 # Every entry below is the same debt — a module that still holds more than one
 # concern. Splitting them is planned work, not a discovery.
 
-# `on_key` (435 lines) and `on_agent_event` (25 arms) in one impl, plus the
-# slash commands split across two non-contiguous blocks.
-crates/smith-tui/src/app.rs
+# The production module came apart into `app/` — seven submodules, none over
+# 723 lines. What is left is the test file, still one block covering all seven.
 crates/smith-tui/src/app/tests.rs
 
 # The composition layer: layout arithmetic, tool cards, sidebar, modals.

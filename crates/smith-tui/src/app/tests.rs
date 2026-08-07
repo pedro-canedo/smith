@@ -1,5 +1,9 @@
 use super::*;
-use smith_core::TaskStatus;
+// `use super::*` reaches only what `app.rs` itself still names. The split moved
+// most of this file's vocabulary into sibling modules, so it is imported here
+// by its own path instead of inherited from the parent.
+use smith_core::{AgentEvent, McpCommand, PermissionRequest, StopReason, TaskStatus, UserQuestion};
+use std::time::Duration;
 
 use crate::testkit::{app_with_cards, app_with_command_files, test_app};
 
