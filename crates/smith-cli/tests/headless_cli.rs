@@ -8,9 +8,14 @@
 //! reads *cargo's* stdin, which proves nothing about `cat x | smith`. So these
 //! spawn the real binary.
 //!
-//! Every case here stops before a provider request is ever made: `HOME` and
-//! `--cwd` point at empty temporary directories and the API-key variables are
-//! stripped, so `build_provider` fails and the run exits 2. That failure is
+//! Every case here stops before a provider request is ever made: `SMITH_HOME`
+//! and `--cwd` point at empty temporary directories and the API-key variables
+//! are stripped, so `build_provider` fails and the run exits 2.
+//!
+//! `SMITH_HOME` and not `HOME`: `directories` resolves the Windows profile
+//! through `SHGetKnownFolderPath`, which ignores every environment variable,
+//! so setting `HOME` isolated these runs on Unix and did nothing at all on
+//! windows-latest. That failure is
 //! the assertion tool — reaching it proves the whole path in front of it
 //! (stdin read, prompt composed, headless frontend chosen over the TUI) ran,
 //! and it guarantees the suite never touches the network.
@@ -43,6 +48,9 @@ fn smith(args: &[&str], input: &str) -> (Run, tempfile::TempDir, tempfile::TempD
         .args(["--cwd", &project.path().to_string_lossy()])
         .args(args)
         .env("HOME", home.path())
+        // The one that actually isolates on all three platforms; see the
+        // module doc. `HOME` stays because other things read it.
+        .env("SMITH_HOME", home.path().join(".smith"))
         // All four, not two: an exported key is one of the things that
         // decides a run is not a first run, so leaving two of them visible
         // would make these tests depend on the developer's shell.
@@ -144,19 +152,34 @@ fn cwd_moves_the_project_directory_the_run_operates_on() {
     // `.smith/` is only reached once the run has something to talk to.
     let (_run, project, home) = smith(&["--provider", "anthropic", "-p", "hi"], "");
 
-    // History moved to `~/.smith/projects/<name>-<hash>/`, so the proof that
-    // `--cwd` was honoured is a store keyed by *that* directory appearing
-    // under this run's isolated HOME — and, just as importantly, no `.smith/`
-    // left behind in the project itself.
-    let expected = home
+    // History moved to `$SMITH_HOME/projects/<name>-<hash>/`, so the proof
+    // that `--cwd` was honoured is a store named after *that* directory
+    // appearing under this run's own SMITH_HOME.
+    //
+    // Read back rather than recomputed: calling `project_store_name` here
+    // would re-run the implementation and agree with it by construction, and
+    // it would also have to canonicalise the same way the child did — which on
+    // Windows means an 8.3 short path on one side and a `\\?\` verbatim one
+    // on the other. Listing the directory tests the outcome instead.
+    let projects = home.path().join(".smith").join("projects");
+    let stores: Vec<String> = std::fs::read_dir(&projects)
+        .unwrap_or_else(|e| panic!("no store under {}: {e}", projects.display()))
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    let wanted: String = project
         .path()
-        .join(".smith")
-        .join("projects")
-        .join(smith_config::project_store_name(project.path()));
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
     assert!(
-        expected.is_dir(),
-        "the run did not treat --cwd as its project directory: {} is missing",
-        expected.display()
+        stores.iter().any(|s| s.contains(&wanted)),
+        "the run did not treat --cwd as its project directory: wanted a store \
+         named after `{wanted}`, found {stores:?}"
     );
     assert!(
         !project.path().join(".smith").join("sessions.db").exists(),

@@ -123,6 +123,12 @@ export ANTHROPIC_API_KEY=...
 smith --provider anthropic
 ```
 
+Everything smith keeps for itself lives under `~/.smith/`: the config, the
+runtimes it downloads, and one directory per project under `projects/` holding
+that project's conversation history. Set `SMITH_HOME` to put that root
+somewhere else — it names the directory itself, the way `CARGO_HOME` does.
+`smith uninstall` removes all of it, showing you what and how much first.
+
 Run one turn without opening the TUI:
 
 ```sh

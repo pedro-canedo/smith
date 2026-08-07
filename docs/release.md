@@ -10,8 +10,17 @@ package-manager metadata become the bottleneck.
 
 ## Release checklist
 
-1. Update `CHANGELOG.md`.
-2. Run the local gates:
+1. **Bump `[workspace.package] version` in `Cargo.toml` to the version you are
+   about to tag, and commit it.** This is not bookkeeping: it is what
+   `env!("CARGO_PKG_VERSION")` compiles into the binary, so it is what
+   `smith --version` reports and what `smith update` compares the latest tag
+   against. Tagging without it ships a binary that reports the *previous*
+   version, which makes `update` see a newer release forever — it installs,
+   still reports the old number, and offers the same update again. v0.2.1
+   through v0.2.3 shipped exactly that way. The release workflow now fails when
+   the tag and the manifest disagree, so this step cannot be skipped silently.
+2. Update `CHANGELOG.md`.
+3. Run the local gates:
 
    ```sh
    cargo fmt --all -- --check
@@ -19,15 +28,15 @@ package-manager metadata become the bottleneck.
    cargo test --workspace
    ```
 
-3. Confirm the platform matrix is green on GitHub Actions, especially Windows.
-4. Tag the release:
+4. Confirm the platform matrix is green on GitHub Actions, especially Windows.
+5. Tag the release:
 
    ```sh
    git tag v0.1.0
    git push origin v0.1.0
    ```
 
-5. Verify the release assets:
+6. Verify the release assets:
 
    - `smith-<version>-x86_64-unknown-linux-gnu.tar.gz`
    - `smith-<version>-aarch64-unknown-linux-gnu.tar.gz`

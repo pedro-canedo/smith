@@ -317,9 +317,24 @@ pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_NINEROUTER_BASE_URL: &str = "http://localhost:20128/v1";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 
-/// `~/.smith` — the only place secrets live. Session history is stored
-/// per-project instead (see the M7 milestone), separately from this file.
+/// `~/.smith` (or `$SMITH_HOME`) — the config file, the runtimes smith
+/// downloaded, and, since history moved out of projects, one directory per
+/// project under `projects/`. The only place secrets live.
 pub fn config_dir() -> Result<PathBuf, ConfigError> {
+    // `SMITH_HOME` names the `.smith` directory itself, the way `CARGO_HOME`
+    // does — not the home it usually sits in.
+    //
+    // It exists because there is otherwise no way to move this root, and on
+    // Windows there is no way to *test* against it either: `directories`
+    // resolves the profile through `SHGetKnownFolderPath`, which ignores
+    // `HOME` and `USERPROFILE` alike. The integration tests set `HOME` and
+    // believed they were hermetic; on Windows they were reading, and after
+    // session history moved here would have been writing, the real profile.
+    if let Some(root) = std::env::var_os("SMITH_HOME") {
+        if !root.is_empty() {
+            return Ok(PathBuf::from(root));
+        }
+    }
     let dirs = directories::BaseDirs::new().ok_or(ConfigError::NoHomeDir)?;
     Ok(dirs.home_dir().join(".smith"))
 }
