@@ -26,7 +26,7 @@ mod tools;
 mod turn;
 
 pub use compaction::{CompactionConfig, CompactionOutcome, TurnAccounting};
-pub use executor::{NoTools, PermissionAsk, QuestionAsk, ToolExecutor};
+pub use executor::{AskAnswer, NoTools, PermissionAsk, QuestionAsk, SubmittedAnswer, ToolExecutor};
 pub use interactive::parse_tasks;
 pub use limits::TurnLimits;
 

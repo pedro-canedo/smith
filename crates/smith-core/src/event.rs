@@ -22,6 +22,17 @@ pub struct PermissionRequest {
     pub detail: String,
 }
 
+/// Which frontend answered a blocking ask. With more than one frontend on a
+/// session (TUI plus the web console), the one that did not answer needs to
+/// know its modal went stale — and *who* answered is worth a line in the
+/// transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskSource {
+    Tui,
+    Web,
+}
+
 /// A clarifying question the agent asks the user (via the `ask_user` tool).
 /// Always carries exactly three suggestions; the TUI also offers a free-text
 /// fourth option.
@@ -127,7 +138,14 @@ pub enum Action {
     /// the turn to end, by which point the work it was meant to redirect is
     /// already done.
     Interject(String),
-    PermissionResponse(PermissionDecision),
+    /// The user's answer to a permission modal. Carries the ask's id because
+    /// the frontend closes its modal *before* this action is handled — an
+    /// answer that had to be paired with "whatever modal is open" would race
+    /// its own dismissal. Routed to the ask broker, never the orchestrator.
+    PermissionResponse {
+        tool_call_id: String,
+        decision: PermissionDecision,
+    },
     /// `provider: None` keeps the current provider and just changes the
     /// model; `Some(p)` rebuilds the agent against a different provider
     /// (conversation history is preserved either way). `save` persists the
@@ -156,7 +174,12 @@ pub enum Action {
     /// `.smith/goal.md` and folded into the system prompt on every request.
     SetGoal(Option<String>),
     /// Answer to an `ask_user` prompt (chosen suggestion or free text).
-    QuestionResponse(String),
+    /// Carries the question's id for the same reason `PermissionResponse`
+    /// carries the call's.
+    QuestionResponse {
+        id: String,
+        answer: String,
+    },
     /// `/compact`: summarise the older part of the conversation now, instead
     /// of waiting for the context to cross the auto-compaction threshold.
     Compact,
@@ -237,6 +260,24 @@ pub enum AgentEvent {
     PermissionPromptNeeded(PermissionRequest),
     /// The agent needs a clarifying answer before continuing (3 options + custom).
     UserQuestionNeeded(UserQuestion),
+    /// A pending permission prompt was answered — by this frontend or another.
+    ///
+    /// Emitted by the ask broker, which is what makes two frontends on one
+    /// session coherent: the first answer wins, and this is how the loser
+    /// learns its modal went stale. Not inferred from `PhaseChanged` — the
+    /// phase after an approval depends on what runs next, and inferring
+    /// "your modal is stale" from it is the fragility this variant removes.
+    PermissionResolved {
+        tool_call_id: String,
+        decision: PermissionDecision,
+        source: AskSource,
+    },
+    /// A pending `ask_user` question was answered. Same contract as
+    /// [`AgentEvent::PermissionResolved`].
+    QuestionResolved {
+        id: String,
+        source: AskSource,
+    },
     /// Coarse status for the activity line / chrome.
     PhaseChanged(AgentPhase),
     /// A message the user typed while the turn was already running, now
@@ -421,6 +462,30 @@ mod tests {
         assert_eq!(json["data"]["id"], "call_1");
         assert_eq!(json["data"]["output"], "done");
         assert_eq!(json["data"]["is_error"], false);
+    }
+
+    /// The broker's resolution events are part of the stream-json contract
+    /// from the day they exist — pinned like every other variant.
+    #[test]
+    fn a_resolution_event_serializes_with_its_source_tag() {
+        let json = serde_json::to_value(AgentEvent::PermissionResolved {
+            tool_call_id: "call_1".into(),
+            decision: PermissionDecision::AllowSession,
+            source: AskSource::Web,
+        })
+        .unwrap();
+        assert_eq!(json["type"], "permission_resolved");
+        assert_eq!(json["data"]["tool_call_id"], "call_1");
+        assert_eq!(json["data"]["decision"], "allow_session");
+        assert_eq!(json["data"]["source"], "web");
+
+        let json = serde_json::to_value(AgentEvent::QuestionResolved {
+            id: "q1".into(),
+            source: AskSource::Tui,
+        })
+        .unwrap();
+        assert_eq!(json["type"], "question_resolved");
+        assert_eq!(json["data"]["source"], "tui");
     }
 
     #[test]

@@ -18,13 +18,13 @@ pub mod testkit;
 pub mod tool;
 
 pub use agent::{
-    parse_tasks, Agent, CompactionConfig, CompactionOutcome, NoTools, PermissionAsk, QuestionAsk,
-    ToolExecutor, TurnAccounting, TurnLimits,
+    parse_tasks, Agent, AskAnswer, CompactionConfig, CompactionOutcome, NoTools, PermissionAsk,
+    QuestionAsk, SubmittedAnswer, ToolExecutor, TurnAccounting, TurnLimits,
 };
 pub use checkpoint::{Checkpointer, ConflictKind, RewindConflict, RewindReport, RewindStatus};
 pub use context::{carry_over, CarryOver, ContextUsage, COMPACT_THRESHOLD};
 pub use event::{
-    Action, AgentEvent, AgentPhase, LoopStopReason, ModelChoice, PermissionDecision,
+    Action, AgentEvent, AgentPhase, AskSource, LoopStopReason, ModelChoice, PermissionDecision,
     PermissionRequest, ProgressReporter, ResourceStats, Task, TaskStatus, TurnLimitKind,
     UserQuestion,
 };

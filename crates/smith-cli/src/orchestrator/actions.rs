@@ -373,7 +373,7 @@ pub(super) async fn run(
                 });
             }
             Action::Quit => break,
-            Action::PermissionResponse(_) | Action::QuestionResponse(_) => {
+            Action::PermissionResponse { .. } | Action::QuestionResponse { .. } => {
                 // Resolved directly by smith-tui via the oneshot channels.
             }
         }

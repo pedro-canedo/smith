@@ -200,6 +200,55 @@ impl App {
                     custom: String::new(),
                 });
             }
+            // The broker resolved an ask — possibly from another frontend.
+            // When this TUI answered, its modal is already gone (the key
+            // handler closed it), so these arms are about the *other* case:
+            // a web approval must dismiss the stale modal here, and say in
+            // the transcript who decided, because a permission that resolves
+            // itself with no visible cause reads as a bug.
+            AgentEvent::PermissionResolved {
+                tool_call_id,
+                decision,
+                source,
+            } => {
+                let stale = self
+                    .modal
+                    .permission()
+                    .is_some_and(|m| m.request.tool_call_id == tool_call_id);
+                if stale {
+                    let tool = self
+                        .modal
+                        .permission()
+                        .map(|m| m.request.tool_name.clone())
+                        .unwrap_or_default();
+                    self.modal = Modal::None;
+                    if source == smith_core::AskSource::Web {
+                        let verdict = match decision {
+                            smith_core::PermissionDecision::AllowOnce => "allowed once",
+                            smith_core::PermissionDecision::AllowSession => {
+                                "allowed for the session"
+                            }
+                            smith_core::PermissionDecision::Deny => "denied",
+                        };
+                        self.lines.push(ChatLine::new(
+                            ChatRole::System,
+                            format!("{tool}: {verdict} from the web console"),
+                        ));
+                    }
+                }
+            }
+            AgentEvent::QuestionResolved { id, source } => {
+                let stale = self.modal.question().is_some_and(|m| m.question.id == id);
+                if stale {
+                    self.modal = Modal::None;
+                    if source == smith_core::AskSource::Web {
+                        self.lines.push(ChatLine::new(
+                            ChatRole::System,
+                            "question answered from the web console".to_string(),
+                        ));
+                    }
+                }
+            }
             AgentEvent::PhaseChanged(phase) => {
                 // Don't clobber Asking/WaitingPermission while a modal is open.
                 if self.modal.is_question() && phase != AgentPhase::Asking {

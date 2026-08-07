@@ -86,6 +86,33 @@ pub struct PermissionAsk {
     pub respond_to: oneshot::Sender<PermissionDecision>,
 }
 
+/// A frontend's answer to a pending ask, addressed by the ask's own id.
+///
+/// This is the inbound half of the ask broker: `PermissionAsk`/`QuestionAsk`
+/// carry a `oneshot::Sender` that can be consumed exactly once, so with more
+/// than one frontend on a session nobody but the broker may own it. Frontends
+/// send one of these instead; the broker resolves the oneshot on the first
+/// answer for each id and drops the rest.
+#[derive(Debug, Clone)]
+pub enum AskAnswer {
+    Permission {
+        tool_call_id: String,
+        decision: crate::event::PermissionDecision,
+    },
+    Question {
+        id: String,
+        answer: String,
+    },
+}
+
+/// An [`AskAnswer`] plus who sent it — what the broker's answer channel
+/// carries, and what lets the resolution event say which frontend won.
+#[derive(Debug, Clone)]
+pub struct SubmittedAnswer {
+    pub source: crate::event::AskSource,
+    pub answer: AskAnswer,
+}
+
 /// Asks a frontend to resolve an `ask_user` question.
 ///
 /// The oneshot carries `Ok(answer)` — one of the three suggestions or custom

@@ -97,10 +97,22 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         None
     };
 
+    // The broker owns the ask oneshots for every interactive frontend — see
+    // `askbroker`. Spawned before the orchestrator so no ask can arrive with
+    // nobody listening.
+    let (ask_tx, ask_rx) = tokio::sync::mpsc::unbounded_channel();
+    let broker = tokio::spawn(crate::askbroker::run(
+        permission_rx,
+        question_rx,
+        ask_rx,
+        chans.event_tx.clone(),
+    ));
+
     let orchestrator = tokio::spawn(run_orchestrator(opts, chans));
 
-    let result = smith_tui::run(tui_config, action_tx, event_rx, permission_rx, question_rx).await;
+    let result = smith_tui::run(tui_config, action_tx, event_rx, ask_tx).await;
     orchestrator.abort();
+    broker.abort();
     if let Some(poller) = resource_poller {
         poller.abort();
     }

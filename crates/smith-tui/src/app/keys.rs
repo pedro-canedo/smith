@@ -174,21 +174,15 @@ impl App {
                         if custom.is_empty() {
                             None
                         } else {
-                            self.record_question_answer(&custom);
-                            self.modal = Modal::None;
-                            Some(Action::QuestionResponse(custom))
+                            self.submit_question_answer(custom)
                         }
                     } else {
                         self.submit_question_choice(selected)
                     }
                 }
-                KeyCode::Esc => {
-                    self.record_question_answer("dismissed without answering");
-                    self.modal = Modal::None;
-                    Some(Action::QuestionResponse(
-                        "User dismissed the question without answering.".into(),
-                    ))
-                }
+                KeyCode::Esc => self.submit_question_answer(
+                    "User dismissed the question without answering.".to_string(),
+                ),
                 KeyCode::Backspace => {
                     if let Some(m) = self.modal.question_mut() {
                         m.selected = 3;
@@ -266,18 +260,29 @@ impl App {
     /// The permission modal.
     fn key_permission_modal(&mut self, code: KeyCode) -> Handled {
         if self.modal.permission().is_some() {
+            // Captured before the modal closes: the action must carry the
+            // ask's id, and `Modal::None` is about to erase the only copy.
+            let answer = |app: &mut Self, decision: PermissionDecision| {
+                let tool_call_id = app
+                    .modal
+                    .permission()
+                    .map(|m| m.request.tool_call_id.clone())
+                    .unwrap_or_default();
+                app.modal = Modal::None;
+                Some(Action::PermissionResponse {
+                    tool_call_id,
+                    decision,
+                })
+            };
             return Some(match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.modal = Modal::None;
-                    Some(Action::PermissionResponse(PermissionDecision::AllowOnce))
+                    answer(self, PermissionDecision::AllowOnce)
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    self.modal = Modal::None;
-                    Some(Action::PermissionResponse(PermissionDecision::AllowSession))
+                    answer(self, PermissionDecision::AllowSession)
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.modal = Modal::None;
-                    Some(Action::PermissionResponse(PermissionDecision::Deny))
+                    answer(self, PermissionDecision::Deny)
                 }
                 KeyCode::Up => {
                     if let Some(m) = self.modal.permission_mut() {
@@ -615,20 +620,29 @@ impl App {
             .modal
             .question()
             .and_then(|m| m.question.options.get(index).cloned())?;
-        self.record_question_answer(&answer);
+        self.submit_question_answer(answer)
+    }
+
+    /// Records the exchange in the transcript, closes the modal, and builds
+    /// the action — with the question's id captured first, because the action
+    /// must carry it and `Modal::None` erases the only copy.
+    fn submit_question_answer(&mut self, answer: String) -> Option<Action> {
+        let id = self.record_question_answer(&answer)?;
         self.modal = Modal::None;
-        Some(Action::QuestionResponse(answer))
+        Some(Action::QuestionResponse { id, answer })
     }
 
     /// Leaves a permanent record of an `ask_user` exchange in the transcript
     /// before the modal (which is otherwise the only place it's visible)
-    /// closes.
-    fn record_question_answer(&mut self, answer: &str) {
-        if let Some(modal) = self.modal.question() {
-            self.lines.push(ChatLine::new(
-                ChatRole::System,
-                format!("asked: {} — answered: {answer}", modal.question.prompt),
-            ));
-        }
+    /// closes. Returns the question's id.
+    fn record_question_answer(&mut self, answer: &str) -> Option<String> {
+        let modal = self.modal.question()?;
+        let id = modal.question.id.clone();
+        let prompt = modal.question.prompt.clone();
+        self.lines.push(ChatLine::new(
+            ChatRole::System,
+            format!("asked: {prompt} — answered: {answer}"),
+        ));
+        Some(id)
     }
 }

@@ -9,6 +9,8 @@ use clap::{Parser, Subcommand};
 use headless::{OutputFormat, EXIT_OK, EXIT_TURN_FAILED, EXIT_USAGE};
 use orchestrator::ProviderKind;
 
+#[path = "main/askbroker.rs"]
+mod askbroker;
 #[path = "main/frontend.rs"]
 mod frontend;
 #[path = "main/startup.rs"]

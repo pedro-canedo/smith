@@ -479,9 +479,11 @@ fn question_modal_digit_one_submits_option_a() {
         crossterm::event::KeyCode::Char('1'),
         crossterm::event::KeyModifiers::NONE,
     );
+    // The answer carries the question's id: the modal is already closed by
+    // the time the action is handled, so the id is the only pairing.
     assert!(matches!(
         action,
-        Some(Action::QuestionResponse(ref s)) if s == "Alpha"
+        Some(Action::QuestionResponse { ref id, ref answer }) if id == "q1" && answer == "Alpha"
     ));
     assert!(app.modal.is_none());
 }

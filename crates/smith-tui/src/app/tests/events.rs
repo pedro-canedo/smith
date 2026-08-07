@@ -767,3 +767,61 @@ fn an_unreadable_catalogue_says_so_instead_of_opening_nothing() {
         .iter()
         .any(|l| l.text.contains("could not read") && l.text.contains("/model <name>")));
 }
+
+/// The broker resolved an ask from the *other* frontend: the stale modal
+/// here must close, and a web-sourced decision earns a transcript line so
+/// the terminal user sees who decided.
+#[test]
+fn a_permission_resolved_event_closes_a_matching_stale_modal() {
+    let mut app = test_app();
+    app.modal = permission_modal(); // tool_call_id "call_1"
+
+    // A resolution for some other call leaves this modal alone.
+    app.on_agent_event(AgentEvent::PermissionResolved {
+        tool_call_id: "other".into(),
+        decision: smith_core::PermissionDecision::AllowOnce,
+        source: smith_core::AskSource::Web,
+    });
+    assert!(app.modal.permission().is_some(), "wrong id must not close");
+
+    app.on_agent_event(AgentEvent::PermissionResolved {
+        tool_call_id: "call_1".into(),
+        decision: smith_core::PermissionDecision::AllowOnce,
+        source: smith_core::AskSource::Web,
+    });
+    assert!(app.modal.is_none(), "the matching resolution closes it");
+    assert!(
+        app.lines
+            .iter()
+            .any(|l| l.text.contains("run_bash") && l.text.contains("web console")),
+        "a web decision must be visible in the terminal transcript"
+    );
+}
+
+#[test]
+fn a_question_resolved_event_closes_the_stale_question_modal() {
+    let mut app = test_app();
+    app.modal = question_modal(); // id "q1"
+    app.on_agent_event(AgentEvent::QuestionResolved {
+        id: "q1".into(),
+        source: smith_core::AskSource::Web,
+    });
+    assert!(app.modal.is_none());
+    assert!(app.lines.iter().any(|l| l.text.contains("web console")));
+}
+
+/// When this TUI answered, its modal is already gone by the time its own
+/// resolution echoes back — the event must be a clean no-op, not a duplicate
+/// transcript line.
+#[test]
+fn a_tui_sourced_resolution_is_silent() {
+    let mut app = test_app();
+    let before = app.lines.len();
+    app.on_agent_event(AgentEvent::PermissionResolved {
+        tool_call_id: "call_1".into(),
+        decision: smith_core::PermissionDecision::Deny,
+        source: smith_core::AskSource::Tui,
+    });
+    assert!(app.modal.is_none());
+    assert_eq!(app.lines.len(), before, "no modal was open, nothing to say");
+}

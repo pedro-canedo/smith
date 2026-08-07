@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
-use smith_core::{Action, AgentEvent, PermissionAsk, QuestionAsk};
-use tokio::sync::{mpsc, oneshot};
+use smith_core::{Action, AgentEvent, AskAnswer, AskSource, SubmittedAnswer};
+use tokio::sync::mpsc;
 
 pub use app::{App, ChatLine, ChatRole, IdleHint, TuiConfig};
 pub use complete::CompletionKind;
@@ -35,23 +35,25 @@ pub use theme::{Theme, ThemeError, ThemeName};
 const SPINNER_INTERVAL: Duration = Duration::from_millis(app::SPINNER_INTERVAL_MS as u64);
 
 /// Drives the terminal UI until the user quits. `action_tx` carries user
-/// intent out to the orchestrator; `agent_events`, `permission_asks`, and
-/// `question_asks` carry orchestrator state back in.
+/// intent out to the orchestrator; `agent_events` carries orchestrator state
+/// back in; `ask_tx` carries answers to blocking permission/question prompts
+/// to the ask broker, which owns the oneshots the agent is waiting on.
+///
+/// The TUI does not receive `PermissionAsk`/`QuestionAsk` itself any more:
+/// those carry a `oneshot::Sender` consumable exactly once, and with the web
+/// console a second frontend can answer first. The broker is the one owner;
+/// every frontend — this one included — learns of pending asks from the
+/// `AgentEvent`s and answers over the same channel.
 pub async fn run(
     config: TuiConfig,
     action_tx: mpsc::UnboundedSender<Action>,
     mut agent_events: mpsc::UnboundedReceiver<AgentEvent>,
-    mut permission_asks: mpsc::UnboundedReceiver<PermissionAsk>,
-    mut question_asks: mpsc::UnboundedReceiver<QuestionAsk>,
+    ask_tx: mpsc::UnboundedSender<SubmittedAnswer>,
 ) -> color_eyre::Result<()> {
     let mut term = terminal::init()?;
     let _restore = terminal::RestoreGuard::armed();
     let mut app = App::new(config);
     let mut crossterm_events = EventStream::new();
-    let mut pending_permission: Option<oneshot::Sender<smith_core::PermissionDecision>> = None;
-    // `Result` because a frontend may be unable to ask at all; the TUI
-    // always can, so it only ever sends `Ok`.
-    let mut pending_question: Option<oneshot::Sender<Result<String, String>>> = None;
     let mut spinner = tokio::time::interval(SPINNER_INTERVAL);
 
     term.draw(|f| ui::draw(f, &mut app))?;
@@ -84,18 +86,23 @@ pub async fn run(
                     }
                     if let Some(action) = app.on_key(key.code, key.modifiers) {
                         match action {
-                            Action::PermissionResponse(decision) => {
-                                if let Some(tx) = pending_permission.take() {
-                                    let _ = tx.send(decision);
-                                }
+                            Action::PermissionResponse {
+                                tool_call_id,
+                                decision,
+                            } => {
+                                let _ = ask_tx.send(SubmittedAnswer {
+                                    source: AskSource::Tui,
+                                    answer: AskAnswer::Permission {
+                                        tool_call_id,
+                                        decision,
+                                    },
+                                });
                             }
-                            Action::QuestionResponse(answer) => {
-                                if let Some(tx) = pending_question.take() {
-                                    let _ = tx.send(Ok(answer));
-                                }
-                            }
-                            Action::Quit => {
-                                let _ = action_tx.send(action);
+                            Action::QuestionResponse { id, answer } => {
+                                let _ = ask_tx.send(SubmittedAnswer {
+                                    source: AskSource::Tui,
+                                    answer: AskAnswer::Question { id, answer },
+                                });
                             }
                             other => {
                                 let _ = action_tx.send(other);
@@ -106,14 +113,6 @@ pub async fn run(
             }
             Some(event) = agent_events.recv() => {
                 app.on_agent_event(event);
-            }
-            Some(ask) = permission_asks.recv() => {
-                // ask.request is already surfaced via AgentEvent::PermissionPromptNeeded
-                pending_permission = Some(ask.respond_to);
-            }
-            Some(ask) = question_asks.recv() => {
-                // ask.question is already surfaced via AgentEvent::UserQuestionNeeded
-                pending_question = Some(ask.respond_to);
             }
         }
 
