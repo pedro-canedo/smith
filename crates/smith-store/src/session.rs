@@ -85,6 +85,7 @@ const MIGRATIONS: &[(&str, MigrationFn)] = &[
     ("initial_schema", migrate_initial_schema),
     ("session_goal", migrate_session_goal),
     ("turn_accounting", migrate_turn_accounting),
+    ("task_snapshots", migrate_task_snapshots),
 ];
 
 /// The schema version this build produces.
@@ -151,6 +152,23 @@ fn migrate_turn_accounting(conn: &Connection) -> rusqlite::Result<()> {
             cost_usd           REAL
         );
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, seq);",
+    )
+}
+
+/// Version 4: the task board's stamped snapshot, one row per session.
+///
+/// A snapshot column rather than one row per task: the board is replaced
+/// wholesale on every `write_tasks` call (`TasksUpdated` semantics), and the
+/// stamps (`id`, `updated_at`) exist only in the stamped copy — the model's
+/// un-stamped `tool_use` input in `messages` cannot reproduce them, which is
+/// why resume prefers this table over the legacy history scan.
+fn migrate_task_snapshots(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tasks (
+            session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            snapshot   TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );",
     )
 }
 
@@ -406,6 +424,46 @@ impl SessionStore {
             .optional()
             .map(Option::flatten)
             .map_err(SessionError::from)
+    }
+
+    /// Replaces this session's task-board snapshot — the *stamped* copy, ids
+    /// and timestamps included, which the model's own `tool_use` input in
+    /// `messages` cannot reproduce. Whole-snapshot semantics on purpose: the
+    /// board is replaced wholesale on every `write_tasks` call, so a diff
+    /// table would model an update that never happens.
+    pub fn save_tasks(
+        &self,
+        session_id: &str,
+        tasks: &[smith_core::Task],
+    ) -> Result<(), SessionError> {
+        let snapshot = serde_json::to_string(tasks)?;
+        self.conn.execute(
+            "INSERT INTO tasks (session_id, snapshot, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET snapshot = ?2, updated_at = ?3",
+            params![session_id, snapshot, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// The stamped board, or `None` for a session that never saved one —
+    /// the caller falls back to scanning history for the last `write_tasks`
+    /// call (the pre-v4 recovery path, kept for old sessions).
+    pub fn load_tasks(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<smith_core::Task>>, SessionError> {
+        let snapshot: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT snapshot FROM tasks WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match snapshot {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
     }
 
     /// Appends one turn's accounting to this session.

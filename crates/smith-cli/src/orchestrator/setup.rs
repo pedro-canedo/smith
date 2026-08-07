@@ -50,6 +50,7 @@ pub(super) async fn wire(
         model,
         config,
         initial_messages,
+        initial_tasks,
         mut persistence,
         permission_policy,
         initial_goal,
@@ -235,7 +236,13 @@ pub(super) async fn wire(
         // `--allowed-tools` is the only gate the run has.
         .with_unattended(unattended);
     agent.set_goal(initial_goal);
-    let seeded_tasks = crate::startup::last_write_tasks_call(&initial_messages);
+    // The stamped snapshot when the frontend loaded one; the legacy history
+    // scan otherwise (pre-snapshot sessions, callers that set nothing).
+    let seeded_tasks = if initial_tasks.is_empty() {
+        crate::startup::last_write_tasks_call(&initial_messages)
+    } else {
+        initial_tasks
+    };
     if !initial_messages.is_empty() {
         agent.seed_history(initial_messages);
     }

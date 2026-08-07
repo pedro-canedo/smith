@@ -163,3 +163,25 @@ fn the_throughput_graph_follows_the_newest_samples() {
         "the graph is not showing the recent, high samples:\n{text}"
     );
 }
+
+/// The board's two new states are visible states: blocked carries its
+/// reason on the row below, review reads as awaiting the user.
+#[test]
+fn the_tasks_tab_renders_blocked_with_its_reason_and_review() {
+    let mut app = app_with_context(100);
+    app.sidebar_tab = crate::app::SidebarTab::Tasks;
+    app.tasks = vec![
+        smith_core::Task {
+            blocked_reason: Some("aguardando API key".into()),
+            ..smith_core::Task::new("configurar provider", smith_core::TaskStatus::Blocked)
+        },
+        smith_core::Task::new("revisar diff", smith_core::TaskStatus::Review),
+    ];
+    let text = rendered(&mut app, 100, 30);
+    assert!(text.contains('⊘'), "blocked icon missing: {text}");
+    assert!(
+        text.contains("aguardando API key"),
+        "the reason is the useful half: {text}"
+    );
+    assert!(text.contains('◇'), "review icon missing: {text}");
+}

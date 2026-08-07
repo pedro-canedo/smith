@@ -379,10 +379,7 @@ mod tests {
     use super::*;
 
     fn task(content: &str, status: TaskStatus) -> Task {
-        Task {
-            content: content.to_string(),
-            status,
-        }
+        Task::new(content, status)
     }
 
     fn tool_call(id: &str, name: &str, input: serde_json::Value) -> Message {

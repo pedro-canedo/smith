@@ -340,6 +340,12 @@ pub(super) fn task_lines(tasks: &[smith_core::Task], theme: &Theme) -> Vec<Line<
         let (icon, style) = match task.status {
             TaskStatus::InProgress if theme.unicode => ("▶", theme.ember()),
             TaskStatus::InProgress => (">", theme.ember()),
+            // Blocked is the row that needs the eye: an obstacle, not a queue.
+            TaskStatus::Blocked if theme.unicode => ("⊘", theme.danger()),
+            TaskStatus::Blocked => ("!", theme.danger()),
+            // Review: done, awaiting the user's judgement.
+            TaskStatus::Review if theme.unicode => ("◇", theme.amber()),
+            TaskStatus::Review => ("?", theme.amber()),
             _ if theme.unicode => ("◻", theme.disabled()),
             _ => ("-", theme.disabled()),
         };
@@ -347,6 +353,16 @@ pub(super) fn task_lines(tasks: &[smith_core::Task], theme: &Theme) -> Vec<Line<
             Span::styled(format!("{icon} "), style),
             Span::styled(sidebar_truncate(&task.content), theme.text()),
         ]));
+        // The reason is the useful half of a blocked card; one indented line,
+        // truncated like the content above it.
+        if task.status == TaskStatus::Blocked {
+            if let Some(reason) = &task.blocked_reason {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", sidebar_truncate(reason)),
+                    theme.secondary(),
+                )));
+            }
+        }
     }
     if pending.len() > MAX_SHOWN {
         lines.push(Line::from(Span::styled(

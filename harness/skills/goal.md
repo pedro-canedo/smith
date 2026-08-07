@@ -11,9 +11,11 @@ description: Work toward a session goal set with /goal: decompose it, track prog
    cannot list milestones is a goal to clarify with one `ask_user` — three
    concrete readings — before working.
 3. Work milestone by milestone, exactly as any other task: mark
-   `in_progress` before starting one, verify it, mark `completed`. The task
-   list IS the goal's progress meter — keep it truthful; never mark
-   completed what you did not verify.
+   `in_progress` before starting one, verify it, mark `completed`. A
+   milestone you cannot proceed with is `blocked` with a one-line
+   `blocked_reason`; one awaiting the user's verdict is `review`. The board
+   IS the goal's progress meter — keep it truthful; never mark completed
+   what you did not verify.
 4. At the end of each turn, connect what happened to the goal in one line:
    which milestone advanced, which is next. The user should never have to
    ask "where are we on the goal?"

@@ -23,7 +23,9 @@ description: Add a feature: survey existing conventions, plan with write_tasks, 
    criterion observable. Wiring a stub through the real path beats building
    a complete layer nobody calls yet.
 5. Implement one task at a time. Before each mutation, mark the task
-   `in_progress`; after verifying it, mark it `completed`. Verify means: run
+   `in_progress`; after verifying it, mark it `completed` — or `review`
+   when it is done but awaits the user's judgement, or `blocked` (with the
+   reason) when it cannot proceed. Verify means: run
    the relevant test or command with `run_bash` and read its output — not
    "the code looks right". Reuse existing helpers instead of writing new
    ones; never add a dependency without saying so in the summary.

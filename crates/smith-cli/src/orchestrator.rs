@@ -418,6 +418,11 @@ impl Persistence {
         let _ = self.store.record_turn(&session_id, turn);
     }
 
+    fn persist_tasks(&mut self, tasks: &[smith_core::Task]) {
+        let session_id = self.ensure_session_id();
+        let _ = self.store.save_tasks(&session_id, tasks);
+    }
+
     /// The totals a resumed session starts from, or zero for a fresh one.
     fn turn_totals(&self) -> TurnTotals {
         self.session_id
@@ -435,6 +440,7 @@ impl Persistence {
 fn persist_turn(state: &mut OrchestratorState) {
     let history = state.agent.history().to_vec();
     let turn = state.agent.last_turn().cloned();
+    let tasks = state.agent.tasks().to_vec();
     let Some(persistence) = state.persistence.as_mut() else {
         return;
     };
@@ -446,6 +452,13 @@ fn persist_turn(state: &mut OrchestratorState) {
             usage: turn.usage,
             cost_usd: turn.cost_usd,
         });
+    }
+    // The *stamped* board — resume prefers this snapshot because the ids and
+    // timestamps exist only here, not in the model's tool_use input that
+    // history holds. Empty is skipped: most turns never touch the board, and
+    // an empty write would erase a snapshot the turn had nothing to do with.
+    if !tasks.is_empty() {
+        persistence.persist_tasks(&tasks);
     }
 }
 
@@ -681,6 +694,9 @@ pub struct OrchestratorOptions {
     pub model: String,
     pub config: Config,
     pub initial_messages: Vec<Message>,
+    /// The resumed board, already stamped. Empty means "scan history",
+    /// which keeps pre-snapshot sessions working — see setup::wire.
+    pub initial_tasks: Vec<smith_core::Task>,
     pub persistence: Option<Persistence>,
     pub permission_policy: smith_core::PermissionPolicy,
     pub initial_goal: Option<String>,
@@ -710,6 +726,7 @@ impl OrchestratorOptions {
             model,
             config,
             initial_messages: Vec::new(),
+            initial_tasks: Vec::new(),
             persistence: None,
             permission_policy: smith_core::PermissionPolicy::default(),
             initial_goal: None,

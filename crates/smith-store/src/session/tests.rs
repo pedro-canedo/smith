@@ -662,3 +662,60 @@ fn last_seq_is_none_for_a_session_with_no_messages() {
     let id = store.create_session("anthropic", "m", "/tmp").unwrap();
     assert_eq!(store.last_seq(&id).unwrap(), None);
 }
+
+/// The stamped board round-trips whole — ids and timestamps included, which
+/// is the reason this table exists (history holds only the model's
+/// un-stamped input).
+#[test]
+fn a_saved_task_snapshot_round_trips_stamps_and_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(dir.path()).unwrap();
+    let id = store.create_session("ollama", "qwen", "/tmp/p").unwrap();
+
+    assert_eq!(store.load_tasks(&id).unwrap(), None, "no snapshot yet");
+
+    let tasks = vec![
+        smith_core::Task {
+            id: Some("t1".into()),
+            blocked_reason: Some("waiting on a key".into()),
+            updated_at: Some(1_000),
+            ..smith_core::Task::new("first", smith_core::TaskStatus::Blocked)
+        },
+        smith_core::Task {
+            id: Some("t2".into()),
+            updated_at: Some(2_000),
+            ..smith_core::Task::new("second", smith_core::TaskStatus::Review)
+        },
+    ];
+    store.save_tasks(&id, &tasks).unwrap();
+    assert_eq!(store.load_tasks(&id).unwrap(), Some(tasks.clone()));
+
+    // Whole-snapshot semantics: a later save replaces, never merges.
+    let replacement = vec![smith_core::Task::new(
+        "only this now",
+        smith_core::TaskStatus::Completed,
+    )];
+    store.save_tasks(&id, &replacement).unwrap();
+    assert_eq!(store.load_tasks(&id).unwrap(), Some(replacement));
+}
+
+/// Reopening a database that already ran every migration is a no-op — the
+/// v4 table included.
+#[test]
+fn the_task_snapshot_migration_is_idempotent_over_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let store = SessionStore::open(dir.path()).unwrap();
+        let id = store.create_session("ollama", "qwen", "/tmp/p").unwrap();
+        store
+            .save_tasks(
+                &id,
+                &[smith_core::Task::new("x", smith_core::TaskStatus::Pending)],
+            )
+            .unwrap();
+        id
+    };
+    let reopened = SessionStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(reopened.load_tasks(&id).unwrap().unwrap()[0].content, "x");
+}

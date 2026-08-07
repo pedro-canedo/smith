@@ -21,9 +21,9 @@ Each iteration of a looped task follows the same five moves:
    increment is not progress, it is deferred debugging.
 5. **Record state** so the next iteration (or a fresh context) can resume
    without archaeology: keep `write_tasks` current — completed work marked,
-   the next increment named as `pending`. The task list is the loop's
-   memory; keep it truthful even when an increment failed (leave it
-   `in_progress` and note the blocker in your reply).
+   the next increment named as `pending`, and an increment that cannot
+   proceed marked `blocked` with its `blocked_reason` on the card, not
+   only in prose. The board is the loop's memory; keep it truthful.
 
 # Termination
 

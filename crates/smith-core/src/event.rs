@@ -48,16 +48,52 @@ pub struct UserQuestion {
 pub enum TaskStatus {
     Pending,
     InProgress,
+    /// Cannot proceed — `Task::blocked_reason` says why. Distinct from
+    /// pending: a blocked card names an obstacle, a pending one just waits
+    /// its turn.
+    Blocked,
+    /// Done pending the user's judgement — work that awaits a decision, not
+    /// more work.
+    Review,
     Completed,
 }
 
-/// One step of a checklist the agent keeps visible via the `write_tasks`
-/// tool — mirrors how coding-agent CLIs surface a persistent todo list
-/// instead of just a transient "thinking…" status.
+/// One card of the board the agent keeps visible via the `write_tasks`
+/// tool. The statuses are the board's columns.
+///
+/// The three optional fields are additive on the wire: absent, a task
+/// serializes byte-identically to the original two-field shape, so existing
+/// stream-json consumers see nothing new until the fields are used. The new
+/// `status` values do reach the wire when the model uses them — the one
+/// compat note (see docs/web-console.md §3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub content: String,
     pub status: TaskStatus,
+    /// Stable identity across full-list replacements. The model echoes ids
+    /// back; `run_write_tasks` stamps a positional one where none was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// One line on what stands in the way; meaningful with `Blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// Milliseconds since the epoch, stamped by smith at receipt — never
+    /// model-supplied (a model has no clock worth trusting). Refreshed only
+    /// when the card actually changed, so a board can show per-card recency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+}
+
+impl Task {
+    pub fn new(content: impl Into<String>, status: TaskStatus) -> Self {
+        Self {
+            content: content.into(),
+            status,
+            id: None,
+            blocked_reason: None,
+            updated_at: None,
+        }
+    }
 }
 
 /// High-level agent activity for status chrome (avoids a silent "stuck" UI).
@@ -498,10 +534,7 @@ mod tests {
                 cache_read: 30,
                 cache_write: 40,
             }),
-            AgentEvent::TasksUpdated(vec![Task {
-                content: "ship it".into(),
-                status: TaskStatus::InProgress,
-            }]),
+            AgentEvent::TasksUpdated(vec![Task::new("ship it", TaskStatus::InProgress)]),
             AgentEvent::Error("boom".into()),
         ];
 

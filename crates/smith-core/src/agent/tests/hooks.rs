@@ -705,6 +705,84 @@ fn parse_tasks_reads_content_and_status() {
 }
 
 #[test]
+fn parse_tasks_accepts_blocked_with_a_reason_and_review() {
+    let tasks = parse_tasks(&serde_json::json!({
+        "tasks": [
+            {"content": "a", "status": "blocked", "blocked_reason": "needs a key", "id": "t1"},
+            {"content": "b", "status": "review"},
+        ]
+    }))
+    .unwrap();
+    assert_eq!(tasks[0].status, TaskStatus::Blocked);
+    assert_eq!(tasks[0].blocked_reason.as_deref(), Some("needs a key"));
+    assert_eq!(tasks[0].id.as_deref(), Some("t1"));
+    assert_eq!(tasks[1].status, TaskStatus::Review);
+    assert_eq!(
+        tasks[1].id, None,
+        "ids are stamped later, not invented here"
+    );
+}
+
+/// The stamp is smith's, never the model's — a model has no clock worth
+/// trusting, and a fabricated recency would order the board by fiction.
+#[test]
+fn parse_tasks_discards_a_model_supplied_updated_at() {
+    let tasks = parse_tasks(&serde_json::json!({
+        "tasks": [{"content": "a", "status": "pending", "updated_at": 12345}]
+    }))
+    .unwrap();
+    assert_eq!(tasks[0].updated_at, None);
+}
+
+#[test]
+fn stamping_assigns_positional_ids_only_where_the_model_sent_none() {
+    let incoming = vec![
+        Task {
+            id: Some("keep-me".into()),
+            ..Task::new("a", TaskStatus::Pending)
+        },
+        Task::new("b", TaskStatus::Pending),
+    ];
+    let stamped = super::super::interactive::stamp_tasks(&[], incoming, 1_000);
+    assert_eq!(stamped[0].id.as_deref(), Some("keep-me"));
+    assert_eq!(stamped[1].id.as_deref(), Some("t2"));
+    assert_eq!(stamped[0].updated_at, Some(1_000));
+}
+
+/// Per-card recency: an unchanged card keeps its stamp across the full-list
+/// replacement `write_tasks` always sends; a changed one is refreshed.
+#[test]
+fn an_unchanged_task_keeps_its_updated_at_across_snapshots() {
+    let first = super::super::interactive::stamp_tasks(
+        &[],
+        vec![
+            Task::new("unchanged", TaskStatus::Pending),
+            Task::new("will change", TaskStatus::Pending),
+        ],
+        1_000,
+    );
+    let second = super::super::interactive::stamp_tasks(
+        &first,
+        vec![
+            Task::new("unchanged", TaskStatus::Pending),
+            Task::new("will change", TaskStatus::InProgress),
+        ],
+        2_000,
+    );
+    assert_eq!(second[0].updated_at, Some(1_000), "nothing changed");
+    assert_eq!(second[1].updated_at, Some(2_000), "the status moved");
+}
+
+/// The compat pin: without the optional fields a task serializes exactly as
+/// the original two-field shape, so stream-json consumers see nothing new
+/// until the fields are actually used.
+#[test]
+fn a_task_without_new_fields_serializes_exactly_as_before() {
+    let json = serde_json::to_string(&Task::new("ship it", TaskStatus::InProgress)).unwrap();
+    assert_eq!(json, r#"{"content":"ship it","status":"in_progress"}"#);
+}
+
+#[test]
 fn finds_fallback_tool_call_that_is_the_whole_message() {
     let known = defs(&["write_file"]);
     let text = r#"{"name": "write_file", "arguments": {"path": "a.txt", "content": "hi"}}"#;

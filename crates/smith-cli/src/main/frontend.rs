@@ -1,8 +1,7 @@
 //! The two frontends, and the terminal policy that picks between them.
 
 use crate::startup::{
-    channels, detect_git_branch, display_path, last_write_tasks_call, messages_to_chat_lines,
-    prompt_history, Startup,
+    channels, detect_git_branch, display_path, messages_to_chat_lines, prompt_history, Startup,
 };
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Read};
@@ -74,7 +73,7 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         theme: startup.theme.clone(),
         keys: startup.keys.clone(),
         goal: startup.initial_goal.clone(),
-        tasks: last_write_tasks_call(&startup.initial_messages),
+        tasks: startup.initial_tasks.clone(),
         history: prompt_history(&startup.initial_messages),
         commands: smith_tui::slash::SlashRegistry::new(commands),
         logs,
@@ -90,6 +89,7 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         startup.model.clone(),
         startup.config.clone(),
     );
+    opts.initial_tasks = startup.initial_tasks.clone();
     opts.persistence = startup.persistence();
     opts.permission_policy = startup.permission_policy;
     opts.initial_goal = startup.initial_goal.clone();
@@ -250,6 +250,7 @@ pub(crate) async fn run_headless(cli: Cli) -> u8 {
         startup.config.clone(),
     );
     opts.provider = Some(provider);
+    opts.initial_tasks = startup.initial_tasks.clone();
     opts.persistence = startup.persistence();
     opts.initial_goal = startup.initial_goal.clone();
     opts.initial_messages = std::mem::take(&mut startup.initial_messages);

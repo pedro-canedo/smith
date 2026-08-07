@@ -14,12 +14,15 @@ impl Tool for WriteTasksTool {
     }
 
     fn description(&self) -> &str {
-        "Maintain a visible checklist of the steps for the current work, shown live to the \
-         user. Call it once at the start of any multi-step task (3+ steps) with the full list \
-         (status: pending), then again whenever a step's status changes — mark it in_progress \
-         right before starting it, completed right after finishing it. Always resend the FULL \
-         list, not just the changed item. Keep task descriptions short and concrete (3-7 \
-         words). Skip this entirely for single-step or trivial requests."
+        "Maintain the visible board of steps for the current work, shown live to the user. \
+         Call it once at the start of any multi-step task (3+ steps) with the full list \
+         (status: pending), then again whenever a step's status changes — in_progress right \
+         before starting it, completed right after finishing it. A step you cannot proceed \
+         with is `blocked` with a one-line `blocked_reason` — mark it and move on rather than \
+         stalling. A step that is done but awaits the user's judgement is `review`. Always \
+         resend the FULL list, not just the changed item, and echo back each task's `id` \
+         unchanged so cards keep their identity. Keep content short and concrete (3-7 words). \
+         Skip this entirely for single-step or trivial requests."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -34,7 +37,15 @@ impl Tool for WriteTasksTool {
                             "content": {"type": "string"},
                             "status": {
                                 "type": "string",
-                                "enum": ["pending", "in_progress", "completed"]
+                                "enum": ["pending", "in_progress", "blocked", "review", "completed"]
+                            },
+                            "id": {
+                                "type": "string",
+                                "description": "Echo back unchanged from the previous list; omit for new tasks."
+                            },
+                            "blocked_reason": {
+                                "type": "string",
+                                "description": "One line on what stands in the way; use with status blocked."
                             }
                         },
                         "required": ["content", "status"]

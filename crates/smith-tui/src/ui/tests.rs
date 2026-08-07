@@ -323,10 +323,10 @@ fn app_with_context(width: u16) -> App {
         window: 128_000,
         estimated: false,
     });
-    app.tasks = vec![smith_core::Task {
-        content: "fazer algo".into(),
-        status: smith_core::TaskStatus::Completed,
-    }];
+    app.tasks = vec![smith_core::Task::new(
+        "fazer algo",
+        smith_core::TaskStatus::Completed,
+    )];
     let _ = width;
     app
 }

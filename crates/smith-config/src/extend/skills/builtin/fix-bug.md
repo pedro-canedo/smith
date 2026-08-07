@@ -20,7 +20,9 @@ description: Fix a reported bug: reproduce it, locate the cause, fix minimally, 
    region with `offset`/`limit` — not the whole file. Follow the data, not
    your first theory: read the code that actually runs.
 5. If the fix will take 3 or more steps, call `write_tasks` with the full
-   list before starting.
+   list before starting. A step waiting on something you cannot get (a
+   credential, a decision) is `blocked` with its reason — mark it and keep
+   moving.
 6. If the project has a test suite, write the test that fails because of the
    bug BEFORE writing the fix. Run it and watch it fail for the reported
    reason. This test is your proof and your regression guard.

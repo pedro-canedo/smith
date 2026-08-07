@@ -95,6 +95,10 @@ pub(crate) struct Startup {
     pub(crate) session_store: Option<SessionStore>,
     pub(crate) session_id: Option<String>,
     pub(crate) initial_messages: Vec<Message>,
+    /// The resumed session's task board. The stored *stamped* snapshot when
+    /// one exists (ids and timestamps live only there); the legacy history
+    /// scan otherwise, so pre-v4 sessions still restore their checklist.
+    pub(crate) initial_tasks: Vec<smith_core::Task>,
     pub(crate) idle_hint: IdleHint,
     pub(crate) initial_goal: Option<String>,
     /// The output style this session runs under. Resolved here rather than in
@@ -184,6 +188,11 @@ impl Startup {
             .and_then(|dir| SessionStore::open(&dir).ok());
         let (session_id, initial_messages, idle_hint, initial_goal) =
             resolve_session(session_store.as_ref(), cli.resume.as_deref(), cli.continue_)?;
+        let initial_tasks = session_store
+            .as_ref()
+            .zip(session_id.as_deref())
+            .and_then(|(store, id)| store.load_tasks(id).ok().flatten())
+            .unwrap_or_else(|| last_write_tasks_call(&initial_messages));
 
         Ok(Self {
             cwd,
@@ -194,6 +203,7 @@ impl Startup {
             session_store,
             session_id,
             initial_messages,
+            initial_tasks,
             idle_hint,
             initial_goal,
             persona,

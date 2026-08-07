@@ -471,17 +471,11 @@ mod tests {
         let mut p = projection();
         p.apply(
             1,
-            &AgentEvent::TasksUpdated(vec![Task {
-                content: "a".into(),
-                status: smith_core::TaskStatus::Pending,
-            }]),
+            &AgentEvent::TasksUpdated(vec![Task::new("a", smith_core::TaskStatus::Pending)]),
         );
         p.apply(
             2,
-            &AgentEvent::TasksUpdated(vec![Task {
-                content: "b".into(),
-                status: smith_core::TaskStatus::Completed,
-            }]),
+            &AgentEvent::TasksUpdated(vec![Task::new("b", smith_core::TaskStatus::Completed)]),
         );
         assert_eq!(p.tasks.len(), 1);
         assert_eq!(p.tasks[0].content, "b");

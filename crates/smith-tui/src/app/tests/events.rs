@@ -517,14 +517,8 @@ fn tasks_updated_event_replaces_the_checklist() {
     let mut app = test_app();
     assert!(app.tasks.is_empty());
     app.on_agent_event(AgentEvent::TasksUpdated(vec![
-        Task {
-            content: "one".into(),
-            status: TaskStatus::Completed,
-        },
-        Task {
-            content: "two".into(),
-            status: TaskStatus::InProgress,
-        },
+        Task::new("one", TaskStatus::Completed),
+        Task::new("two", TaskStatus::InProgress),
     ]));
     assert_eq!(app.tasks.len(), 2);
     assert_eq!(app.tasks[1].content, "two");
