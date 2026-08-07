@@ -388,7 +388,7 @@ function openDetail(id) {
        ${p.source === 'environment'
          ? '<div class="notice">An exported environment variable outranks anything saved here, so this box has no effect until you unset it.</div>' : ''}
        ${id === '9router'
-         ? '<div class="notice">The key comes from the gateway\\'s own dashboard at <span class="mono">http://localhost:20128</span>, and the gateway must have at least one provider configured there or every request fails.</div>' : ''}`
+         ? '<div class="notice">The key comes from the own dashboard of the gateway at <span class="mono">http://localhost:20128</span>, and the gateway must have at least one provider configured there or every request fails.</div>' : ''}`
     : '<div class="empty">Nothing to enter. The Ollama daemon holds its own credential, so smith sends none.<br>Cloud models still need <span class="mono">ollama signin</span> once — free, no card.</div>';
   if ($('d-key')) $('d-key').oninput = e => { pending[field] = e.target.value; };
 

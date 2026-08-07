@@ -129,3 +129,68 @@ fn the_header_terminator_is_found_where_it_is() {
     // ours, and treating it as the end would read headers as a body.
     assert_eq!(find_header_end(b"GET / HTTP/1.1\n\nbody"), None);
 }
+
+/// The page's script, extracted from the embedded document.
+fn embedded_script() -> &'static str {
+    let open = PAGE.find("<script>").expect("the page has a script") + "<script>".len();
+    let close = PAGE[open..]
+        .find("</script>")
+        .expect("the script is closed")
+        + open;
+    &PAGE[open..close]
+}
+
+/// A backslash before a quote inside the embedded script is never intentional
+/// here, and it is how this page shipped once with its whole script dead.
+///
+/// The sequence `\\'` reads as an escaped *backslash* followed by a quote that
+/// ends the string, so the rest of the sentence becomes loose identifiers —
+/// `Uncaught SyntaxError: Unexpected identifier`. Nothing in nineteen passing
+/// tests noticed, because none of them ran the script. Write the sentence
+/// without the apostrophe instead of escaping it.
+#[test]
+fn the_embedded_script_never_escapes_a_quote() {
+    let script = embedded_script();
+    for hazard in ["\\\\'", "\\\\\""] {
+        assert!(
+            !script.contains(hazard),
+            "the script contains `{hazard}`, which ends the string early — \
+             rewrite the text so it needs no escape"
+        );
+    }
+}
+
+/// The real check: hand the script to a JavaScript parser.
+///
+/// Skipped rather than failed when no `node` is on PATH, because a developer
+/// without one should not be blocked — but CI runners ship node, so this does
+/// run where it matters. It is the only test here that would have caught the
+/// syntax error above on its own.
+#[test]
+fn the_embedded_script_parses_as_javascript() {
+    let Some(node) = which_node_for_test() else {
+        eprintln!("skipping: no `node` on PATH to parse the page with");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ui.js");
+    std::fs::write(&path, embedded_script()).unwrap();
+
+    let output = std::process::Command::new(node)
+        .arg("--check")
+        .arg(&path)
+        .output()
+        .expect("node ran");
+    assert!(
+        output.status.success(),
+        "the page's script does not parse:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn which_node_for_test() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) { "node.exe" } else { "node" };
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
