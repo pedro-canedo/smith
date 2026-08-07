@@ -378,11 +378,13 @@ async fn a_missing_ollama_is_explained_rather_than_installed() {
 #[test]
 fn a_writable_project_dir_and_an_existing_db_both_pass() {
     let dir = tempfile::tempdir().unwrap();
-    // A project that has actually been used, which is when the schema
-    // version becomes a real question.
-    drop(smith_store::SessionStore::open(dir.path()).unwrap());
+    // History lives centrally now, so "a project that has been used" means a
+    // database under `~/.smith/projects/<id>/`. Pointed at a temporary
+    // directory here so the test never writes into the real one.
+    let store = dir.path().join("central");
+    drop(smith_store::SessionStore::open(&store).unwrap());
 
-    let (writable, schema) = check_project_dir(dir.path());
+    let (writable, schema) = check_project_dir_at(dir.path(), &store);
 
     assert_eq!(writable.status, Status::Ok, "{}", writable.detail);
     assert_eq!(schema.status, Status::Ok, "{}", schema.detail);

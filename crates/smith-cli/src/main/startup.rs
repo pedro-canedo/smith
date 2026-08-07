@@ -168,7 +168,20 @@ impl Startup {
         )
         .map_err(|e| format!("smith: {e}"))?;
 
-        let session_store = SessionStore::open(&cwd).ok();
+        // History moved out of `<project>/.smith/` and into `~/.smith/projects/`.
+        // Adopting an existing database is announced rather than silent: a
+        // session list that relocates looks exactly like one that was lost.
+        match smith_config::adopt_legacy_session_db(&cwd) {
+            Ok(Some(from)) => eprintln!(
+                "smith: moved this project's history out of {} — it now lives under ~/.smith",
+                from.display()
+            ),
+            Ok(None) => {}
+            Err(e) => eprintln!("smith: could not move the old session database: {e}"),
+        }
+        let session_store = smith_config::project_store_dir(&cwd)
+            .ok()
+            .and_then(|dir| SessionStore::open(&dir).ok());
         let (session_id, initial_messages, idle_hint, initial_goal) =
             resolve_session(session_store.as_ref(), cli.resume.as_deref(), cli.continue_)?;
 

@@ -145,9 +145,12 @@ const LEGACY_V0_SCHEMA: &str = "
 /// afterwards, to model the second legacy shape (the ad-hoc `goal`
 /// `ALTER` having already run).
 fn legacy_v0_database(dir: &Path, extra: Option<&str>) {
-    let smith_dir = dir.join(".smith");
-    std::fs::create_dir_all(&smith_dir).unwrap();
-    let conn = Connection::open(smith_dir.join("sessions.db")).unwrap();
+    // `dir` is the store directory itself. It used to be the *project*
+    // directory with `.smith/` appended; history moved to
+    // `~/.smith/projects/<id>/` and `open` now takes the directory the
+    // database is in, whichever that is.
+    std::fs::create_dir_all(dir).unwrap();
+    let conn = Connection::open(dir.join("sessions.db")).unwrap();
     conn.execute_batch(LEGACY_V0_SCHEMA).unwrap();
     if let Some(extra) = extra {
         conn.execute_batch(extra).unwrap();
@@ -289,7 +292,7 @@ fn a_database_from_the_future_is_refused_instead_of_corrupted() {
     let dir = tempfile::tempdir().unwrap();
     SessionStore::open(dir.path()).unwrap();
     {
-        let conn = Connection::open(dir.path().join(".smith/sessions.db")).unwrap();
+        let conn = Connection::open(dir.path().join("sessions.db")).unwrap();
         conn.execute(
                 "INSERT INTO schema_version (version, name, applied_at) VALUES (?1, 'from-the-future', 0)",
                 params![SCHEMA_VERSION + 5],

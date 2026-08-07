@@ -157,16 +157,20 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Resu
     stmt.exists(params![table, column])
 }
 
-/// Per-project conversation history, stored at `<project>/.smith/sessions.db`.
-/// Global config/secrets live separately in `~/.smith/config.toml`.
+/// One project's conversation history.
+///
+/// `open` takes the directory the database lives in and puts `sessions.db`
+/// straight into it — it does not know, and must not know, whether that is
+/// under the project or under `~/.smith/projects/`. Deciding where a thing
+/// lives is `smith-config`'s job (`project_store_dir`); this is the adapter
+/// that reads and writes it.
 pub struct SessionStore {
     conn: Connection,
 }
 
 impl SessionStore {
-    pub fn open(project_dir: &Path) -> Result<Self, SessionError> {
-        let dir = project_dir.join(".smith");
-        std::fs::create_dir_all(&dir)?;
+    pub fn open(dir: &Path) -> Result<Self, SessionError> {
+        std::fs::create_dir_all(dir)?;
         let conn = Connection::open(dir.join("sessions.db"))?;
         Self::migrate(&conn)?;
         Ok(Self { conn })

@@ -35,7 +35,7 @@ struct Run {
 /// Runs the real `smith` binary with a hermetic environment and `input` on
 /// stdin. stdout and stderr are pipes, which is also what makes this a no-TTY
 /// run.
-fn smith(args: &[&str], input: &str) -> (Run, tempfile::TempDir) {
+fn smith(args: &[&str], input: &str) -> (Run, tempfile::TempDir, tempfile::TempDir) {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
@@ -71,6 +71,7 @@ fn smith(args: &[&str], input: &str) -> (Run, tempfile::TempDir) {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         },
         project,
+        home,
     )
 }
 
@@ -82,7 +83,7 @@ fn smith(args: &[&str], input: &str) -> (Run, tempfile::TempDir) {
 /// the missing key is the instrument.
 #[test]
 fn a_piped_prompt_is_read_and_the_run_gets_as_far_as_the_provider() {
-    let (run, _project) = smith(
+    let (run, _project, _home) = smith(
         &["--provider", "anthropic", "-p", "diagnose this"],
         "thread 'main' panicked\n",
     );
@@ -100,7 +101,7 @@ fn a_piped_prompt_is_read_and_the_run_gets_as_far_as_the_provider() {
 /// actually read rather than the flag defaulting somewhere.
 #[test]
 fn stdin_alone_supplies_the_prompt() {
-    let (run, _project) = smith(&["--provider", "anthropic"], "explain this repository\n");
+    let (run, _project, _home) = smith(&["--provider", "anthropic"], "explain this repository\n");
 
     assert_eq!(run.code, EXIT_USAGE, "stderr: {}", run.stderr);
     assert!(
@@ -114,7 +115,7 @@ fn stdin_alone_supplies_the_prompt() {
 /// is no prompt", instead of blocking on a terminal that isn't there.
 #[test]
 fn an_empty_pipe_and_no_flag_is_a_usage_error_not_a_hang() {
-    let (run, _project) = smith(&["--provider", "anthropic"], "");
+    let (run, _project, _home) = smith(&["--provider", "anthropic"], "");
 
     assert_eq!(run.code, EXIT_USAGE, "stderr: {}", run.stderr);
     assert!(run.stderr.contains("no prompt"), "stderr: {}", run.stderr);
@@ -126,7 +127,7 @@ fn an_empty_pipe_and_no_flag_is_a_usage_error_not_a_hang() {
 /// cannot arrive — a CI job that hangs until its timeout.
 #[test]
 fn a_non_terminal_stdout_never_starts_the_tui() {
-    let (run, _project) = smith(&[], "hello");
+    let (run, _project, _home) = smith(&[], "hello");
 
     // The alternate-screen switch is the TUI's first act; a single escape
     // byte anywhere on stdout means it started.
@@ -141,11 +142,25 @@ fn a_non_terminal_stdout_never_starts_the_tui() {
 fn cwd_moves_the_project_directory_the_run_operates_on() {
     // Needs a provider for the same reason: the session store that creates
     // `.smith/` is only reached once the run has something to talk to.
-    let (_run, project) = smith(&["--provider", "anthropic", "-p", "hi"], "");
+    let (_run, project, home) = smith(&["--provider", "anthropic", "-p", "hi"], "");
 
+    // History moved to `~/.smith/projects/<name>-<hash>/`, so the proof that
+    // `--cwd` was honoured is a store keyed by *that* directory appearing
+    // under this run's isolated HOME — and, just as importantly, no `.smith/`
+    // left behind in the project itself.
+    let expected = home
+        .path()
+        .join(".smith")
+        .join("projects")
+        .join(smith_config::project_store_name(project.path()));
     assert!(
-        project.path().join(".smith").is_dir(),
-        "the run did not treat --cwd as its project directory"
+        expected.is_dir(),
+        "the run did not treat --cwd as its project directory: {} is missing",
+        expected.display()
+    );
+    assert!(
+        !project.path().join(".smith").join("sessions.db").exists(),
+        "session history must no longer be written into the project"
     );
 }
 
@@ -155,7 +170,7 @@ fn cwd_moves_the_project_directory_the_run_operates_on() {
 /// out, and it must never try to open an interactive menu on a pipe.
 #[test]
 fn a_first_run_without_a_terminal_explains_itself_instead_of_prompting() {
-    let (run, _project) = smith(&["-p", "hi"], "");
+    let (run, _project, _home) = smith(&["-p", "hi"], "");
 
     assert_eq!(run.code, EXIT_USAGE, "stderr: {}", run.stderr);
     assert!(

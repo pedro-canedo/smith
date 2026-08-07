@@ -28,7 +28,24 @@ All notable user-facing changes are tracked here.
   provider, so a gateway that only appears in the fallback chain is set up
   before a turn reaches for it rather than when one does.
 
+- **`smith uninstall`**, with `--yes` and `--keep-config`. Prints what it will
+  remove and how much of it there is before removing anything, refuses any path
+  that is not inside `~/.smith` or the running binary, and asks about your API
+  keys separately from everything else. Per-project `.smith/` directories are
+  named rather than hunted for: it prints the `find` that lists them and leaves
+  them alone.
+
 ### Changed
+
+- **Session history moved out of your projects.** It now lives in
+  `~/.smith/projects/<name>-<hash>/sessions.db` instead of
+  `<project>/.smith/sessions.db`, so running smith somewhere no longer leaves a
+  multi-megabyte database in that directory. It is still per project — another
+  project's conversations never appear in `/resume`. An existing database is
+  moved the first time you run smith in that project, and smith says so when it
+  does. What stays in `<project>/.smith/` is the data that *is* the project's:
+  `/rewind` checkpoints, staging, and the session scratch directory, which the
+  model is told about as a path inside the jail writes are confined to.
 
 - **A Node the machine already has is used when it is new enough.** smith
   checks the Node on `PATH` against 9router's own floor (`>=18`) instead of

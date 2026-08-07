@@ -952,11 +952,30 @@ async fn check_browser(config: &Config) -> Check {
 
 /// `.smith/` writability and the session DB's schema version.
 fn check_project_dir(cwd: &Path) -> (Check, Check) {
+    let store = match smith_config::project_store_dir(cwd) {
+        Ok(dir) => dir,
+        Err(e) => {
+            return (
+                Check::fail(
+                    ".smith dir",
+                    format!("cannot work out where ~/.smith lives: {e}"),
+                    "smith needs a home directory. Set HOME (or USERPROFILE on Windows).",
+                ),
+                Check::ok("session db", "not checked — see the line above"),
+            )
+        }
+    };
+    check_project_dir_at(cwd, &store)
+}
+
+/// Split from `check_project_dir` so tests can point the session store at a
+/// temporary directory instead of the real `~/.smith/projects/`.
+fn check_project_dir_at(cwd: &Path, store: &Path) -> (Check, Check) {
     let dir = cwd.join(".smith");
     match probe_writable(&dir) {
         Ok(()) => (
             Check::ok(".smith dir", format!("{} is writable", dir.display())),
-            check_session_db(cwd),
+            check_session_db(store),
         ),
         Err(e) => (
             Check::fail(
@@ -1012,26 +1031,26 @@ fn probe_writable(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn check_session_db(cwd: &Path) -> Check {
+fn check_session_db(dir: &Path) -> Check {
     // `SessionStore::open` *creates* the database and runs every migration
     // into it. In a normal run that is exactly right; in a diagnostic it means
     // asking "is the store healthy?" leaves a store behind in a project that
     // had none. A project with no history yet is a perfectly healthy state and
     // needs no file to prove it.
-    if !cwd.join(".smith").join("sessions.db").exists() {
+    if !dir.join("sessions.db").exists() {
         return Check::ok(
             "session db",
             "none yet — it is created on the first conversation in this project",
         );
     }
 
-    match smith_store::SessionStore::open(cwd) {
+    match smith_store::SessionStore::open(dir) {
         Ok(store) => match store.schema_version() {
             Ok(version) => Check::ok("session db", format!("schema version {version}")),
             Err(e) => Check::fail(
                 "session db",
                 format!("opened, but its schema version is unreadable: {e}"),
-                "The database may be corrupt. Move `.smith/sessions.db` aside — smith creates a \
+                "The database may be corrupt. Move the database aside — smith creates a \
                  fresh one. Past conversations in the old file are lost; nothing else is.",
             ),
         },
@@ -1047,10 +1066,10 @@ fn check_session_db(cwd: &Path) -> Check {
                 e.to_string(),
                 if too_new {
                     "This project's history was written by a newer smith. Upgrade smith to at \
-                     least that version. Only move `.smith/sessions.db` aside if you are willing \
+                     least that version. Only move the database aside if you are willing \
                      to lose that history — an upgrade would have read it."
                 } else {
-                    "Move `.smith/sessions.db` aside and re-run — smith creates a fresh store. If \
+                    "Move the database aside and re-run — smith creates a fresh store. If \
                      it fails again, `.smith/` itself is likely not writable."
                 },
             )

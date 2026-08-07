@@ -343,6 +343,105 @@ pub fn runtime_dir() -> Result<PathBuf, ConfigError> {
     Ok(config_dir()?.join("runtime"))
 }
 
+/// `~/.smith/projects/<name>-<hash>` — where one project's session history
+/// lives.
+///
+/// Central rather than `<project>/.smith/sessions.db`, so that running smith
+/// somewhere does not leave a multi-megabyte database in that directory
+/// forever. Still **per project**, not global: `/resume` listing another
+/// project's conversations would be worse than the tidiness is worth.
+///
+/// The directory name is the project's own basename followed by a hash of its
+/// absolute path — readable enough to find by eye, unique enough that two
+/// checkouts both called `api` do not share a history.
+///
+/// What stays behind in `<project>/.smith/` is everything that *is* project
+/// data: `/rewind` checkpoints and staging hold copies of the project's own
+/// files, and `scratch/` is announced to the model as a path inside the jail
+/// that `resolve` confines writes to. Moving those out would move a security
+/// boundary, not just a file.
+pub fn project_store_dir(project_dir: &std::path::Path) -> Result<PathBuf, ConfigError> {
+    Ok(config_dir()?
+        .join("projects")
+        .join(project_store_name(project_dir)))
+}
+
+/// The directory name on its own — split out so it is testable without a home
+/// directory for `config_dir` to find.
+pub fn project_store_name(project_dir: &std::path::Path) -> String {
+    // Canonical where possible so `/home/me/p` and a symlink to it are one
+    // project. A path that does not exist yet cannot be canonicalised, and
+    // falling back to it verbatim is right: it is the name the caller used.
+    let canonical =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "root".to_string());
+    let slug: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("{slug}-{:016x}", path_hash(&canonical.to_string_lossy()))
+}
+
+/// FNV-1a over the path.
+///
+/// Hand-rolled rather than `DefaultHasher`, whose output std explicitly does
+/// not promise to be stable across releases — and a hash that changes under
+/// people is a directory of orphaned histories. Not a cryptographic choice:
+/// nothing here defends against a chosen path, it only has to be stable and
+/// spread.
+fn path_hash(path: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+/// Moves a pre-existing `<project>/.smith/sessions.db` to where it now lives.
+///
+/// Called once, before the store is opened. Returns the path it moved *from*
+/// when it moved something, so the caller can say so — a session history that
+/// silently relocates looks identical to one that was lost.
+///
+/// Refuses to overwrite: if a central database already exists, the legacy file
+/// is left exactly where it is. Two histories is a situation someone can look
+/// at; one history overwritten by another is not.
+pub fn adopt_legacy_session_db(
+    project_dir: &std::path::Path,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let legacy = project_dir.join(".smith").join("sessions.db");
+    if !legacy.is_file() {
+        return Ok(None);
+    }
+    let target_dir = project_store_dir(project_dir)?;
+    adopt_into(&legacy, &target_dir)
+}
+
+/// The move itself, against an explicit destination so it can be tested.
+fn adopt_into(
+    legacy: &std::path::Path,
+    target_dir: &std::path::Path,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let target = target_dir.join("sessions.db");
+    if target.exists() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(target_dir)?;
+    // Rename first: it is atomic within a filesystem and cannot half-copy a
+    // database. `~/.smith` on another mount than the project is ordinary
+    // enough (an encrypted home, a network checkout) to need the fallback.
+    if std::fs::rename(legacy, &target).is_err() {
+        std::fs::copy(legacy, &target)?;
+        std::fs::remove_file(legacy)?;
+    }
+    Ok(Some(legacy.to_path_buf()))
+}
+
 impl Config {
     /// Global config only. Prefer `load_layered` — this exists for `save`,
     /// which must never write a project's values back into the global file.
@@ -1026,5 +1125,69 @@ mod tests {
         write_private_atomic(&path, "api_key = \"sk-secret\"\n").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "got {mode:o}");
+    }
+
+    // ---- where a project's history lives -----------------------------------
+
+    #[test]
+    fn two_projects_with_the_same_basename_do_not_share_a_history() {
+        // The reason the name carries a hash at all: `~/work/api` and
+        // `~/clients/acme/api` are both "api", and one silently reading the
+        // other's conversations would be worse than any tidiness gained.
+        let a = project_store_name(std::path::Path::new("/nowhere/work/api"));
+        let b = project_store_name(std::path::Path::new("/nowhere/clients/acme/api"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("api-"), "{a}");
+        assert!(b.starts_with("api-"), "{b}");
+    }
+
+    #[test]
+    fn the_same_project_always_lands_in_the_same_place() {
+        let path = std::path::Path::new("/nowhere/projetos/smith");
+        assert_eq!(project_store_name(path), project_store_name(path));
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_filename_is_made_into_one() {
+        let name = project_store_name(std::path::Path::new("/nowhere/my project (v2)"));
+        assert!(
+            name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "{name} must be safe as a directory name"
+        );
+    }
+
+    #[test]
+    fn adopting_moves_the_old_database_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.db");
+        std::fs::write(&legacy, b"history").unwrap();
+        let target_dir = dir.path().join("central");
+
+        let moved = adopt_into(&legacy, &target_dir).unwrap();
+        assert_eq!(moved.as_deref(), Some(legacy.as_path()));
+        assert!(!legacy.exists(), "the old file must be gone");
+        assert_eq!(
+            std::fs::read(target_dir.join("sessions.db")).unwrap(),
+            b"history"
+        );
+    }
+
+    #[test]
+    fn adopting_refuses_to_overwrite_a_history_that_is_already_there() {
+        // Two histories is a situation someone can look at; one overwritten by
+        // the other is not.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.db");
+        std::fs::write(&legacy, b"old").unwrap();
+        let target_dir = dir.path().join("central");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("sessions.db"), b"current").unwrap();
+
+        assert_eq!(adopt_into(&legacy, &target_dir).unwrap(), None);
+        assert!(legacy.exists(), "the legacy file must be left alone");
+        assert_eq!(
+            std::fs::read(target_dir.join("sessions.db")).unwrap(),
+            b"current"
+        );
     }
 }

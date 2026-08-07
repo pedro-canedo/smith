@@ -16,7 +16,14 @@ use super::*;
 /// silent success on the wrong one is unrecoverable.
 pub(crate) fn run_sessions(action: &SessionAction) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let mut store = match SessionStore::open(&cwd) {
+    let dir = match smith_config::project_store_dir(&cwd) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("smith: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut store = match SessionStore::open(&dir) {
         Ok(store) => store,
         Err(e) => {
             eprintln!("smith: could not open this project's session store: {e}");
