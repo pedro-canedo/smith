@@ -22,7 +22,7 @@ use super::Agent;
 /// a bare error would make the parent re-delegate the same task from scratch —
 /// paying twice for the half it already has. The note is what stops the parent
 /// mistaking a partial answer for a complete one.
-pub(crate) fn finish_subagent(report: subagent::ChildReport, cancelled: bool) -> ToolResult {
+pub(super) fn finish_subagent(report: subagent::ChildReport, cancelled: bool) -> ToolResult {
     let body = report.report.trim().to_string();
     if body.is_empty() {
         let reason = if cancelled || report.error.as_deref() == Some("cancelled") {

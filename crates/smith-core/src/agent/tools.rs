@@ -34,7 +34,7 @@ use super::{Agent, INTERCEPTED_TOOLS};
 ///   random, which is far worse than being a little slower.
 /// - Eight simultaneously-spinning tool cards is already the most a terminal
 ///   transcript can show without becoming noise.
-pub(crate) const MAX_CONCURRENT_TOOLS: usize = 8;
+pub(super) const MAX_CONCURRENT_TOOLS: usize = 8;
 
 impl Agent {
     #[allow(clippy::too_many_arguments)]

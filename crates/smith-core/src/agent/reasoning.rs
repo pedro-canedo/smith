@@ -39,7 +39,7 @@ enum TagScan {
 ///   lost upstream (consumed as a role marker by a chat template), so the
 ///   surrounding text is the model's real output and deleting it back to the
 ///   start of the message would throw away the reply.
-pub(crate) struct ReasoningFilter {
+pub(super) struct ReasoningFilter {
     /// Text held back because it may be the start of a tag or fence marker
     /// that continues in the next delta.
     buf: String,

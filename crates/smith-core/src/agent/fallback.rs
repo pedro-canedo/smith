@@ -9,7 +9,7 @@ use crate::message::ToolDefinition;
 /// before/after it. Uses a streaming JSON parser to find the object's end
 /// rather than hand-rolled brace counting, so it doesn't get confused by
 /// braces inside string values.
-pub(crate) fn find_fallback_tool_call(
+pub(super) fn find_fallback_tool_call(
     text: &str,
     known_tools: &[ToolDefinition],
 ) -> Option<(String, serde_json::Value, String, String)> {
@@ -145,7 +145,7 @@ fn is_segment_affix(name: &str, want: &str) -> bool {
 /// from names that have nothing to do with running a shell, and the cost of a
 /// false positive (an arbitrary tool executing) is unbounded while the benefit
 /// (recovering from a typo no observed model actually makes) is small.
-pub(crate) fn resolve_tool_name<'a>(
+pub(super) fn resolve_tool_name<'a>(
     written: &str,
     known: &'a [ToolDefinition],
 ) -> Option<&'a ToolDefinition> {
@@ -188,7 +188,7 @@ pub(crate) fn resolve_tool_name<'a>(
 /// The renaming is driven entirely by the schema each tool publishes, so it
 /// stays in this layer — `smith-tools` needs no per-tool alias table, and MCP
 /// tools nobody here has heard of get the same treatment.
-pub(crate) fn align_arguments(
+pub(super) fn align_arguments(
     def: &ToolDefinition,
     arguments: serde_json::Value,
 ) -> serde_json::Value {

@@ -27,7 +27,7 @@ pub(super) struct StreamOutcome {
 /// The `Usage` is returned as well as forwarded on the event channel: the
 /// caller needs it for context and cost accounting, and reading it back off a
 /// channel it also owns would be a race.
-pub(crate) async fn consume_stream(
+pub(super) async fn consume_stream(
     mut stream: futures::stream::BoxStream<
         'static,
         Result<StreamEvent, crate::provider::ProviderError>,
