@@ -64,6 +64,18 @@ impl OllamaModel {
     }
 }
 
+/// Whether a model name refers to a cloud model.
+///
+/// Two spellings, both real: a model with no tag takes `:cloud`
+/// (`nemotron-3-super:cloud`), and one that already has a tag takes `-cloud`
+/// on the end of it (`gpt-oss:120b-cloud`). Reading only the first form
+/// classifies half the catalogue as local, and "local" is what decides
+/// whether smith tries to download weights that do not exist and whether it
+/// distrusts the advertised context window.
+pub fn is_cloud_name(name: &str) -> bool {
+    name.ends_with(":cloud") || name.ends_with("-cloud")
+}
+
 /// `262144` -> `262k`, `1048576` -> `1.0M`. Mirrors the context gauge's
 /// `compact`, which the user already reads in the sidebar.
 fn compact_tokens(n: u32) -> String {
@@ -120,8 +132,7 @@ pub fn parse_ollama_tags(body: &serde_json::Value) -> Vec<OllamaModel> {
             // one must not silently reclassify every cloud model as local,
             // because that decides whether smith trusts the advertised
             // context window.
-            is_cloud: e.remote_host.is_some_and(|h| !h.trim().is_empty())
-                || e.name.ends_with(":cloud"),
+            is_cloud: e.remote_host.is_some_and(|h| !h.trim().is_empty()) || is_cloud_name(&e.name),
             // A cloud entry's `size` is a placeholder of a few hundred bytes,
             // which is why `summary` only shows it for local models.
             size_bytes: e.size,

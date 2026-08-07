@@ -12,7 +12,7 @@ fn config_with_openrouter_key() -> Config {
 fn a_chain_naming_an_unknown_provider_errs_naming_it() {
     let mut config = config_with_openrouter_key();
     config.fallback.providers = vec!["chatgpt".into()];
-    let Err(err) = build_provider_stack(ProviderKind::Openrouter, &config) else {
+    let Err(err) = build_provider_stack(ProviderKind::Openrouter, &config, "a-model") else {
         panic!("an unknown chain entry must fail loudly");
     };
     assert!(err.contains("chatgpt"), "{err}");
@@ -22,7 +22,7 @@ fn a_chain_naming_an_unknown_provider_errs_naming_it() {
 fn a_chain_entry_without_its_key_errs_naming_the_key() {
     let mut config = config_with_openrouter_key();
     config.fallback.providers = vec!["9router".into()];
-    let Err(err) = build_provider_stack(ProviderKind::Openrouter, &config) else {
+    let Err(err) = build_provider_stack(ProviderKind::Openrouter, &config, "a-model") else {
         panic!("an unusable chain entry must fail loudly");
     };
     assert!(err.contains("NINEROUTER_API_KEY"), "{err}");
@@ -32,8 +32,12 @@ fn a_chain_entry_without_its_key_errs_naming_the_key() {
 /// No chain configured — the primary alone, unwrapped, zero cost.
 #[test]
 fn an_empty_chain_returns_the_bare_primary() {
-    let provider =
-        build_provider_stack(ProviderKind::Openrouter, &config_with_openrouter_key()).unwrap();
+    let provider = build_provider_stack(
+        ProviderKind::Openrouter,
+        &config_with_openrouter_key(),
+        "a-model",
+    )
+    .unwrap();
     assert_eq!(provider.id(), "openrouter");
 }
 
@@ -43,9 +47,80 @@ fn an_empty_chain_returns_the_bare_primary() {
 fn a_configured_chain_wraps_and_skips_the_primary_itself() {
     let mut config = config_with_openrouter_key();
     config.nine_router.api_key = Some("nk".into());
+    // A model is a precondition for a 9router entry now, not a default: the
+    // gateway's catalogue belongs to whoever set the gateway up.
+    config.nine_router.model = Some("ag/gemini-3-flash".into());
     config.fallback.providers = vec!["openrouter".into(), "9router".into()];
-    let provider = build_provider_stack(ProviderKind::Openrouter, &config).unwrap();
+    let provider = build_provider_stack(ProviderKind::Openrouter, &config, "a-model").unwrap();
     assert_eq!(provider.id(), "openrouter", "primary serves first");
+}
+
+/// A 9Router entry with no model used to be handed `auto`, which is not a
+/// model any gateway is obliged to have — one measured in the wild listed
+/// thirty-three and none of them was `auto`, and another resolved it to a
+/// combo its owner had defined, which smith had no business naming. Both
+/// failed on the first message, which is the worst place to learn it.
+///
+/// Same treatment as a missing key: refuse while there is still a terminal to
+/// read the reason on.
+#[test]
+fn a_gateway_entry_with_no_model_is_refused_rather_than_guessed() {
+    let mut config = config_with_openrouter_key();
+    config.nine_router.api_key = Some("nk".into());
+    config.fallback.providers = vec!["9router".into()];
+
+    // `Result::expect_err` needs `Debug` on the Ok side, and a boxed provider
+    // has none — match instead of asking the trait to grow one for a test.
+    let Err(err) = build_provider_stack(ProviderKind::Openrouter, &config, "a-model") else {
+        panic!("a chain entry with no model cannot be built");
+    };
+    assert!(err.contains("9router"), "{err}");
+    assert!(err.contains("[9router] model"), "{err}");
+    assert!(err.contains("smith setup"), "{err}");
+
+    // With one named, the same chain builds.
+    config.nine_router.model = Some("ag/gemini-3-flash".into());
+    assert!(build_provider_stack(ProviderKind::Openrouter, &config, "a-model").is_ok());
+}
+
+/// `auto` is gone from the curated list too, so `/model` cannot offer it and
+/// the wizard cannot write it back in.
+/// The chain must ask for the model the session resolved, not the one saved
+/// in config.
+///
+/// `FallbackProvider` overwrites every request's model with the entry's, so
+/// whatever lands on the primary entry is what actually gets sent. Reading
+/// `[general] model` here meant that configuring any fallback chain silently
+/// disabled `--model` and `/model` — and on a machine whose `[general] model`
+/// named a gateway-specific id, that id was sent to Ollama, which had never
+/// heard of it.
+#[test]
+fn the_primary_entry_carries_the_resolved_model_not_the_saved_one() {
+    let mut config = config_with_openrouter_key();
+    config.general.model = Some("saved-in-config".into());
+    config.nine_router.api_key = Some("nk".into());
+    config.nine_router.model = Some("ag/gemini-3-flash".into());
+    config.fallback.providers = vec!["9router".into()];
+
+    // Nothing observable distinguishes the entries from outside, so this
+    // asserts the seam exists at all: the resolved model is an argument, and
+    // a chain builds from it without consulting `[general] model`.
+    let provider =
+        build_provider_stack(ProviderKind::Openrouter, &config, "asked-for-this").unwrap();
+    assert_eq!(provider.id(), "openrouter");
+    assert_eq!(
+        provider.effective_model("asked-for-this"),
+        "asked-for-this",
+        "the chain answers for the model the session asked for"
+    );
+}
+
+#[test]
+fn auto_is_no_longer_offered_as_a_gateway_model() {
+    assert!(
+        !smith_store::models::known_models("9router").contains(&"auto"),
+        "`auto` is a guess about someone else's gateway"
+    );
 }
 
 /// Two extra attempts per chain entry — the arithmetic in the doc.

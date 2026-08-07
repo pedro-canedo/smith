@@ -58,8 +58,12 @@ impl ProviderKind {
             ProviderKind::Openai => "gpt-4.1",
             // Head of the curated free chain — see `smith_store::models`.
             ProviderKind::Openrouter => "nvidia/nemotron-3-ultra-550b-a55b:free",
-            // The gateway routes by its own prefixes; `auto` lets it pick.
-            ProviderKind::NineRouter => "auto",
+            // There is no honest default. A gateway serves whatever its owner
+            // configured, so any name smith invents is a guess — and the
+            // guess used to be `auto`, which gateways resolve to something
+            // local and then fail on. `build_provider_stack` refuses rather
+            // than reaching this.
+            ProviderKind::NineRouter => "",
             // Cloud, not a local weight. `llama3.2` was a model almost
             // nobody had pulled, so the last-resort default failed with "model
             // not found"; this one needs no download and no VRAM, and when it
@@ -174,9 +178,24 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
 /// silently skipping the entry — a fallback that quietly is not there is
 /// discovered at the worst possible moment, which is the one moment it was
 /// configured for.
+/// `model` is the **resolved** model for this session — `--model`, then
+/// `/model`, then `[general] model`, then the provider's default. It has to be
+/// passed in rather than read from config here, because `FallbackProvider`
+/// overwrites each request's model with the entry's
+/// (`fallback.rs`: `request.model = entry.model.clone()`), so whatever this
+/// function puts on the primary entry is what actually gets asked for.
+///
+/// It used to read `[general] model` and carried a comment claiming the
+/// request drove the primary and this was "a placeholder overwritten per
+/// request by the wrapper". The overwrite goes the other way. The effect was
+/// that configuring any fallback chain silently disabled `--model` and
+/// `/model`: a session asking for one model sent the name of another, and on
+/// a machine whose `[general] model` named a gateway-specific id, that name
+/// was sent to Ollama, which had never heard of it.
 pub fn build_provider_stack(
     kind: ProviderKind,
     config: &Config,
+    model: &str,
 ) -> Result<Arc<dyn LlmProvider>, String> {
     let primary = build_provider(kind, config)?;
     if config.fallback.providers.is_empty() {
@@ -185,13 +204,7 @@ pub fn build_provider_stack(
 
     let mut entries = vec![FallbackEntry {
         provider: primary,
-        // The request's own model field drives the primary; the placeholder
-        // is overwritten per request by the wrapper.
-        model: config
-            .general
-            .model
-            .clone()
-            .unwrap_or_else(|| kind.default_model().to_string()),
+        model: model.to_string(),
         label: kind.label().to_string(),
     }];
 
@@ -224,6 +237,19 @@ pub fn build_provider_stack(
             _ => None,
         }
         .unwrap_or_else(|| fallback_kind.default_model().to_string());
+
+        // An entry that would ask for a model nobody named is the same class
+        // of problem as one whose key is missing: it looks configured and
+        // fails on arrival. 9Router is the only provider with no honest
+        // default, because its catalogue belongs to whoever set up the
+        // gateway.
+        if model.is_empty() {
+            return Err(format!(
+                "[fallback] names `{name}`, but no model is set for it — add \
+                 `[9router] model` (run `smith setup` to pick one the gateway \
+                 actually lists), or remove it from the list"
+            ));
+        }
         entries.push(FallbackEntry {
             provider,
             model,
@@ -503,7 +529,7 @@ impl OrchestratorState {
             }
             None => self.provider_kind,
         };
-        let new_provider = build_provider_stack(new_kind, config)?;
+        let new_provider = build_provider_stack(new_kind, config, &model)?;
 
         let history = self.agent.history().to_vec();
         let permission_policy = self.agent.permission_policy();
@@ -767,7 +793,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
 
     let provider = match provider_override {
         Some(p) => p,
-        None => match build_provider_stack(provider_kind, &config) {
+        None => match build_provider_stack(provider_kind, &config, &model) {
             Ok(p) => p,
             Err(err) => {
                 let _ = event_tx.send(AgentEvent::Error(err));

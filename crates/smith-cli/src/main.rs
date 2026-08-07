@@ -850,8 +850,11 @@ async fn run_headless(cli: Cli) -> u8 {
     // Built here rather than inside the orchestrator so a missing API key is a
     // clean exit code and one line on stderr, instead of an `Error` event that
     // has to race the turn it prevented.
-    let provider = match orchestrator::build_provider_stack(startup.provider_kind, &startup.config)
-    {
+    let provider = match orchestrator::build_provider_stack(
+        startup.provider_kind,
+        &startup.config,
+        &startup.model,
+    ) {
         Ok(provider) => provider,
         Err(message) => {
             eprintln!("smith: {message}");

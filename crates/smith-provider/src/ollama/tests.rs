@@ -93,6 +93,22 @@ fn tool_support_is_read_from_the_capability_list() {
     assert!(model.summary().contains("NO TOOLS"), "{}", model.summary());
 }
 
+/// Two spellings, both real, and reading only one classifies half the
+/// catalogue as local — which is what decides whether smith tries to download
+/// weights that do not exist.
+#[test]
+fn both_spellings_of_a_cloud_name_are_recognised() {
+    assert!(is_cloud_name("nemotron-3-super:cloud"));
+    assert!(is_cloud_name("gpt-oss:120b-cloud"));
+    assert!(is_cloud_name("minimax-m3:cloud"));
+
+    assert!(!is_cloud_name("qwen3.5:9b"));
+    assert!(!is_cloud_name("llama3.3"));
+    // A name that merely mentions cloud is not one.
+    assert!(!is_cloud_name("cloudy-llama"));
+    assert!(!is_cloud_name("cloud"));
+}
+
 #[test]
 fn a_summary_says_what_the_row_needs_to_decide() {
     let cloud = by_name("nemotron-3-super:cloud").summary();
@@ -129,6 +145,26 @@ fn an_unreadable_body_yields_nothing_rather_than_an_error() {
 /// and it is a contract nobody promised us — when it changes, it changes here.
 const SUBSCRIPTION_BODY: &str = r#"{"error":{"message":"this model requires a subscription, upgrade for access: https://ollama.com/upgrade (ref: 01K9)","type":"api_error"}}"#;
 const UNAUTHORIZED_BODY: &str = r#"{"error":"Unauthorized"}"#;
+/// A third shape, found while measuring which cloud models are free: some ask
+/// for a plan *and* for extra usage on top, and the sentence never says
+/// "subscription". It is caught by the `upgrade for access` half of the match,
+/// which is the reason that half exists.
+const PLAN_AND_USAGE_BODY: &str = r#"{"error":{"message":"this model requires both a Pro, Max, or Team plan and extra usage (it does not use included plan usage), upgrade for access: https://ollama.com/upgrade then add extra usage: https://ollama.com/settings (ref: 53e9)","type":"api_error"}}"#;
+
+#[test]
+fn a_plan_plus_usage_refusal_is_still_an_entitlement_failure() {
+    let body: serde_json::Value = serde_json::from_str(PLAN_AND_USAGE_BODY).unwrap();
+    let message = error_in_success_body(&body).expect("an error hides in here");
+    assert!(
+        !message.to_ascii_lowercase().contains("subscription"),
+        "if this ever says `subscription` the test stops proving anything"
+    );
+    let err = classify_ollama_error(message);
+    let ProviderError::Api { status, .. } = err else {
+        panic!("an entitlement failure is an API error");
+    };
+    assert_eq!(status, 402, "the chain has to move past it, not retry it");
+}
 
 #[test]
 fn a_subscription_refusal_names_a_free_model_and_the_upgrade_page() {

@@ -95,10 +95,11 @@ async fn models(provider: Option<&str>) -> Result<Value, String> {
                 .ollama
                 .base_url
                 .unwrap_or_else(|| smith_config::DEFAULT_OLLAMA_BASE_URL.to_string());
-            smith_provider::ollama_tags(&base)
+            let live = smith_provider::ollama_tags(&base)
                 .await
-                .map_err(|e| e.to_string())?
-                .into_iter()
+                .map_err(|e| e.to_string())?;
+            let mut out: Vec<Value> = live
+                .iter()
                 .map(|m| {
                     json!({
                         "id": m.name,
@@ -107,7 +108,24 @@ async fn models(provider: Option<&str>) -> Result<Value, String> {
                         "tools": m.supports_tools,
                     })
                 })
-                .collect()
+                .collect();
+            // The daemon lists only what is pulled or linked, so a fresh
+            // install shows almost nothing — and the free cloud models are
+            // exactly what is worth offering there. Same merge the wizard
+            // does, and the live entry still wins a collision, because it
+            // carries the real window and the capability list.
+            for name in smith_store::models::OLLAMA_FREE_CLOUD_MODELS {
+                if live.iter().any(|m| m.name == *name) {
+                    continue;
+                }
+                out.push(json!({
+                    "id": name,
+                    "detail": format!("{name}  cloud · free tier"),
+                    "cloud": true,
+                    "tools": true,
+                }));
+            }
+            out
         }
         "9router" => {
             let base = config
