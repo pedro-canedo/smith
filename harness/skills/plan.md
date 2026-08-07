@@ -1,5 +1,5 @@
 ---
-description: Produce an approvable plan under /plan: explore read-only, numbered steps with files and risks, plain text.
+description: Produce a plan under /plan: explore read-only, ask the user 3-4 option questions, steps with files and risks.
 ---
 
 # Workflow
@@ -15,7 +15,16 @@ description: Produce an approvable plan under /plan: explore read-only, numbered
    paths.
 3. Identify the quality gates (test/lint/format commands) — the plan's last
    step is always running them.
-4. Write the plan, as plain text in your reply, with this shape:
+4. Make the user a co-author of the plan, not its audience. Before writing
+   it, surface the decisions that shape it — scope, approach, technology,
+   trade-offs the code alone cannot settle — as up to 3–4 `ask_user` calls,
+   each with three concrete options; put your recommendation first and mark
+   it "(recommended)". The UI always offers free text as a fourth path, so
+   the user can answer outside your options. Fold every answer into the
+   plan and attribute it ("per your choice, X"). Recommend, never decide
+   alone: a plan whose every decision was made by the agent is the agent's
+   plan, not the user's.
+5. Write the plan, as plain text in your reply, with this shape:
    - **Context** — one short paragraph: what is being changed and why.
    - **Steps** — numbered, each one concrete enough to execute without
      re-deciding: the file(s) touched, what changes in them, and how that
@@ -25,7 +34,7 @@ description: Produce an approvable plan under /plan: explore read-only, numbered
      assumption you could not verify read-only (name the assumption).
    - **Out of scope** — what you are deliberately not doing, so approval
      means the same thing to both sides.
-5. End the reply with the plan itself. No mutations of any kind while
+6. End the reply with the plan itself. No mutations of any kind while
    planning: the plan gate blocks them, and a plan that already started
    executing is not a plan.
 
@@ -46,6 +55,7 @@ description: Produce an approvable plan under /plan: explore read-only, numbered
   recommend.
 - If exploration shows the task is trivial (one obvious small edit), say so
   and propose the single step — padding a trivial change into a ceremony
-  wastes the user's approval on nothing.
+  wastes the user's approval on nothing. Scale the questions the same way:
+  "up to 3–4" means a real decision per question, never quota-filling.
 - If exploration shows the task is impossible or already done, that IS the
   plan's conclusion. Report it instead of planning around it.

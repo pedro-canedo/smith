@@ -59,6 +59,27 @@ description: Scaffold a new Rust, TypeScript, Python, or Go project: layout, too
 - Gates: `pytest`, `ruff check .`, `ruff format --check .`.
 - `.gitignore`: `.venv/`, `__pycache__/`, `dist/`.
 
+# Web frontend — default styling stack
+
+When the project is a web frontend (or the TypeScript project above renders
+UI), this is the default stack. Recommend it by name; depart from it only
+when the user asks for something else or the chosen framework forces it:
+
+- **Tailwind CSS v4** — the styling library. No hand-rolled CSS beyond the
+  Tailwind entry point.
+- **shadcn/ui** for components, built on **Radix UI** primitives —
+  accessibility (focus, keyboard, ARIA) comes from Radix; never rebuild it
+  by hand.
+- **class-variance-authority (CVA)** for component variants.
+- **tailwind-merge** + **clsx**, composed in the `cn()` helper (the
+  shadcn/ui idiom), for conditional and merged classes.
+- **Lucide React** for icons.
+- **Motion** (formerly Framer Motion) for animation — only where animation
+  is actually needed, not by default.
+
+In an existing project the project's own stack wins — survey first, as
+always; propose this stack only where nothing is established yet.
+
 # Go
 
 - `go mod init <module-path>` — ask for the module path if it's not implied

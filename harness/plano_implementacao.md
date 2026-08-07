@@ -15,6 +15,14 @@ Decisões já tomadas (com o usuário):
 - Templates de novo projeto para **Rust, TypeScript/Node, Python e Go**.
 - Skills também para os recursos do próprio smith: `plan`, `goal`, `loop`,
   `delegate`, `research`.
+- **Planejamento participativo**: em `/plan`, o agente estrutura até 3–4
+  perguntas via `ask_user` (3 opções concretas + texto livre, recomendação
+  marcada) antes de escrever o plano — recomenda, mas não decide tudo
+  sozinho. (Codificado na skill `plan`.)
+- **Stack padrão de front-end**: Tailwind CSS v4, shadcn/ui sobre Radix UI,
+  CVA, tailwind-merge + clsx (`cn()`), Lucide React, Motion quando
+  necessário. (Codificado na skill `new-project`; em projeto existente, a
+  stack do projeto vence.)
 
 Princípios que o desenho respeita:
 
