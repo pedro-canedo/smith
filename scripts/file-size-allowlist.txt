@@ -10,7 +10,3 @@
 # the entry least likely to be paid off, and splitting it into six files would
 # make the state machine harder to follow, not easier.
 crates/smith-tui/src/highlight.rs
-
-# Follows its module: the read-before-overwrite gate, the path jail and four
-# tools are tested together because they share the `ReadSet`.
-crates/smith-tools/src/fs_tools/tests.rs
