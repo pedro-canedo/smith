@@ -404,22 +404,144 @@ pub async fn provision_ninerouter(
     })
 }
 
+/// The oldest Node the gateway runs on, from 9router's own `engines` field
+/// (`{"node": ">=18.0.0"}`).
+///
+/// This is the *floor*, not the pin. `NODE_VERSION` above is what smith
+/// downloads when it has to supply Node itself; anything from here up is
+/// accepted when the machine already has one, because downloading fifty
+/// megabytes to replace a working Node 22 helps nobody.
+pub const MIN_NODE_MAJOR: u32 = 18;
+
+/// Where the Node that will run the gateway came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeSource {
+    /// `SMITH_NODE_PATH`; honoured verbatim, version unchecked.
+    Env,
+    /// `[runtime] node_path` — what smith provisioned.
+    Provisioned,
+    /// Found on `PATH`.
+    System,
+}
+
+#[derive(Debug, Clone)]
+pub struct FoundNode {
+    pub path: PathBuf,
+    pub source: NodeSource,
+    /// Major version it reported, or `None` when it would not answer
+    /// `--version` at all — a broken install, a shim, or a wrapper that needs
+    /// an interactive shell.
+    pub major: Option<u32>,
+}
+
+impl FoundNode {
+    /// Whether this Node can actually run the gateway.
+    ///
+    /// An `Env` override is taken at its word: it exists so someone can point
+    /// smith at a Node smith would not have picked, and second-guessing it
+    /// would defeat the point. Everything else has to prove its version.
+    pub fn usable(&self) -> bool {
+        self.source == NodeSource::Env || self.major.is_some_and(|m| m >= MIN_NODE_MAJOR)
+    }
+
+    pub fn describe(&self) -> String {
+        let version = match self.major {
+            Some(m) => format!("v{m}.x"),
+            None => "version unknown".to_string(),
+        };
+        let origin = match self.source {
+            NodeSource::Env => "SMITH_NODE_PATH",
+            NodeSource::Provisioned => "provisioned by smith",
+            NodeSource::System => "found on PATH",
+        };
+        format!("{version} ({origin}, {})", self.path.display())
+    }
+}
+
 /// The Node binary to use: env override → provisioned → PATH. Mirrors
 /// `runtime::find_browser`'s precedence for the same reasons.
+///
+/// Path only — it says nothing about whether that Node *works*. Callers that
+/// are about to run the gateway want [`resolve_node`], which probes the
+/// version; this stays for the places that only need to know whether a Node is
+/// configured at all.
 pub fn find_node(settings: &smith_config::RuntimeSettings) -> Option<PathBuf> {
+    candidates(settings).into_iter().map(|(p, _)| p).next()
+}
+
+fn candidates(settings: &smith_config::RuntimeSettings) -> Vec<(PathBuf, NodeSource)> {
+    let mut out = Vec::new();
     if let Some(path) = std::env::var_os("SMITH_NODE_PATH") {
         let path = PathBuf::from(path);
         if path.is_file() {
-            return Some(path);
+            out.push((path, NodeSource::Env));
         }
     }
     if let Some(path) = settings.node_path.as_deref() {
         let path = PathBuf::from(path);
         if path.is_file() {
-            return Some(path);
+            out.push((path, NodeSource::Provisioned));
         }
     }
-    which_node()
+    if let Some(path) = which_node() {
+        out.push((path, NodeSource::System));
+    }
+    out
+}
+
+/// The first Node in the precedence order that can run the gateway.
+///
+/// When none can, the *best* candidate comes back anyway with `usable()`
+/// false, so the caller can say "your Node is v16, the gateway needs 18" —
+/// which is a fixable problem — instead of "no Node found", which sends
+/// someone looking for a Node they already have.
+pub async fn resolve_node(settings: &smith_config::RuntimeSettings) -> Option<FoundNode> {
+    let mut best: Option<FoundNode> = None;
+    for (path, source) in candidates(settings) {
+        let major = node_major(&path).await;
+        let found = FoundNode {
+            path,
+            source,
+            major,
+        };
+        if found.usable() {
+            return Some(found);
+        }
+        if best.is_none() {
+            best = Some(found);
+        }
+    }
+    best
+}
+
+/// Asks a Node binary its version. `None` when it does not answer, which is
+/// as disqualifying as answering "v16" and is reported differently.
+pub async fn node_major(binary: &Path) -> Option<u32> {
+    let out = tokio::process::Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_node_major(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `v22.22.3` → `22`. Tolerant of the leading `v`, trailing newline, and the
+/// `-nightly…`/`-rc…` suffixes nodejs.org publishes.
+pub fn parse_node_major(reported: &str) -> Option<u32> {
+    reported
+        .trim()
+        .trim_start_matches('v')
+        .split(['.', '-'])
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn which_node() -> Option<PathBuf> {
@@ -507,9 +629,26 @@ pub async fn ensure_ninerouter_running(config: &Config) -> Result<(), String> {
         return Ok(());
     }
 
-    let node = find_node(&config.runtime).ok_or_else(|| {
-        "9router needs Node, and none is provisioned — run `smith setup`".to_string()
-    })?;
+    // Version-checked, not merely found. A Node too old to run the gateway
+    // used to be launched anyway, and the failure surfaced as whatever 9router
+    // happened to print — which is not a sentence anyone can act on.
+    let node = match resolve_node(&config.runtime).await {
+        Some(found) if found.usable() => found.path,
+        Some(found) => {
+            return Err(format!(
+                "9router needs Node {MIN_NODE_MAJOR} or newer; the one smith found is {}. \
+                 Run `smith setup` (or `smith doctor --fix`) and smith will download a \
+                 private Node {NODE_VERSION} for the gateway without touching this one.",
+                found.describe()
+            ))
+        }
+        None => {
+            return Err(format!(
+                "9router needs Node {MIN_NODE_MAJOR} or newer and none was found. \
+                 Run `smith setup` (or `smith doctor --fix`) to download a private one."
+            ))
+        }
+    };
     let cli = config
         .runtime
         .ninerouter_dir

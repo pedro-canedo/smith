@@ -176,12 +176,89 @@ impl Report {
 }
 
 /// Runs every check and prints the report. The only entry point `main` needs.
-pub async fn run() -> u8 {
+pub async fn run(fix: bool) -> u8 {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let config = Config::load_layered(&cwd).unwrap_or_default();
+    let mut config = Config::load_layered(&cwd).unwrap_or_default();
+    if fix {
+        if let Err(e) = fix_what_can_be_fixed(&mut config).await {
+            eprintln!("smith: {e}");
+            return 2;
+        }
+        // Re-read: `fix_what_can_be_fixed` wrote the global config, and the
+        // layered view it is diagnosed against has to include that write.
+        config = Config::load_layered(&cwd).unwrap_or_default();
+    }
     let report = diagnose(&cwd, &config).await;
     print!("{}", report.render(&redactor_for(&config)));
     report.exit_code()
+}
+
+/// `--fix`: install the missing pieces, then fall through to the ordinary
+/// diagnosis so the output still says what the state *is*.
+///
+/// Interactive only. A `--fix` in CI that quietly downloaded a Node, a
+/// gateway and a browser would be a surprise measured in hundreds of
+/// megabytes, and the flag is far too easy to add to a pipeline that only
+/// wanted the exit code.
+async fn fix_what_can_be_fixed(config: &mut Config) -> Result<(), String> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "`--fix` needs a terminal: it asks before every download. Run `smith setup` \
+             and pick Runtimes, or run this from an interactive shell."
+                .into(),
+        );
+    }
+
+    let needs = crate::preflight::survey(config).await;
+    if needs.is_empty() {
+        println!("Nothing to fix — everything this configuration needs is present.\n");
+        return Ok(());
+    }
+
+    let theme = dialoguer::theme::ColorfulTheme::default();
+    let mut changed = false;
+    for need in &needs {
+        match &need.fix {
+            crate::preflight::Fix::Manual { command } => {
+                println!("{} — smith cannot install this one.", need.name);
+                println!("  {}", need.detail);
+                println!("  Run:  {command}\n");
+            }
+            crate::preflight::Fix::Auto { .. } => {
+                println!("{} — {}", need.name, need.detail);
+                let approved = dialoguer::Confirm::with_theme(&theme)
+                    .with_prompt(format!("{}?", need.prompt()))
+                    .default(true)
+                    .interact_opt()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false);
+                if !approved {
+                    println!("  skipped\n");
+                    continue;
+                }
+                let mut out = Vec::new();
+                match crate::preflight::apply(config, need, &mut out).await {
+                    Ok(()) => {
+                        for line in out.iter().filter(|l| !l.is_empty()) {
+                            println!("  {line}");
+                        }
+                        println!();
+                        changed = true;
+                    }
+                    Err(e) => {
+                        println!("  failed: {e}\n");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if changed {
+        config.save().map_err(|e| e.to_string())?;
+    }
+    println!("--- re-checking ---\n");
+    Ok(())
 }
 
 /// Every credential this process can see, so none can reach stdout.
@@ -802,7 +879,7 @@ async fn check_ollama(config: &Config) -> Check {
     }
 }
 
-async fn ollama_daemon_reachable() -> bool {
+pub(crate) async fn ollama_daemon_reachable() -> bool {
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_millis(1500))
         .build()

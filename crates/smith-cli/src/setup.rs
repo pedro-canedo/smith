@@ -14,6 +14,8 @@
 //! manage. The only in-memory mutation is inside a section, and a section
 //! that is backed out of mutates nothing.
 
+mod preflight_section;
+
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -154,6 +156,10 @@ pub async fn run(jump_to_model: bool) -> color_eyre::Result<()> {
             items.push("Configure in a browser   (a page on this machine)".to_string());
         }
         items.extend([
+            format!(
+                "Runtimes           [{}]",
+                preflight_section::summary(&config).await
+            ),
             format!("Provider & model   [{}]", provider_summary(&config)),
             format!("Web search         [{}]", search_summary(&config)),
             format!("Browser            [{}]", browser_summary(&config)),
@@ -182,10 +188,11 @@ pub async fn run(jump_to_model: bool) -> color_eyre::Result<()> {
                 config = Config::load().unwrap_or_default();
                 false
             }
-            0 => section_provider(&theme, &mut config).await?,
-            1 => section_search(&theme, &mut config)?,
-            2 => section_browser(&theme, &mut config).await?,
-            3 => section_permissions(&theme, &mut config)?,
+            0 => preflight_section::run(&theme, &mut config).await?,
+            1 => section_provider(&theme, &mut config).await?,
+            2 => section_search(&theme, &mut config)?,
+            3 => section_browser(&theme, &mut config).await?,
+            4 => section_permissions(&theme, &mut config)?,
             _ => break, // Done.
         };
         if changed {

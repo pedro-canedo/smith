@@ -21,6 +21,7 @@ mod headless;
 mod logging;
 mod node_runtime;
 mod orchestrator;
+mod preflight;
 mod prompts;
 mod resources;
 mod runtime;
@@ -148,7 +149,13 @@ enum Commands {
     /// Check config, credentials, connectivity, runtimes, directory
     /// permissions and MCP servers. Exits non-zero if anything FAILs, so it
     /// can gate a CI job.
-    Doctor,
+    Doctor {
+        /// Install what is missing instead of only reporting it, asking
+        /// before each download. Refuses in a non-interactive shell rather
+        /// than fetching ~200 MB into somebody's CI job unasked.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Check for and install the latest published Smith release.
     Update,
 }
@@ -289,8 +296,8 @@ async fn main() -> ExitCode {
     // After `--cwd`, because the project config layer, `.smith/` and the
     // session store it inspects all hang off the working directory — doctor
     // has to be looking at the same project a real run would.
-    if let Some(Commands::Doctor) = &command {
-        return ExitCode::from(doctor::run().await);
+    if let Some(Commands::Doctor { fix }) = &command {
+        return ExitCode::from(doctor::run(*fix).await);
     }
 
     let headless = cli.is_headless(std::io::stdout().is_terminal());
