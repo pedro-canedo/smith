@@ -35,9 +35,12 @@
 //! # Cost when nothing is used
 //!
 //! The catalogue is listed in this tool's own `description`, so an unused
-//! skill costs one line and the whole feature costs one tool definition. With
-//! no skills at all the frontend does not register the tool, so the cost is
-//! exactly zero — see `smith_cli::orchestrator`.
+//! skill costs one line and the whole feature costs one tool definition.
+//! smith ships builtin skills (`smith_config::extend::skills`), so in
+//! practice the tool is always registered and the standing price is the
+//! catalogue — a dozen-odd lines, paid once per session via the prefix
+//! cache. The frontend still skips registration for an empty catalogue,
+//! which is reachable only if the builtins are ever compiled out.
 
 use crate::args::field_str;
 use async_trait::async_trait;

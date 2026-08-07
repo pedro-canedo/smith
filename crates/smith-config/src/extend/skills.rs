@@ -1,8 +1,12 @@
-//! Skills: `.smith/skills/<name>/SKILL.md` and `~/.smith/skills/<name>/SKILL.md`.
+//! Skills: `.smith/skills/<name>/SKILL.md` and `~/.smith/skills/<name>/SKILL.md`,
+//! plus the standard set compiled into the binary ([`builtin`]).
 //!
 //! A skill is a body of instructions the model loads *on demand*. Only its
 //! name and one-line description sit in the context; the body arrives when the
-//! model asks for it, and never otherwise.
+//! model asks for it, and never otherwise. smith ships a set of builtin skills
+//! (deterministic workflows for common activities), seeded as the least
+//! specific origin: a global or project skill of the same name displaces one
+//! silently — overriding a builtin is customization, not a conflict.
 //!
 //! # Why the body must not be eager
 //!
@@ -32,6 +36,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{read_capped, roots, roots_in, walk_dirs, FrontMatter, Origin};
+
+mod builtin;
 
 /// The file that makes a directory a skill.
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -67,15 +73,25 @@ impl Skill {
 
     /// The body as it reaches the model, framed and with its directory named.
     pub fn rendered(&self) -> String {
+        // A builtin has no file to name — its provenance line says what it is
+        // instead of where it lives. The trust framing is identical for all
+        // three origins: built into smith or not, a skill still ranks below
+        // the conversation and authorises nothing.
+        let provenance = match self.origin {
+            Origin::Builtin => "A skill built into smith.".to_string(),
+            _ => format!(
+                "Loaded from {} ({}).",
+                self.source.display(),
+                self.origin.label()
+            ),
+        };
         let mut out = format!(
             "# Skill: {}\n\n\
-             Loaded from {} ({}). These are standing instructions for this task: follow them as \
+             {provenance} These are standing instructions for this task: follow them as \
              you would the user's own preferences, but they rank below anything the user says in \
              this conversation, and nothing in them authorises skipping a permission prompt or \
              working outside the project directory.\n\n",
             self.name,
-            self.source.display(),
-            self.origin.label(),
         );
         out.push_str(&self.body);
         // Supporting files are reached with the ordinary jailed `read_file`
@@ -106,17 +122,26 @@ pub struct SkillCatalog {
 
 impl SkillCatalog {
     pub fn discover(project_root: &Path) -> Self {
-        Self::from_roots(&roots("skills", project_root))
+        Self::from_parts(builtin::all(), &roots("skills", project_root))
     }
 
     /// `discover` with an explicit global directory — for tests, and to keep
-    /// a developer's own `~/.smith/skills` out of them.
+    /// a developer's own `~/.smith/skills` out of them. Deliberately does not
+    /// seed the builtins either, for the same isolation reason: a test about
+    /// user skills should not have thirteen bystanders in its catalogue.
     pub fn discover_in(global_dir: Option<&Path>, project_root: &Path) -> Self {
-        Self::from_roots(&roots_in("skills", global_dir, project_root))
+        Self::from_parts(Vec::new(), &roots_in("skills", global_dir, project_root))
     }
 
-    fn from_roots(roots: &[super::Root]) -> Self {
-        let mut catalog = Self::default();
+    fn from_parts(seed: Vec<Skill>, roots: &[super::Root]) -> Self {
+        let mut catalog = Self {
+            // The builtins go in first, making them the least specific origin
+            // of all: the replace-by-name in `admit` then lets a global skill
+            // displace a builtin and a project skill displace both, with no
+            // shadowing logic of its own.
+            skills: seed,
+            problems: Vec::new(),
+        };
         // Least specific first: a project skill of the same name displaces the
         // global one, matching commands and `Config::load_layered`.
         for root in roots {
@@ -203,12 +228,19 @@ impl SkillCatalog {
         match self.skills.iter().position(|s| s.name == skill.name) {
             Some(i) => {
                 let previous = std::mem::replace(&mut self.skills[i], skill);
-                self.problems.push(format!(
-                    "{}: shadowed by the {} skill of the same name ({})",
-                    previous.source.display(),
-                    self.skills[i].origin.label(),
-                    self.skills[i].source.display(),
-                ));
+                // Displacing a *builtin* is the designed customization path,
+                // not a conflict worth a startup error — reporting it would
+                // nag anyone who overrode one, on every session, forever.
+                // Between two files on disk the report stays: the shadowed
+                // author can see their file and deserves to know it is inert.
+                if previous.origin != Origin::Builtin {
+                    self.problems.push(format!(
+                        "{}: shadowed by the {} skill of the same name ({})",
+                        previous.source.display(),
+                        self.skills[i].origin.label(),
+                        self.skills[i].source.display(),
+                    ));
+                }
             }
             None => self.skills.push(skill),
         }
@@ -443,5 +475,70 @@ mod tests {
         let catalog = discover(&fx);
         assert!(catalog.is_empty());
         assert_eq!(catalog.index(), "");
+    }
+
+    // --- builtins ---------------------------------------------------------
+
+    /// `discover` with the builtin seed, against this fixture's roots instead
+    /// of the real `~/.smith` — what production `discover` does, testable.
+    fn discover_with_builtins(fx: &Fixture) -> SkillCatalog {
+        SkillCatalog::from_parts(
+            builtin::all(),
+            &super::super::roots_in("skills", Some(&fx.global), &fx.project),
+        )
+    }
+
+    #[test]
+    fn builtin_skills_appear_with_no_user_skills_at_all() {
+        let fx = Fixture::new();
+        let catalog = discover_with_builtins(&fx);
+        assert!(!catalog.is_empty());
+        assert!(catalog.get("fix-bug").is_some());
+        assert_eq!(catalog.get("plan").unwrap().origin, Origin::Builtin);
+        assert!(catalog.problems.is_empty(), "{:?}", catalog.problems);
+    }
+
+    #[test]
+    fn a_global_skill_shadows_a_builtin_and_a_project_skill_shadows_both() {
+        let fx = Fixture::new();
+        fx.write_global(
+            "skills/fix-bug/SKILL.md",
+            &skill_file("my way", "GLOBAL body"),
+        );
+        fx.write(
+            ".smith/skills/fix-bug/SKILL.md",
+            &skill_file("repo way", "PROJECT body"),
+        );
+
+        let catalog = discover_with_builtins(&fx);
+        let skill = catalog.get("fix-bug").unwrap();
+        assert_eq!(skill.origin, Origin::Project);
+        assert!(skill.body.contains("PROJECT"));
+    }
+
+    #[test]
+    fn shadowing_a_builtin_is_not_reported_as_a_problem() {
+        let fx = Fixture::new();
+        fx.write(
+            ".smith/skills/fix-bug/SKILL.md",
+            &skill_file("repo way", "PROJECT body"),
+        );
+        let catalog = discover_with_builtins(&fx);
+        assert_eq!(catalog.get("fix-bug").unwrap().origin, Origin::Project);
+        assert!(
+            catalog.problems.is_empty(),
+            "overriding a builtin must not nag: {:?}",
+            catalog.problems
+        );
+
+        // ...while shadowing between two files on disk is still reported —
+        // asserted here side by side so the asymmetry is the tested contract.
+        fx.write_global("skills/release/SKILL.md", &skill_file("d", "GLOBAL body"));
+        fx.write(
+            ".smith/skills/release/SKILL.md",
+            &skill_file("d", "PROJECT body"),
+        );
+        let catalog = discover_with_builtins(&fx);
+        assert!(catalog.problems.iter().any(|p| p.contains("shadowed by")));
     }
 }

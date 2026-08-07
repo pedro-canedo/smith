@@ -118,10 +118,11 @@ pub(super) async fn wire(
     tools.replace(Arc::new(
         smith_tools::web_search::WebSearchTool::with_settings(web_search_settings(&config)),
     ));
-    // Skills, and the `skill` tool that discloses them. Registered *only* when
-    // there is at least one, so a user with no skills pays nothing at all —
-    // not even a tool definition. A broken SKILL.md costs its own skill and is
-    // reported, exactly like a broken subagent definition.
+    // Skills, and the `skill` tool that discloses them. The catalogue always
+    // holds at least the builtin set, so the tool is registered in practice
+    // on every session; the `is_empty` guard below is the fallback for a
+    // build with the builtins compiled out. A broken SKILL.md costs its own
+    // skill and is reported, exactly like a broken subagent definition.
     let project_dir = std::env::current_dir().unwrap_or_default();
     let skills = smith_config::SkillCatalog::discover(&project_dir);
     for problem in &skills.problems {

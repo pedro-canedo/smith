@@ -56,9 +56,13 @@ pub const MAX_FILES: usize = 128;
 /// `/a:b:c:d`, which nobody is typing.
 pub const MAX_TREE_DEPTH: usize = 4;
 
-/// Which of the two roots a file came from.
+/// Which of the two roots a file came from — or neither, for content
+/// compiled into the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
+    /// Embedded in smith itself via `include_str!`. Least specific of all:
+    /// a global or project file of the same name displaces it.
+    Builtin,
     /// `~/.smith/...` — the user's own, present in every project.
     Global,
     /// `<project>/.smith/...` — came with the repository.
@@ -68,6 +72,7 @@ pub enum Origin {
 impl Origin {
     pub fn label(self) -> &'static str {
         match self {
+            Origin::Builtin => "built-in",
             Origin::Global => "global",
             Origin::Project => "project",
         }
