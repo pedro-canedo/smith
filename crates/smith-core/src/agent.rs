@@ -513,9 +513,20 @@ impl Agent {
             }
         }
         if let Some(goal) = &self.goal {
-            parts.push(format!(
+            let mut text = format!(
                 "Current session goal: {goal}\nKeep this goal in mind and work toward it unless the user directs you otherwise."
-            ));
+            );
+            // The `goal` skill carries the tracking workflow (milestones,
+            // write_tasks, drift flagging). Conditioned on the tool actually
+            // being registered so this never names a tool that does not
+            // exist; the sentence itself is static, so the only volatility
+            // in this segment remains the goal text it already carries.
+            if self.tools.permission_class("skill").is_some() {
+                text.push_str(
+                    "\nIf you have not already this session, load the `goal` skill with the `skill` tool for how to track and report progress against this goal."
+                );
+            }
+            parts.push(text);
         }
         (!parts.is_empty()).then(|| parts.join("\n\n"))
     }

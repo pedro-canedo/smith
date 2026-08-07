@@ -326,6 +326,53 @@ fn effective_system_works_with_goal_but_no_base_system() {
         .contains("ship the login page"));
 }
 
+/// The goal segment points at the builtin `goal` skill — but only when a
+/// `skill` tool is actually registered, so the prompt never names a tool
+/// that does not exist (headless with a stripped registry, tests, forks
+/// with the builtins compiled out).
+#[test]
+fn the_goal_names_the_goal_skill_only_when_the_skill_tool_exists() {
+    // `fake_agent` runs on NoTools: no `skill` tool, no pointer.
+    let mut agent = fake_agent();
+    agent.set_goal(Some("ship the login page".to_string()));
+    let system = agent.effective_system().unwrap();
+    assert!(!system.contains("`goal` skill"), "{system}");
+
+    struct SkillOnly;
+    #[async_trait]
+    impl ToolExecutor for SkillOnly {
+        fn tool_defs(&self) -> Vec<ToolDefinition> {
+            Vec::new()
+        }
+        fn permission_class(&self, name: &str) -> Option<PermissionClass> {
+            (name == "skill").then_some(PermissionClass::ReadOnly)
+        }
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+            _cancel: CancellationToken,
+        ) -> ToolResult {
+            ToolResult::error("not under test")
+        }
+    }
+    let mut agent = Agent::new(
+        Arc::new(ScriptedProvider::streams([])),
+        Arc::new(SkillOnly),
+        "fake-model".to_string(),
+        ToolContext::new(".", "test-session"),
+    );
+    agent.set_goal(Some("ship the login page".to_string()));
+    let system = agent.effective_system().unwrap();
+    assert!(system.contains("`goal` skill"), "{system}");
+    // The pointer belongs to the goal segment, behind the goal line itself.
+    assert!(
+        system.find("ship the login page").unwrap() < system.find("`goal` skill").unwrap(),
+        "{system}"
+    );
+}
+
 #[test]
 fn clearing_goal_reverts_to_base_system() {
     let mut agent = fake_agent().with_system("be concise");

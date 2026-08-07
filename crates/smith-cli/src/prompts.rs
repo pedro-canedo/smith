@@ -211,9 +211,28 @@ pub fn system_prompt_with(persona: Option<&Persona>) -> String {
     }
 }
 
+/// Builds the user message for a `/plan <task>` turn.
+///
+/// Names the builtin `plan` skill outright: the skill carries the planning
+/// workflow (explore read-only, involve the user in the shaping decisions,
+/// end with plain text), and telling the model to load it is what makes the
+/// workflow deterministic instead of dependent on the model matching the
+/// catalogue line by itself.
+pub fn build_planning_prompt(description: &str) -> String {
+    format!(
+        "Planning request. First call the `skill` tool with name \"plan\" and follow its \
+         workflow. Produce a structured plan (numbered steps, risks, and affected files) for the \
+         following task. Do not write, edit, or execute anything yet — only use read-only tools \
+         if you need to inspect the codebase first, and end your reply with the plan as plain \
+         text.\n\nTask: {description}"
+    )
+}
+
 const BUILD_PLAN_PROMPT: &str = "\
 The plan below was approved in the UI. Do NOT ask for approval. \
 Do NOT call ask_user about proceeding. Call tools NOW to implement step 1. \
+The `plan` skill's \"After approval\" section governs this turn — load it with the `skill` tool \
+if you have not this session. \
 Prefer small steps: read before edit, verify each result. \
 Only use ask_user if a concrete implementation choice is ambiguous (then give three options).
 
@@ -227,8 +246,9 @@ const BUILD_PLAN_FOOTER: &str = "\n\nStart with the first concrete tool call.";
 pub const LOOP_DONE_SENTINEL: &str = "LOOP_DONE";
 
 pub const LOOP_CONTINUE_PROMPT: &str = "\
-Continue working on the loop task from where you left off. If it is now fully \
-complete, end your reply with the exact line `LOOP_DONE` on its own line.";
+Continue working on the loop task from where you left off, following the `loop` skill's \
+iteration cycle. If it is now fully complete, end your reply with the exact line `LOOP_DONE` \
+on its own line.";
 
 /// Builds the user message for a post-approval implementation turn.
 pub fn build_approved_plan_prompt(plan_text: &str) -> String {
@@ -255,8 +275,12 @@ pub fn last_assistant_plan_text(history: &[Message]) -> String {
 /// Builds the first-iteration prompt for a `/loop` task, instructing the
 /// model to keep working autonomously and self-report completion.
 pub fn build_loop_task_prompt(task: &str) -> String {
+    // The `loop` skill (builtin) holds the per-iteration cycle — verify the
+    // criterion with tools, one increment, verify, record state. Naming it
+    // makes the workflow deterministic instead of model-dependent.
     format!(
         "{task}\n\n\
+First call the `skill` tool with name \"loop\" and follow its iteration cycle. \
 Work on this using the available tools, across as many turns as it takes. \
 Once the task is fully complete, end your reply with the exact line `{LOOP_DONE_SENTINEL}` \
 on its own line — only once it is truly done, not before. Don't ask the user whether to \
@@ -286,6 +310,20 @@ mod build_prompt_tests {
         assert!(prompt.contains("1. Read foo"));
         assert!(prompt.contains("Do NOT ask for approval"));
         assert!(prompt.contains("Start with the first concrete tool call"));
+        // The post-approval half of the builtin `plan` skill governs this
+        // turn; the prompt must say so by name.
+        assert!(prompt.contains("`plan` skill"));
+    }
+
+    /// The determinism hook: `/plan` does not hope the model matches the
+    /// skill catalogue on its own — the prompt names the skill outright.
+    #[test]
+    fn planning_prompt_names_the_plan_skill_and_the_task() {
+        let prompt = super::build_planning_prompt("add retry to the store");
+        assert!(prompt.contains("skill"));
+        assert!(prompt.contains("\"plan\""));
+        assert!(prompt.contains("add retry to the store"));
+        assert!(prompt.contains("Do not write, edit, or execute anything yet"));
     }
 
     #[test]
@@ -321,6 +359,10 @@ mod loop_prompt_tests {
         assert!(prompt.contains("fix the flaky test"));
         assert!(prompt.contains(LOOP_DONE_SENTINEL));
         assert!(prompt.contains("Don't ask the user whether to continue"));
+        // The determinism hook: both the first-iteration prompt and the
+        // continue prompt name the builtin `loop` skill.
+        assert!(prompt.contains("\"loop\""));
+        assert!(super::LOOP_CONTINUE_PROMPT.contains("`loop` skill"));
     }
 
     fn assistant(text: &str) -> Message {

@@ -143,9 +143,7 @@ pub(super) async fn run(
                 let permission_tx = permission_tx.clone();
                 let question_tx = question_tx.clone();
                 tokio::spawn(async move {
-                    let prompt = format!(
-                        "Planning request. Produce a structured plan (numbered steps, risks, and affected files) for the following task. Do not write, edit, or execute anything yet — only use read-only tools if you need to inspect the codebase first, and end your reply with the plan as plain text.\n\nTask: {description}"
-                    );
+                    let prompt = crate::prompts::build_planning_prompt(&description);
 
                     let mut guard = state.lock().await;
                     guard.agent.set_plan_gated(true);
