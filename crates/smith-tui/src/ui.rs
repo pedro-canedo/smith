@@ -80,13 +80,14 @@ fn transcript_panes(area: Rect) -> (Rect, Rect) {
     (content, gutter)
 }
 
-/// Draws the transcript and, beside it, how much of it is off screen.
+/// Draws the transcript and, around it, how much of it is off screen: the
+/// track in the gutter and the row counter over the bottom-right corner.
 fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let (content, gutter) = transcript_panes(area);
     draw_messages(frame, app, content);
     // Read back after the draw: `draw_messages` is what clamps `scroll` and
     // re-arms follow-the-tail, and the memo is what knows the height. Asking
-    // before it ran would put the bar one frame behind the text.
+    // before it ran would put the chrome one frame behind the text.
     let content_height = u16::try_from(app.transcript.total_height()).unwrap_or(u16::MAX);
     crate::components::scrollbar::vertical(
         frame,
@@ -96,6 +97,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         app.scroll,
         &app.theme.clone(),
     );
+    message::draw_position_pill(frame, app, content);
 }
 
 /// Rows each region of the vertical stack gets, allocated by priority rather

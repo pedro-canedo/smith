@@ -624,3 +624,48 @@ fn the_cursor_and_the_window_stay_inside_the_list() {
     assert_eq!(picker.selected, 0);
     assert_eq!(picker.scroll, 0);
 }
+
+/// A page is the pane, not a constant. Ten rows was most of a short
+/// terminal and a third of a tall one, so paging felt like a different key
+/// at every size.
+#[test]
+fn a_page_key_moves_by_the_panes_height_less_an_overlap() {
+    let mut app = test_app();
+    app.message_area = ratatui::layout::Rect::new(0, 0, 80, 30);
+    app.follow_bottom = false;
+    app.scroll = 100;
+
+    app.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+    assert_eq!(app.scroll, 100 - 28, "a page is height - 2 rows of overlap");
+
+    app.on_key(KeyCode::PageDown, KeyModifiers::NONE);
+    assert_eq!(app.scroll, 100);
+}
+
+/// Home and End belong to the caret while there is a prompt to move within
+/// — taking them outright would cost line editing to buy scrolling.
+#[test]
+fn home_and_end_reach_the_transcript_only_when_the_prompt_is_empty() {
+    let mut app = test_app();
+    app.follow_bottom = false;
+    app.scroll = 50;
+
+    app.on_key(KeyCode::Home, KeyModifiers::NONE);
+    assert_eq!(app.scroll, 0, "an empty prompt lets Home reach the top");
+
+    app.scroll = 50;
+    app.input.insert_str("a draft");
+    app.on_key(KeyCode::Home, KeyModifiers::NONE);
+    assert_eq!(app.scroll, 50, "Home moved the caret, not the transcript");
+
+    // ...and Ctrl takes them unconditionally, for typing and reading at once.
+    app.on_key(KeyCode::Home, KeyModifiers::CONTROL);
+    assert_eq!(app.scroll, 0);
+    assert!(!app.follow_bottom);
+
+    app.on_key(KeyCode::End, KeyModifiers::CONTROL);
+    assert!(
+        app.follow_bottom,
+        "End is re-arming the tail, not a big offset"
+    );
+}

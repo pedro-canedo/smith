@@ -678,6 +678,52 @@ impl App {
     /// every other pager in the user's shell already does.
     const WHEEL_ROWS: u16 = 3;
 
+    /// Rows one `PageUp`/`PageDown` moves: the transcript's own height, less
+    /// two rows kept as overlap.
+    ///
+    /// It used to be a flat 10 regardless of the pane, which is most of a
+    /// screen on a short terminal and a third of one on a tall display —
+    /// paging felt like a different key at every size. The overlap is what
+    /// makes a page turn readable: land exactly one screen on and the
+    /// sentence that straddled the seam is gone.
+    ///
+    /// `message_area` is whatever the last frame recorded, so before the
+    /// first draw this falls back to the old constant rather than to zero —
+    /// a page key that does nothing is worse than one that moves the wrong
+    /// distance once.
+    fn page_rows(&self) -> u16 {
+        match self.message_area.height {
+            0 => 10,
+            height => height.saturating_sub(2).max(1),
+        }
+    }
+
+    pub(crate) fn scroll_page_up(&mut self) {
+        self.follow_bottom = false;
+        self.scroll = self.scroll.saturating_sub(self.page_rows());
+    }
+
+    pub(crate) fn scroll_page_down(&mut self) {
+        // No `follow_bottom = true` here: the renderer re-arms it the moment
+        // the offset reaches the end, so setting it early would jump past
+        // whatever is between here and the tail.
+        self.scroll = self.scroll.saturating_add(self.page_rows());
+    }
+
+    pub(crate) fn scroll_to_top(&mut self) {
+        self.follow_bottom = false;
+        self.scroll = 0;
+    }
+
+    /// Back to the live edge.
+    ///
+    /// Expressed as re-arming follow-the-tail rather than as a large offset:
+    /// `App` does not know the document height — only the renderer does — so
+    /// "the bottom" is a state, not a number.
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        self.follow_bottom = true;
+    }
+
     /// Mouse input. Scrolling is the whole point; clicking selects the tool
     /// card under the pointer, which is the same selection `Ctrl+O` drives.
     pub fn on_mouse(&mut self, event: crossterm::event::MouseEvent) -> Option<Action> {

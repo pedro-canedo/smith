@@ -173,6 +173,10 @@ pub(super) fn draw_idle(frame: &mut Frame, app: &App, area: Rect) {
         "Enter send   Alt+Enter newline   Esc cancel   Ctrl+O pick a tool card   Ctrl+C ×2 quit",
         theme.disabled(),
     )));
+    lines.push(Line::from(Span::styled(
+        "PgUp/PgDn scroll   Home/End jump   Ctrl+B sidebar   Ctrl+L logs",
+        theme.disabled(),
+    )));
     lines.push(Line::from(""));
 
     match &app.idle_hint {

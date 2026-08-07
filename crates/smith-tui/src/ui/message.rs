@@ -76,8 +76,6 @@ pub(super) fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         verbose: app.verbose_tools,
         theme: app.theme.clone(),
     };
-    let ember = app.theme.ember;
-    let overlay = app.theme.overlay;
 
     app.transcript.sync(
         &app.lines,
@@ -133,26 +131,56 @@ pub(super) fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(Text::from(window)).wrap(Wrap { trim: false }),
         area,
     );
+}
 
-    // Jump pill — the user scrolled up to read history while the agent kept
-    // working; offer a visible way back to the live edge.
-    if !app.follow_bottom
-        && (app.waiting_on_assistant || app.in_flight_text.is_some())
-        && area.width > 20
-        && area.height > 2
-    {
-        let label = " ↓ new activity ";
-        let pill = Rect {
-            x: area.x + area.width.saturating_sub(label.chars().count() as u16 + 1),
-            y: area.y + area.height.saturating_sub(1),
-            width: label.chars().count() as u16,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(label, Style::default().fg(ember).bg(overlay))),
-            pill,
-        );
+/// The readout that sits over the bottom-right of the transcript once the
+/// user has left the live edge.
+///
+/// Shown whenever `follow_bottom` is off, because that is exactly when "how
+/// far up am I, and how do I get back" is the question. It used to appear
+/// only while a turn was in flight, so scrolling through history between
+/// turns had no readout at all — the scrollbar shows the *proportion* of the
+/// document on screen, never which row you are on.
+///
+/// Drawn by the caller rather than by `draw_messages`, alongside the
+/// scrollbar: both are chrome about the transcript rather than part of it,
+/// and `tests::legacy_draw_messages` compares the transcript itself cell for
+/// cell.
+pub(super) fn draw_position_pill(frame: &mut Frame, app: &App, area: Rect) {
+    if app.follow_bottom || area.width <= 20 || area.height <= 2 {
+        return;
     }
+    let total = app.transcript.total_height();
+    let position = format!(
+        " {}/{} ",
+        (app.scroll as usize + area.height as usize).min(total),
+        total
+    );
+    let label = if app.waiting_on_assistant || app.in_flight_text.is_some() {
+        // A live turn outranks the bare row count: new output is arriving off
+        // screen, and this is what says so.
+        if app.theme.unicode {
+            format!("{position}↓ new activity ")
+        } else {
+            format!("{position}v new activity ")
+        }
+    } else {
+        position
+    };
+    let width = (label.chars().count() as u16).min(area.width);
+    let pill = Rect {
+        x: area.x + area.width.saturating_sub(width),
+        y: area.y + area.height.saturating_sub(1),
+        width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            label,
+            Style::default().fg(app.theme.ember).bg(app.theme.overlay),
+        )),
+        pill,
+    );
 }
 
 /// Gutter drawn down the left of an assistant reply: a solid bar on the first

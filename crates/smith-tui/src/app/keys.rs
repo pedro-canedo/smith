@@ -429,6 +429,22 @@ impl App {
         let slash_nav = !hints.is_empty();
         let completing_file = self.completion_kind == CompletionKind::File;
 
+        // Ahead of the cascade, because these are the unconditional half of
+        // the pair: they must reach the transcript even mid-sentence.
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            match code {
+                KeyCode::Home => {
+                    self.scroll_to_top();
+                    return None;
+                }
+                KeyCode::End => {
+                    self.scroll_to_bottom();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         match code {
             KeyCode::Esc if self.waiting_on_assistant => Some(Action::CancelGeneration),
             KeyCode::Tab if slash_nav && completing_file => {
@@ -498,12 +514,24 @@ impl App {
                 None
             }
             KeyCode::PageUp => {
-                self.follow_bottom = false;
-                self.scroll = self.scroll.saturating_sub(10);
+                self.scroll_page_up();
                 None
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.scroll_page_down();
+                None
+            }
+            // Top and bottom of the transcript. `Home`/`End` belong to the
+            // caret whenever there is a prompt to move within — taking them
+            // outright would cost line editing to buy scrolling — so they
+            // cascade exactly as the arrows above do, and `Ctrl` takes them
+            // unconditionally for anyone typing and reading at once.
+            KeyCode::Home if self.input.is_empty() => {
+                self.scroll_to_top();
+                None
+            }
+            KeyCode::End if self.input.is_empty() => {
+                self.scroll_to_bottom();
                 None
             }
             KeyCode::Enter => {
