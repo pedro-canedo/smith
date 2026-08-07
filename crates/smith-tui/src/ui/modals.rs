@@ -6,13 +6,34 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::components::{chips, panel};
+use crate::components::{chips, panel, scrollbar};
 use crate::theme::Theme;
 
 use super::*;
 
 /// Floor for the permission popup: header, detail, key row and both borders.
 pub(super) const PERMISSION_MODAL_MIN_HEIGHT: u16 = 8;
+
+/// Outer height a bordered, padded `paragraph` needs at `outer_width`.
+///
+/// [`Paragraph::line_count`] wraps at exactly the width it is handed and adds
+/// only the block's *vertical* chrome — measured, not assumed: with
+/// `Borders::ALL` plus `Padding::horizontal(1)` it returns the same count as
+/// with the borders alone, so the horizontal half is entirely the caller's
+/// problem. Handing it the outer width therefore under-counts every line that
+/// wraps in the last columns, and an under-counted height is an under-counted
+/// `max_scroll` — a modal whose final rows cannot be scrolled to at all. That
+/// is the failure this function exists to make impossible to repeat.
+fn framed_height(paragraph: &Paragraph, outer_width: u16) -> u16 {
+    paragraph.line_count(framed_content_width(outer_width)) as u16
+}
+
+/// The width text actually wraps at inside a framed, padded box.
+fn framed_content_width(outer_width: u16) -> u16 {
+    outer_width
+        .saturating_sub(panel::framed_chrome_width())
+        .max(1)
+}
 
 pub(super) fn draw_permission_modal(
     frame: &mut Frame,
@@ -50,31 +71,23 @@ pub(super) fn draw_permission_modal(
     body_lines.push(Line::from(""));
     body_lines.push(Line::from(key_row));
 
-    let block = |scrollable: bool| {
-        let block = Block::default()
+    let block = || {
+        Block::default()
             .borders(Borders::ALL)
             .border_set(theme.block_border_set())
+            .padding(panel::block_padding())
             .title(Span::styled(
                 " permission requested ",
                 theme.warning().add_modifier(Modifier::BOLD),
             ))
-            .border_style(theme.warning());
-        if scrollable {
-            block.title_bottom(Span::styled(" ↑↓ / PgUp/PgDn scroll ", theme.disabled()))
-        } else {
-            block
-        }
+            .border_style(theme.warning())
     };
     let paragraph = Paragraph::new(Text::from(body_lines))
         .style(theme.raised_bg())
-        .block(block(false))
+        .block(block())
         .wrap(Wrap { trim: false });
 
-    // `line_count` takes the **outer** width and returns the **outer** height:
-    // it subtracts the block's borders itself before wrapping, and adds its two
-    // border rows back to the count. Handing it `inner_width` therefore wrapped
-    // the text at `width - 4` and over-counted every line that wrapped.
-    let content_height = paragraph.line_count(width) as u16;
+    let content_height = framed_height(&paragraph, width);
     let height = content_height
         .min(max_height)
         .max(PERMISSION_MODAL_MIN_HEIGHT)
@@ -90,12 +103,11 @@ pub(super) fn draw_permission_modal(
     };
 
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        paragraph
-            .block(block(max_scroll > 0))
-            .scroll((modal.scroll, 0)),
-        popup,
-    );
+    frame.render_widget(paragraph.block(block()).scroll((modal.scroll, 0)), popup);
+    // The scrollbar replaces the bottom-title hint: a track that shows both
+    // that there is more and *where* in it you are says strictly more than
+    // the words "PgUp/PgDn scroll", in the same zero rows.
+    scrollbar::vertical(frame, popup, content_height, height, modal.scroll, theme);
 }
 
 pub(super) fn draw_plan_modal(
@@ -120,15 +132,30 @@ pub(super) fn draw_plan_modal(
     body_lines.extend(crate::markdown::render(&modal.text, theme));
     body_lines.push(Line::from(""));
     body_lines.push(Line::from(key_row));
-    body_lines.push(Line::from(Span::styled(
-        "↑↓ / PgUp/PgDn scroll",
-        theme.disabled(),
-    )));
 
-    let height = (body_lines.len() as u16)
-        .saturating_add(2)
+    let paragraph = Paragraph::new(Text::from(body_lines))
+        .style(theme.raised_bg())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(theme.block_border_set())
+                .padding(panel::block_padding())
+                .title(Span::styled(" plan ready ", theme.plan_bold()))
+                .border_style(theme.plan()),
+        )
+        .wrap(Wrap { trim: false });
+
+    // Measured, not counted from `body_lines`: a plan is markdown, and its
+    // long rows wrap. Counting the unwrapped lines made a wrapped plan claim
+    // to be shorter than it renders, which is the same under-counted
+    // `max_scroll` `framed_height` exists to prevent.
+    let content_height = framed_height(&paragraph, width);
+    let height = content_height
         .min(max_height)
-        .max(10);
+        .max(10)
+        .min(area.height.max(1));
+    let max_scroll = content_height.saturating_sub(height);
+    modal.scroll = modal.scroll.min(max_scroll);
 
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -137,26 +164,9 @@ pub(super) fn draw_plan_modal(
         height,
     };
 
-    let paragraph = Paragraph::new(Text::from(body_lines))
-        .style(theme.raised_bg())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_set(theme.block_border_set())
-                .title(Span::styled(" plan ready ", theme.plan_bold()))
-                .border_style(theme.plan()),
-        )
-        .wrap(Wrap { trim: false });
-    // Both sides of this are *outer* measurements — see the note in
-    // `draw_permission_modal`. Mixing them was worth two rows of overscroll:
-    // `line_count` includes the two border rows, so subtracting the inner
-    // height let the plan scroll two lines past its own end into blank space.
-    let content_height = paragraph.line_count(width) as u16;
-    let max_scroll = content_height.saturating_sub(height);
-    modal.scroll = modal.scroll.min(max_scroll);
-
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph.scroll((modal.scroll, 0)), popup);
+    scrollbar::vertical(frame, popup, content_height, height, modal.scroll, theme);
 }
 
 pub(super) fn draw_question_modal(
@@ -229,24 +239,30 @@ pub(super) fn draw_question_modal(
     key_row.extend(chips::cancel_hint("Esc", "dismiss", theme));
     body_lines.push(Line::from(key_row));
 
-    let height = (body_lines.len() as u16).saturating_add(2).clamp(12, 20);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
     let paragraph = Paragraph::new(Text::from(body_lines))
         .style(theme.raised_bg())
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_set(theme.block_border_set())
+                .padding(panel::block_padding())
                 .title(Span::styled(" question ", theme.info_bold()))
                 .border_style(theme.info()),
         )
         .wrap(Wrap { trim: false });
+
+    // Measured rather than counted: this modal does not scroll, so a long
+    // prompt that wraps has to be given the rows it wraps into or its last
+    // option is simply not on screen — and the options are the whole point.
+    let height = framed_height(&paragraph, width)
+        .clamp(12, 20)
+        .min(area.height.max(1));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
 
     frame.render_widget(Clear, popup);
     frame.render_widget(paragraph, popup);

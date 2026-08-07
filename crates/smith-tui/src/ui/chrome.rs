@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::{App, IdleHint, Overlay, OverlayBody};
-use crate::components::panel;
+use crate::components::{panel, scrollbar};
 use crate::theme::Theme;
 
 use super::card::truncate_chars;
@@ -45,6 +45,7 @@ pub(super) fn draw_overlay(frame: &mut Frame, overlay: &mut Overlay, theme: &The
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(theme.block_border_set())
+        .padding(panel::block_padding())
         .border_style(theme.ember())
         .title(Span::styled(
             format!(" {} ", overlay.title),
@@ -121,22 +122,27 @@ pub(super) fn draw_overlay(frame: &mut Frame, overlay: &mut Overlay, theme: &The
     }
 
     if footer_rows > 0 {
-        let mut footer: Vec<Line<'static>> = overlay
+        let footer: Vec<Line<'static>> = overlay
             .footer
             .iter()
             .map(|f| Line::from(Span::styled(f.clone(), theme.disabled())))
             .collect();
-        // Only claimed when there is something below to reach: a scroll hint
-        // on a panel that fits is noise.
-        if max_scroll > 0 {
-            if let Some(first) = footer.first_mut() {
-                first
-                    .spans
-                    .push(Span::styled("  (scrollable)", theme.warning()));
-            }
-        }
         frame.render_widget(Paragraph::new(footer), footer_area);
     }
+
+    // Replaces the "(scrollable)" word the footer used to carry: the track
+    // says the same thing and also says *where*, and it says it beside the
+    // rows it is talking about rather than under them. Measured against the
+    // body's own viewport, which is a header row short of `body_area` for a
+    // table.
+    scrollbar::framed(
+        frame,
+        popup,
+        scrollable as u16,
+        visible as u16,
+        overlay.scroll,
+        theme,
+    );
 }
 
 pub(super) fn draw_idle(frame: &mut Frame, app: &App, area: Rect) {
@@ -379,6 +385,7 @@ pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_set(theme.block_border_set())
+            .padding(panel::block_padding())
             .title(title)
             .border_style(border),
     );

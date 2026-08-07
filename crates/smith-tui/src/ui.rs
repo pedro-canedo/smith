@@ -56,6 +56,48 @@ const MIN_GAUGE_WIDTH: u16 = 16;
 /// reasonable margin.
 const MAX_CONTENT_WIDTH: u16 = 100;
 
+/// Splits a transcript pane into the text column and the one-column gutter
+/// its scrollbar lives in.
+///
+/// The gutter is reserved whether or not a bar is currently drawn in it, and
+/// that is the whole point. Handing the column back whenever the content
+/// happens to fit would make the text width depend on the scroll state — and
+/// the render memo is keyed on width, so the entire transcript would re-wrap
+/// and every line on screen would shift sideways at the exact moment the
+/// content grew past the viewport, which is the moment the user is reading
+/// new output.
+///
+/// Splitting here rather than inside `draw_messages` keeps that function
+/// taking the rect it draws text into, which is what
+/// `tests::legacy_draw_messages` compares against cell for cell.
+fn transcript_panes(area: Rect) -> (Rect, Rect) {
+    let gutter_width = crate::components::scrollbar::SCROLLBAR_WIDTH;
+    if area.width <= gutter_width {
+        return (area, Rect { width: 0, ..area });
+    }
+    let [content, gutter] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(gutter_width)]).areas(area);
+    (content, gutter)
+}
+
+/// Draws the transcript and, beside it, how much of it is off screen.
+fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
+    let (content, gutter) = transcript_panes(area);
+    draw_messages(frame, app, content);
+    // Read back after the draw: `draw_messages` is what clamps `scroll` and
+    // re-arms follow-the-tail, and the memo is what knows the height. Asking
+    // before it ran would put the bar one frame behind the text.
+    let content_height = u16::try_from(app.transcript.total_height()).unwrap_or(u16::MAX);
+    crate::components::scrollbar::vertical(
+        frame,
+        gutter,
+        content_height,
+        content.height,
+        app.scroll,
+        &app.theme.clone(),
+    );
+}
+
 /// Rows each region of the vertical stack gets, allocated by priority rather
 /// than by position — see `docs/design-system.md` §3.3. Pure, so the 80x24
 /// contract is testable without a `Frame`.
@@ -203,14 +245,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, chat_area);
             frame.render_widget(Block::new().style(theme.base_bg()), chat_area);
         } else {
-            draw_messages(frame, app, clamp_width(chat_area, MAX_CONTENT_WIDTH));
+            draw_transcript(frame, app, clamp_width(chat_area, MAX_CONTENT_WIDTH));
         }
         draw_sidebar(frame, &*app, sidebar_area);
     } else if modal_open {
         frame.render_widget(Clear, message_area);
         frame.render_widget(Block::new().style(theme.base_bg()), message_area);
     } else {
-        draw_messages(frame, app, clamp_width(message_area, MAX_CONTENT_WIDTH));
+        draw_transcript(frame, app, clamp_width(message_area, MAX_CONTENT_WIDTH));
     }
 
     if layout.strip > 0 {

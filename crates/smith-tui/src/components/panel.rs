@@ -37,7 +37,23 @@ pub fn fill_line(spans: Vec<Span<'static>>, width: usize, bg: Style) -> Line<'st
 }
 
 /// Cells of padding between a box's border and its content, on each side.
-const BOX_PADDING: usize = 1;
+/// Columns of breathing room between a box's border and its text, per side.
+///
+/// One number for the hand-rolled boxes here and for the `ratatui::Padding`
+/// the framed blocks set, so a modal and a transcript bubble sitting on the
+/// same screen inset their text by the same amount.
+pub const BOX_PADDING: usize = 1;
+
+/// [`BOX_PADDING`] as a `ratatui` block padding.
+pub fn block_padding() -> ratatui::widgets::Padding {
+    ratatui::widgets::Padding::horizontal(BOX_PADDING as u16)
+}
+
+/// Columns a bordered, padded block spends on chrome — both borders and both
+/// pads. Subtract from an outer width to get the width text actually wraps at.
+pub const fn framed_chrome_width() -> u16 {
+    2 + 2 * BOX_PADDING as u16
+}
 
 /// A horizontal rule capping a box: `left` corner, a run of `─`, `right`
 /// corner. An optional label interrupts the rule just after the corner

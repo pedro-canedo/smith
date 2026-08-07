@@ -13,9 +13,12 @@ fn permission_modal_scrolls_through_a_long_detail_and_keeps_its_offset() {
 
     let first = screen_text(&terminal);
     assert!(first.contains("line-00"), "top of the command is missing");
+    // A clipped detail has to say it is clipped. The scrollbar carries that
+    // now — and unlike the words it replaced, it also says how far down the
+    // command the visible rows are.
     assert!(
-        first.contains("PgUp/PgDn"),
-        "a clipped detail must say it scrolls"
+        first.contains('█'),
+        "a clipped detail must show a scrollbar thumb"
     );
 
     for _ in 0..20 {

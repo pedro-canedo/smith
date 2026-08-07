@@ -231,3 +231,46 @@ fn follow_bottom_pins_to_the_live_edge_and_a_manual_scroll_holds() {
     buffer_of(72, 24, |f, area| draw_messages(f, &mut app, area));
     assert!(app.scroll > bottom);
 }
+
+/// The transcript's own track: it appears exactly when there is history off
+/// screen, and the gutter it lives in is reserved either way so the text
+/// never reflows as the content crosses the viewport height.
+#[test]
+fn the_transcript_shows_a_scrollbar_only_once_there_is_history_off_screen() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let short = {
+        let mut app = test_app();
+        app.lines
+            .push(ChatLine::new(ChatRole::Assistant, "uma linha".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        (screen_text(&terminal), app.message_area)
+    };
+    assert!(
+        !short.0.contains('█'),
+        "a transcript that fits must not claim to scroll:\n{}",
+        short.0
+    );
+
+    let long = {
+        let mut app = test_app();
+        long_transcript(&mut app, 30);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        (screen_text(&terminal), app.message_area)
+    };
+    assert!(
+        long.0.contains('█'),
+        "history off screen must show a track:\n{}",
+        long.0
+    );
+
+    // The pane is the same width in both — the gutter is reserved, not
+    // borrowed, so nothing re-wraps when the transcript outgrows the pane.
+    assert_eq!(
+        short.1.width, long.1.width,
+        "the text pane changed width with the scroll state"
+    );
+}

@@ -18,19 +18,30 @@ fn transcript_renders_bubble_borders_in_the_right_column() {
         "e a resposta do agente logo abaixo".to_string(),
     ));
 
-    // Narrow enough that the sidebar stays hidden, so the pane is the
-    // full width and the bubble must land flush against it.
+    // Narrow enough that the sidebar stays hidden, so the pane is the whole
+    // width bar the scrollbar gutter, and the bubble must land flush against
+    // that edge — the gutter is reserved whether or not a bar is drawn in it,
+    // so the pane's right edge does not move with the scroll state.
     let width = 60u16;
     let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
     terminal.draw(|f| draw(f, &mut app)).unwrap();
+    // Scoped to the transcript's own rect, which `draw_messages` records.
+    // Scanning the whole screen used to work only because the input box
+    // happened to close in the same column; it spans the full width, while
+    // the transcript stops short of the scrollbar gutter, so a screen-wide
+    // scan now tests two different panes against one edge.
+    let pane = app.message_area;
+    let last_text_column = pane.x + pane.width - 1;
     let buf = terminal.backend().buffer();
 
     let mut bubble_rows = 0;
-    for y in 0..24 {
-        if buf.cell(Position::new(0, y)).unwrap().symbol() == "│" {
+    for y in pane.y..pane.y + pane.height {
+        if buf.cell(Position::new(pane.x, y)).unwrap().symbol() == "│" {
             bubble_rows += 1;
             assert_eq!(
-                buf.cell(Position::new(width - 1, y)).unwrap().symbol(),
+                buf.cell(Position::new(last_text_column, y))
+                    .unwrap()
+                    .symbol(),
                 "│",
                 "row {y} opened a bubble but never closed it"
             );

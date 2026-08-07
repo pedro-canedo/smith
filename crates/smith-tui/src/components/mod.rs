@@ -6,4 +6,5 @@ pub mod diff;
 pub mod gauge;
 pub mod input;
 pub mod panel;
+pub mod scrollbar;
 pub mod wrap;

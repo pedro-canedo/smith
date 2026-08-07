@@ -627,9 +627,18 @@ impl Theme {
         }
     }
 
+    /// The border of every framed block — rounded where the terminal can draw
+    /// it.
+    ///
+    /// One set for all of them rather than a per-site choice: a screen where
+    /// the modal is rounded and the panel behind it is square reads as two
+    /// unrelated programs. The corners are the only thing that differs from
+    /// `PLAIN`, so the ascii fallback is unchanged — `+` was already the
+    /// corner there, and a font that lacks `╭` would leave a blank cell where
+    /// the frame turns.
     pub fn block_border_set(&self) -> symbols::border::Set<'static> {
         if self.unicode {
-            symbols::border::PLAIN
+            symbols::border::ROUNDED
         } else {
             symbols::border::Set {
                 top_left: "+",
@@ -641,6 +650,20 @@ impl Theme {
                 horizontal_top: "-",
                 horizontal_bottom: "-",
             }
+        }
+    }
+
+    /// Thumb and track cells of a scrollbar.
+    ///
+    /// No arrow caps are offered: they would cost the two rows that say most
+    /// about where you are — the very top and the very bottom of the track —
+    /// and they are not clickable, so they would look pressable and do
+    /// nothing.
+    pub fn scrollbar_symbols(&self) -> (&'static str, &'static str) {
+        if self.unicode {
+            ("█", "│")
+        } else {
+            ("#", "|")
         }
     }
 
