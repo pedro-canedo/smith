@@ -1485,3 +1485,118 @@ fn an_overlay_stays_inside_the_frame_at_80x24() {
     assert!(text.contains("session usage"), "{text}");
     assert!(text.is_ascii(), "non-ASCII glyph under an ASCII theme");
 }
+
+// ---- the /model picker -----------------------------------------------------
+
+fn picker(ids: &[(&str, &str, bool)], filter: &str, selected: usize) -> crate::app::ModelPicker {
+    crate::app::ModelPicker {
+        provider: "ollama".to_string(),
+        all: ids
+            .iter()
+            .map(|(id, detail, tools)| smith_core::ModelChoice {
+                id: (*id).to_string(),
+                detail: (*detail).to_string(),
+                supports_tools: *tools,
+            })
+            .collect(),
+        filter: filter.to_string(),
+        selected,
+        scroll: 0,
+    }
+}
+
+/// Renders into a real buffer and reads the cells back as rows, so a claim
+/// about what is on screen is a claim about what was painted.
+fn picker_rows(width: u16, height: u16, modal: &mut crate::app::ModelPicker) -> Vec<String> {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = Theme::ansi();
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| draw_model_picker(frame, modal, &theme, area))
+        .unwrap();
+    let cells: Vec<String> = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    cells
+        .chunks(width as usize)
+        .map(|row| row.concat())
+        .collect()
+}
+
+#[test]
+fn the_model_picker_shows_the_rows_and_what_to_press() {
+    let mut modal = picker(
+        &[
+            ("nemotron-3-super:cloud", "cloud · 262k ctx", true),
+            ("qwen3.5:9b", "6.6 GB", true),
+        ],
+        "",
+        0,
+    );
+    let text = picker_rows(80, 24, &mut modal).join("\n");
+
+    assert!(text.contains("ollama models"), "{text}");
+    assert!(text.contains("nemotron-3-super:cloud"), "{text}");
+    assert!(text.contains("262k ctx"), "{text}");
+    assert!(text.contains("type to filter"), "{text}");
+    assert!(text.contains("Enter"), "{text}");
+    assert!(text.contains("Esc"), "{text}");
+}
+
+/// A model that cannot call tools makes an agent that cannot open a file, and
+/// the failure would arrive a turn later. The row says so.
+#[test]
+fn a_model_without_tools_is_marked_on_its_row() {
+    let mut modal = picker(&[("embed-only", "", false)], "", 0);
+    let text = picker_rows(80, 24, &mut modal).join("\n");
+    assert!(text.contains("NO TOOLS"), "{text}");
+}
+
+/// The filter is echoed as typed, and only what survives it is drawn.
+#[test]
+fn the_filter_is_visible_and_the_list_follows_it() {
+    let mut modal = picker(
+        &[
+            ("gpt-oss:20b-cloud", "", true),
+            ("gemma4:31b-cloud", "", true),
+        ],
+        "gpt",
+        0,
+    );
+    let text = picker_rows(80, 24, &mut modal).join("\n");
+    assert!(text.contains("gpt-oss:20b-cloud"), "{text}");
+    assert!(!text.contains("gemma4"), "filtered out: {text}");
+}
+
+/// Acceptance criterion #7's terminal. A picker taller than the frame is one
+/// whose hint row cannot be read, and that row is where the way out is
+/// written.
+#[test]
+fn the_picker_fits_an_eighty_by_twentyfour_terminal() {
+    let many: Vec<(&str, &str, bool)> = (0..40)
+        .map(|_| ("openrouter/nvidia/nemotron-3-nano-30b-a3b:free", "", true))
+        .collect();
+    let mut modal = picker(&many, "", 0);
+    let rows = picker_rows(80, 24, &mut modal);
+
+    assert_eq!(rows.len(), 24);
+    for row in &rows {
+        assert!(
+            row.chars().count() <= 80,
+            "a row ran past the frame: {row:?}"
+        );
+    }
+    assert!(rows.join("\n").contains("Enter"), "the hint survived");
+}

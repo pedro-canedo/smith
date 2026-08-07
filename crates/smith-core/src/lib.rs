@@ -24,8 +24,9 @@ pub use agent::{
 pub use checkpoint::{Checkpointer, ConflictKind, RewindConflict, RewindReport, RewindStatus};
 pub use context::{carry_over, CarryOver, ContextUsage, COMPACT_THRESHOLD};
 pub use event::{
-    Action, AgentEvent, AgentPhase, LoopStopReason, PermissionDecision, PermissionRequest,
-    ProgressReporter, ResourceStats, Task, TaskStatus, TurnLimitKind, UserQuestion,
+    Action, AgentEvent, AgentPhase, LoopStopReason, ModelChoice, PermissionDecision,
+    PermissionRequest, ProgressReporter, ResourceStats, Task, TaskStatus, TurnLimitKind,
+    UserQuestion,
 };
 pub use hooks::{HookDefinition, HookEvent, HookSet};
 pub use mcp::{McpCommand, McpHealth, McpServerStatus, McpStatus};

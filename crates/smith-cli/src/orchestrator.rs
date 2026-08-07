@@ -58,8 +58,12 @@ impl ProviderKind {
             ProviderKind::Openai => "gpt-4.1",
             // Head of the curated free chain — see `smith_store::models`.
             ProviderKind::Openrouter => "nvidia/nemotron-3-ultra-550b-a55b:free",
-            // The gateway routes by its own prefixes; `auto` lets it pick.
-            ProviderKind::NineRouter => "auto",
+            // There is no honest default. A gateway serves whatever its owner
+            // configured, so any name smith invents is a guess — and the
+            // guess used to be `auto`, which gateways resolve to something
+            // local and then fail on. `build_provider_stack` refuses rather
+            // than reaching this.
+            ProviderKind::NineRouter => "",
             // Cloud, not a local weight. `llama3.2` was a model almost
             // nobody had pulled, so the last-resort default failed with "model
             // not found"; this one needs no download and no VRAM, and when it
@@ -174,9 +178,24 @@ pub fn build_provider(kind: ProviderKind, config: &Config) -> Result<Arc<dyn Llm
 /// silently skipping the entry — a fallback that quietly is not there is
 /// discovered at the worst possible moment, which is the one moment it was
 /// configured for.
+/// `model` is the **resolved** model for this session — `--model`, then
+/// `/model`, then `[general] model`, then the provider's default. It has to be
+/// passed in rather than read from config here, because `FallbackProvider`
+/// overwrites each request's model with the entry's
+/// (`fallback.rs`: `request.model = entry.model.clone()`), so whatever this
+/// function puts on the primary entry is what actually gets asked for.
+///
+/// It used to read `[general] model` and carried a comment claiming the
+/// request drove the primary and this was "a placeholder overwritten per
+/// request by the wrapper". The overwrite goes the other way. The effect was
+/// that configuring any fallback chain silently disabled `--model` and
+/// `/model`: a session asking for one model sent the name of another, and on
+/// a machine whose `[general] model` named a gateway-specific id, that name
+/// was sent to Ollama, which had never heard of it.
 pub fn build_provider_stack(
     kind: ProviderKind,
     config: &Config,
+    model: &str,
 ) -> Result<Arc<dyn LlmProvider>, String> {
     let primary = build_provider(kind, config)?;
     if config.fallback.providers.is_empty() {
@@ -185,13 +204,7 @@ pub fn build_provider_stack(
 
     let mut entries = vec![FallbackEntry {
         provider: primary,
-        // The request's own model field drives the primary; the placeholder
-        // is overwritten per request by the wrapper.
-        model: config
-            .general
-            .model
-            .clone()
-            .unwrap_or_else(|| kind.default_model().to_string()),
+        model: model.to_string(),
         label: kind.label().to_string(),
     }];
 
@@ -224,6 +237,19 @@ pub fn build_provider_stack(
             _ => None,
         }
         .unwrap_or_else(|| fallback_kind.default_model().to_string());
+
+        // An entry that would ask for a model nobody named is the same class
+        // of problem as one whose key is missing: it looks configured and
+        // fails on arrival. 9Router is the only provider with no honest
+        // default, because its catalogue belongs to whoever set up the
+        // gateway.
+        if model.is_empty() {
+            return Err(format!(
+                "[fallback] names `{name}`, but no model is set for it — add \
+                 `[9router] model` (run `smith setup` to pick one the gateway \
+                 actually lists), or remove it from the list"
+            ));
+        }
         entries.push(FallbackEntry {
             provider,
             model,
@@ -503,7 +529,7 @@ impl OrchestratorState {
             }
             None => self.provider_kind,
         };
-        let new_provider = build_provider_stack(new_kind, config)?;
+        let new_provider = build_provider_stack(new_kind, config, &model)?;
 
         let history = self.agent.history().to_vec();
         let permission_policy = self.agent.permission_policy();
@@ -767,7 +793,7 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
 
     let provider = match provider_override {
         Some(p) => p,
-        None => match build_provider_stack(provider_kind, &config) {
+        None => match build_provider_stack(provider_kind, &config, &model) {
             Ok(p) => p,
             Err(err) => {
                 let _ = event_tx.send(AgentEvent::Error(err));
@@ -979,6 +1005,20 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                 if let Ok(mut queue) = interjections.lock() {
                     queue.push_back(text);
                 }
+            }
+            Action::ListModels => {
+                // Spawned: a catalogue is a network call, and the action loop
+                // must keep answering Esc while it is in flight.
+                let config = config.clone();
+                let event_tx = event_tx.clone();
+                let provider = provider_kind;
+                tokio::spawn(async move {
+                    let models = live_models(provider, &config).await;
+                    let _ = event_tx.send(AgentEvent::ModelsAvailable {
+                        provider: provider.label().to_string(),
+                        models,
+                    });
+                });
             }
             Action::SwitchModel {
                 provider,
@@ -1281,3 +1321,70 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
 
 #[cfg(test)]
 mod tests;
+
+/// What a provider can run right now, for the `/model` picker.
+///
+/// Live where a live answer exists — an Ollama daemon lists what has been
+/// pulled, a 9Router gateway lists what its owner configured — and the
+/// curated list otherwise, because a catalogue call for the hosted providers
+/// needs the key and offering the shortlist costs nothing.
+///
+/// An empty result is not an error here. The frontend says "could not read
+/// the catalogue" and leaves the user able to type a name, which is strictly
+/// better than a picker that refuses to open.
+pub async fn live_models(kind: ProviderKind, config: &Config) -> Vec<smith_core::ModelChoice> {
+    let choice = |id: String, detail: String, supports_tools: bool| smith_core::ModelChoice {
+        id,
+        detail,
+        supports_tools,
+    };
+
+    match kind {
+        ProviderKind::Ollama => {
+            let base = config
+                .ollama
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_OLLAMA_BASE_URL.to_string());
+            let live = smith_provider::ollama_tags(&base).await.unwrap_or_default();
+            let mut out: Vec<smith_core::ModelChoice> = live
+                .iter()
+                .map(|m| {
+                    let detail = m.summary().trim_start_matches(&m.name).trim().to_string();
+                    choice(m.name.clone(), detail, m.supports_tools)
+                })
+                .collect();
+            // The daemon lists only what is pulled, so a fresh install shows
+            // almost nothing — and the free cloud models are exactly what is
+            // worth offering there. Same merge the wizard and the web UI do.
+            for name in smith_store::models::OLLAMA_FREE_CLOUD_MODELS {
+                if live.iter().any(|m| m.name == *name) {
+                    continue;
+                }
+                out.push(choice(
+                    (*name).to_string(),
+                    "cloud · free tier".to_string(),
+                    true,
+                ));
+            }
+            out
+        }
+        ProviderKind::NineRouter => {
+            let base = config
+                .nine_router
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
+            crate::node_runtime::ninerouter_upstreams(&base)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| choice(id, String::new(), true))
+                .collect()
+        }
+        other => smith_store::models::known_models(other.label())
+            .iter()
+            .map(|id| choice((*id).to_string(), String::new(), true))
+            .collect(),
+    }
+}

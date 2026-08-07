@@ -683,7 +683,7 @@ async fn setup_ollama(theme: &ColorfulTheme, config: &mut Config) -> color_eyre:
         .iter()
         .find(|m| m.name == model)
         .map(|m| m.is_cloud)
-        .unwrap_or_else(|| model.ends_with(":cloud"));
+        .unwrap_or_else(|| smith_provider::is_cloud_name(&model));
 
     if !is_cloud {
         println!("Pulling {model} (this can take a while)...");
@@ -722,20 +722,14 @@ fn pick_ollama_model(
     theme: &ColorfulTheme,
     live: &[smith_provider::OllamaModel],
 ) -> color_eyre::Result<Option<String>> {
-    if live.is_empty() {
+    let offered = ollama_choices(live);
+    if offered.is_empty() {
         println!("Could not read the local model list — showing the built-in one.");
         return select_model(theme, known_models("ollama"));
     }
 
-    // Cloud first: those are the ones that need no VRAM and no download, so
-    // they are what a machine that just installed ollama can actually run.
-    // Within each group, a model that cannot call tools sorts last — it is
-    // offered, but it is not what the cursor lands on.
-    let mut ordered: Vec<&smith_provider::OllamaModel> = live.iter().collect();
-    ordered.sort_by_key(|m| (!m.is_cloud, !m.supports_tools));
-
-    let mut items: Vec<String> = ordered.iter().map(|m| m.summary()).collect();
-    items.push("Other (type a model name)".to_string());
+    let mut items: Vec<String> = offered.iter().map(|c| c.label.clone()).collect();
+    items.push("Other (type a model name — it will be pulled if needed)".to_string());
 
     let Some(idx) = Select::with_theme(theme)
         .with_prompt("Model")
@@ -745,14 +739,56 @@ fn pick_ollama_model(
     else {
         return Ok(None);
     };
-    if idx == ordered.len() {
+    if idx == offered.len() {
         let custom: String = Input::with_theme(theme)
-            .with_prompt("Model name")
+            .with_prompt("Model name, e.g. `llama3.3` or `gpt-oss:20b-cloud`")
             .interact_text()?;
         let custom = custom.trim().to_string();
         return Ok((!custom.is_empty()).then_some(custom));
     }
-    Ok(Some(ordered[idx].name.clone()))
+    Ok(Some(offered[idx].name.clone()))
+}
+
+/// One row of the model picker.
+struct OllamaChoice {
+    name: String,
+    label: String,
+}
+
+/// What to offer for Ollama: what the daemon already has, plus the free cloud
+/// models it could reach.
+///
+/// The daemon only lists what has been pulled or linked, so a fresh install
+/// shows almost nothing — and the cloud models are exactly the ones worth
+/// offering there, because they need no VRAM and no download. They are merged
+/// in rather than replacing the live list, and the live entry wins on a
+/// collision, because a linked model comes with facts (its real window, its
+/// capabilities) that a name alone does not carry.
+fn ollama_choices(live: &[smith_provider::OllamaModel]) -> Vec<OllamaChoice> {
+    let mut out: Vec<OllamaChoice> = Vec::new();
+
+    // Cloud first: no VRAM, no download, so they are what a machine that just
+    // installed ollama can actually run. Within each group a model that
+    // cannot call tools sorts last — offered, but not where the cursor lands.
+    let mut ordered: Vec<&smith_provider::OllamaModel> = live.iter().collect();
+    ordered.sort_by_key(|m| (!m.is_cloud, !m.supports_tools));
+    for model in ordered {
+        out.push(OllamaChoice {
+            name: model.name.clone(),
+            label: model.summary(),
+        });
+    }
+
+    for name in smith_store::models::OLLAMA_FREE_CLOUD_MODELS {
+        if out.iter().any(|c| c.name == *name) {
+            continue;
+        }
+        out.push(OllamaChoice {
+            name: (*name).to_string(),
+            label: format!("{name}  cloud · free tier"),
+        });
+    }
+    out
 }
 
 // ---- section: web search ----------------------------------------------------
@@ -1019,6 +1055,56 @@ async fn ollama_reachable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon lists only what has been pulled, so a fresh install shows
+    /// almost nothing — and the free cloud models are exactly what is worth
+    /// offering there, since they need no VRAM and no download.
+    #[test]
+    fn the_free_cloud_models_are_offered_even_when_nothing_is_pulled() {
+        let choices = ollama_choices(&[]);
+        assert_eq!(
+            choices.len(),
+            smith_store::models::OLLAMA_FREE_CLOUD_MODELS.len()
+        );
+        assert!(choices.iter().any(|c| c.name == "nemotron-3-super:cloud"));
+        assert!(choices.iter().all(|c| c.label.contains("free tier")));
+    }
+
+    /// A linked model comes with facts a name alone does not carry — its real
+    /// window, its capabilities — so the live entry wins the collision.
+    #[test]
+    fn a_linked_model_wins_over_the_curated_entry_of_the_same_name() {
+        let live = vec![smith_provider::OllamaModel {
+            name: "nemotron-3-super:cloud".to_string(),
+            is_cloud: true,
+            context_window: Some(262_144),
+            size_bytes: None,
+            supports_tools: true,
+        }];
+        let choices = ollama_choices(&live);
+        let matching: Vec<_> = choices
+            .iter()
+            .filter(|c| c.name == "nemotron-3-super:cloud")
+            .collect();
+        assert_eq!(matching.len(), 1, "offered twice");
+        assert!(
+            matching[0].label.contains("262k ctx"),
+            "the live entry lost its facts: {}",
+            matching[0].label
+        );
+    }
+
+    /// Every curated name has to be one smith recognises as cloud, or setup
+    /// would try to download weights for something that has none.
+    #[test]
+    fn every_curated_cloud_model_reads_as_cloud() {
+        for name in smith_store::models::OLLAMA_FREE_CLOUD_MODELS {
+            assert!(
+                smith_provider::is_cloud_name(name),
+                "{name} is curated as cloud but does not read as one"
+            );
+        }
+    }
 
     /// The browser row shifts every other row by one, which is exactly the
     /// kind of arithmetic that silently sends someone into the wrong section.

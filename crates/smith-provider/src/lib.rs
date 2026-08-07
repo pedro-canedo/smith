@@ -11,7 +11,7 @@ pub mod openai;
 
 pub use anthropic::AnthropicProvider;
 pub use fallback::{FallbackEntry, FallbackProvider};
-pub use ollama::{classify_ollama_error, ollama_tags, OllamaModel};
+pub use ollama::{classify_ollama_error, is_cloud_name, ollama_tags, OllamaModel};
 pub use openai::OpenAiProvider;
 
 /// TCP connect + TLS handshake. A healthy API endpoint completes this in well

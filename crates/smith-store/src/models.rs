@@ -21,10 +21,42 @@ pub const OPENROUTER_MODELS: &[&str] = &[
     "cohere/north-mini-code:free",
 ];
 
-/// 9Router routes by its own model prefixes; `auto` lets the gateway pick,
-/// which is the mode its own docs lead with.
-const NINEROUTER_MODELS: &[&str] = &["auto"];
+/// Deliberately empty: a 9Router gateway's models are whatever its owner
+/// configured in its dashboard, so there is no list to curate here.
+///
+/// This used to be `["auto"]`. No gateway is obliged to have a model by that
+/// name — one measured in the wild had thirty-three and none of them was
+/// `auto` — and asking for it made the gateway resolve it to whatever its
+/// owner had set up, which failed as `No active credentials` and, on another
+/// machine, as a user-defined combo that smith had no business naming. The
+/// catalogue is read from `GET /v1/models` instead.
+const NINEROUTER_MODELS: &[&str] = &[];
 const OPENAI_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3"];
+/// Ollama cloud models that answer on a **free** account, best first.
+///
+/// Cloud models are proxied by the local daemon, so they need no key from
+/// smith and no VRAM — but the account behind the daemon must be entitled to
+/// them, and most are not. There is no tier field anywhere: not in
+/// `ollama.com/api/tags`, not in `/v1/models`, not on the model page. The only
+/// way to know is to ask, and the refusal arrives as an error body.
+///
+/// So this list is measured, not read. Verified on 2026-08-06 by sending one
+/// token to each of the eighteen models the public catalogue listed: seven
+/// answered, eleven refused with "requires a subscription" or "requires both a
+/// Pro, Max, or Team plan". Entitlements move, which is why the wizard offers
+/// these alongside the live local catalogue and lets the refusal speak for
+/// itself rather than trusting this list blindly — the same arrangement
+/// `OPENROUTER_MODELS` has.
+pub const OLLAMA_FREE_CLOUD_MODELS: &[&str] = &[
+    "nemotron-3-ultra:cloud",
+    "nemotron-3-super:cloud",
+    "nemotron-3-nano:30b-cloud",
+    "gpt-oss:120b-cloud",
+    "gpt-oss:20b-cloud",
+    "gemma4:31b-cloud",
+    "minimax-m3:cloud",
+];
+
 /// Only the fallback for a daemon that did not answer — the wizard reads
 /// `/api/tags` first, because what a machine has pulled is a fact and this is
 /// a guess. Cloud models lead: they need no VRAM and no download, so they are
