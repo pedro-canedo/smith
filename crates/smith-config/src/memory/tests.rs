@@ -563,3 +563,109 @@ fn a_remembered_note_is_loaded_back_as_memory() {
     remember(&memory_path(&fx.root), "the build needs nightly").unwrap();
     assert!(load(&fx.scope("")).text.contains("the build needs nightly"));
 }
+
+// --- AGENTS.md fallback -----------------------------------------------
+
+#[test]
+fn agents_md_is_loaded_when_smith_md_is_absent() {
+    let fx = Fixture::new();
+    std::fs::write(
+        fx.global.join(FALLBACK_MEMORY_FILE_NAME),
+        "global agents rule",
+    )
+    .unwrap();
+    fx.write("AGENTS.md", "root agents rule");
+    fx.write("crates/a/AGENTS.md", "crate agents rule");
+
+    let text = load(&fx.scope("crates/a")).text;
+    assert!(text.contains("global agents rule"), "{text}");
+    assert!(text.contains("root agents rule"));
+    assert!(text.contains("crate agents rule"));
+}
+
+#[test]
+fn smith_md_wins_over_agents_md_in_the_same_directory() {
+    let fx = Fixture::new();
+    fx.write("SMITH.md", "SMITH RULE");
+    fx.write("AGENTS.md", "AGENTS RULE");
+
+    let text = load(&fx.scope("")).text;
+    assert!(text.contains("SMITH RULE"));
+    assert!(
+        !text.contains("AGENTS RULE"),
+        "both files of one layer loaded: {text}"
+    );
+}
+
+/// The fallback is per layer, not global: a nested dir with only an
+/// AGENTS.md still contributes even when the root has a SMITH.md.
+#[test]
+fn the_fallback_is_decided_layer_by_layer() {
+    let fx = Fixture::new();
+    fx.write("SMITH.md", "root smith rule");
+    fx.write("crates/a/AGENTS.md", "crate agents rule");
+
+    let text = load(&fx.scope("crates/a")).text;
+    assert!(text.contains("root smith rule"));
+    assert!(text.contains("crate agents rule"));
+}
+
+#[test]
+fn the_section_header_names_the_agents_file_that_was_loaded() {
+    let fx = Fixture::new();
+    fx.write("AGENTS.md", "agents rule");
+    let text = load(&fx.scope("")).text;
+    assert!(text.contains("AGENTS.md (project root)"), "{text}");
+}
+
+/// The fingerprint claim, asserted end to end: the cache watches the
+/// SMITH.md candidate even while serving the AGENTS.md, so creating one
+/// mid-session displaces the fallback on the next render.
+#[test]
+fn a_smith_md_created_mid_session_displaces_the_agents_md() {
+    let fx = Fixture::new();
+    fx.write("AGENTS.md", "AGENTS RULE");
+    let cache = MemoryCache::new(fx.scope(""));
+    assert!(cache.render().contains("AGENTS RULE"));
+
+    fx.write("SMITH.md", "SMITH RULE");
+    let text = cache.render();
+    assert!(text.contains("SMITH RULE"), "{text}");
+    assert!(!text.contains("AGENTS RULE"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_import_inside_agents_md_stays_jailed() {
+    let fx = Fixture::new();
+    let secret = fx.root.parent().unwrap().join("secret.md");
+    std::fs::write(&secret, "SSH KEY MATERIAL").unwrap();
+    fx.write("AGENTS.md", "@import ../secret.md\n");
+
+    let text = load(&fx.scope("")).text;
+    assert!(!text.contains("SSH KEY MATERIAL"), "{text}");
+    assert!(text.contains("skipped"), "{text}");
+}
+
+#[test]
+fn remember_seeds_an_import_of_an_existing_agents_md() {
+    let fx = Fixture::new();
+    fx.write("AGENTS.md", "existing agents rule");
+    remember(&memory_path(&fx.root), "new note").unwrap();
+
+    let written = std::fs::read_to_string(memory_path(&fx.root)).unwrap();
+    assert!(written.contains("@import AGENTS.md"), "{written}");
+    // ...and the loaded memory carries both the note and the imported rules,
+    // so /remember never silently deactivates the AGENTS.md it eclipsed.
+    let text = load(&fx.scope("")).text;
+    assert!(text.contains("new note"));
+    assert!(text.contains("existing agents rule"), "{text}");
+}
+
+#[test]
+fn remember_does_not_seed_an_import_when_there_is_no_agents_md() {
+    let fx = Fixture::new();
+    remember(&memory_path(&fx.root), "just a note").unwrap();
+    let written = std::fs::read_to_string(memory_path(&fx.root)).unwrap();
+    assert!(!written.contains("@import AGENTS.md"), "{written}");
+}
