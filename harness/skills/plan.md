@@ -18,6 +18,8 @@ description: Produce a plan under /plan: explore read-only, ask the user 3-4 opt
 4. Make the user a co-author of the plan, not its audience. Before writing
    it, surface the decisions that shape it — scope, approach, technology,
    trade-offs the code alone cannot settle — as up to 3–4 `ask_user` calls,
+   informed by the `choose-stack` skill when the decision is a technology
+   choice for new work,
    each with three concrete options; put your recommendation first and mark
    it "(recommended)". The UI always offers free text as a fourth path, so
    the user can answer outside your options. Fold every answer into the

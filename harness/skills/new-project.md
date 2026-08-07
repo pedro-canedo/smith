@@ -5,9 +5,12 @@ description: Scaffold a new Rust, TypeScript, Python, or Go project: layout, too
 # Common workflow (every language)
 
 1. Confirm the two facts everything depends on: the language and the project
-   name/purpose. If either is unstated, call `ask_user` once with three
-   concrete options. Confirm the target directory is empty or new —
-   `list_dir` first; never scaffold over existing files.
+   name/purpose. If the language or the wider stack is not yet chosen, load
+   the `choose-stack` skill first and settle it WITH the user (scenario
+   defaults, recommendation marked, their choice wins). If only the name is
+   missing, one `ask_user` with three concrete options. Confirm the target
+   directory is empty or new — `list_dir` first; never scaffold over
+   existing files.
 2. Create the structure for the chosen language (section below), using
    `write_file` for each file. Every file you create must be minimal and
    real — no placeholder lorem, no commented-out "examples", no empty dirs.

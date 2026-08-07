@@ -2,7 +2,7 @@
 
 Proposta completa da camada de harness: skills padrão embutidas no binário,
 suporte a `AGENTS.md`, regras de ouro no prompt e ganchos de determinismo para
-`/plan`, `/goal` e loop. Este documento é o passo a passo executável; as 12
+`/plan`, `/goal` e loop. Este documento é o passo a passo executável; as 13
 skills em `harness/skills/*.md` **já são os assets finais** — a implementação
 só as move para dentro do crate.
 
@@ -23,6 +23,14 @@ Decisões já tomadas (com o usuário):
   CVA, tailwind-merge + clsx (`cn()`), Lucide React, Motion quando
   necessário. (Codificado na skill `new-project`; em projeto existente, a
   stack do projeto vence.)
+- **Seleção de stack por cenário (2026)**: skill `choose-stack` com os
+  defaults por cenário (corporativo → ASP.NET Core/Go; startup/SaaS →
+  Next.js+Fastify+Prisma; alta performance → Rust+Axum; IA/agentes →
+  Python+FastAPI), ranking de linguagens de backend, stacks por linguagem e
+  defaults transversais (PostgreSQL, Redis, Kafka, OpenTelemetry, OAuth2/
+  OIDC, Docker/K8s). Sempre oferecida via `ask_user` com recomendação
+  marcada — o agente recomenda, o usuário decide; referenciada pelas skills
+  `plan` (passo 4) e `new-project` (passo 1).
 
 Princípios que o desenho respeita:
 
@@ -115,7 +123,7 @@ Budgets: turno = 50 rounds / 100 tool calls / 600 s
 
 ## Fase 1 — Mecanismo de skills embutidas
 
-**Objetivo:** as 12 skills de `harness/skills/` compiladas no binário,
+**Objetivo:** as 13 skills de `harness/skills/` compiladas no binário,
 aparecendo em qualquer sessão, shadowáveis por skills de usuário.
 
 ### Passos
@@ -125,7 +133,7 @@ aparecendo em qualquer sessão, shadowáveis por skills de usuário.
    existe `match` exaustivo sobre `Origin` no workspace — só `==` e
    `label()` — então o variant novo não quebra nada.
 2. **Assets**: criar `crates/smith-config/src/extend/skills/builtin/` e mover
-   para lá os 12 `.md` de `harness/skills/` (sem renomear: o nome do arquivo,
+   para lá os 13 `.md` de `harness/skills/` (sem renomear: o nome do arquivo,
    menos `.md`, é o nome da skill). O `scripts/check-file-size.sh` só varre
    `*.rs` (verificado no script), então os `.md` são isentos do cap de
    linhas.
@@ -166,7 +174,7 @@ aparecendo em qualquer sessão, shadowáveis por skills de usuário.
 
 ### Testes (in-module, convenção do repo)
 
-- `every_builtin_skill_parses_with_a_description_and_body` — as 12 carregam;
+- `every_builtin_skill_parses_with_a_description_and_body` — as 13 carregam;
   description presente e ≤ `MAX_DESCRIPTION_CHARS` (200); corpo não-vazio;
   nomes válidos (`[a-z0-9-_]`); corpos sob um teto de sanidade (~16 KB).
 - `builtin_skills_appear_with_no_user_skills_at_all`.
@@ -295,7 +303,7 @@ comportamentos medidos → re-rodar `evals/run.py` e commitar em
 
 1. Fase 1 com **uma** builtin placeholder + todos os testes de mecanismo
    (prova o seeding/shadowing/supressão antes de discutir conteúdo).
-2. As 12 skills movidas para os assets (commit só de conteúdo, validado pelo
+2. As 13 skills movidas para os assets (commit só de conteúdo, validado pelo
    teste de parse).
 3. Fase 2 (ganchos plan/goal/loop nos prompts internos).
 4. Fase 3 (AGENTS.md) — independente das anteriores, pode paralelizar.
@@ -307,7 +315,7 @@ Gates antes de cada commit: `cargo fmt --all -- --check` ·
 
 Verificação manual de ponta a ponta:
 
-- Diretório vazio → tool `skill` registrada com as 12 builtins no catálogo.
+- Diretório vazio → tool `skill` registrada com as 13 builtins no catálogo.
 - `.smith/skills/fix-bug/SKILL.md` local → shadowa a builtin **sem** linha de
   erro no startup.
 - Projeto só com `AGENTS.md` → bloco de memória o carrega, header o nomeia.
