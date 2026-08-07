@@ -104,10 +104,13 @@ fn a_custom_command_name_is_matched_case_insensitively() {
     }
 }
 
+/// `/model list` is what still prints, and it is the one that has to keep
+/// working without a provider round trip — bare `/model` now opens a picker
+/// (see `a_bare_model_command_asks_for_the_catalogue`).
 #[test]
-fn model_with_no_args_shows_info_and_emits_no_action() {
+fn model_list_shows_info_and_emits_no_action() {
     let mut app = test_app();
-    let action = app.run_slash_command("model");
+    let action = app.run_slash_command("model list");
     assert!(action.is_none());
     assert!(app
         .lines
@@ -2316,4 +2319,150 @@ fn a_rewind_report_lands_in_the_transcript_caveats_and_all() {
     assert!(text.contains("restore src/main.rs"), "{text}");
     assert!(text.contains("NOT COVERED"), "{text}");
     assert!(text.contains("/rewind 3 confirm"), "{text}");
+}
+
+// ---- the /model picker -----------------------------------------------------
+
+fn picker_app(models: &[(&str, bool)]) -> App {
+    let mut app = test_app();
+    app.on_agent_event(AgentEvent::ModelsAvailable {
+        provider: "ollama".to_string(),
+        models: models
+            .iter()
+            .map(|(id, tools)| smith_core::ModelChoice {
+                id: (*id).to_string(),
+                detail: String::new(),
+                supports_tools: *tools,
+            })
+            .collect(),
+    });
+    app
+}
+
+/// `/model` with no argument used to print a hardcoded list and ask you to
+/// type a name. It asks the orchestrator instead, because only the
+/// orchestrator can reach a provider.
+#[test]
+fn a_bare_model_command_asks_for_the_catalogue() {
+    let mut app = test_app();
+    assert!(matches!(
+        app.run_slash_command("model"),
+        Some(Action::ListModels)
+    ));
+}
+
+#[test]
+fn the_catalogue_opens_a_picker_on_the_model_already_in_use() {
+    let mut app = picker_app(&[("a:cloud", true), ("b:cloud", true), ("c:cloud", true)]);
+    app.model_label = "b:cloud".to_string();
+
+    // Re-deliver now that the label is set — the picker starts on what is in
+    // use, so switching to the neighbour is one keypress rather than a scroll.
+    app.on_agent_event(AgentEvent::ModelsAvailable {
+        provider: "ollama".to_string(),
+        models: vec![
+            smith_core::ModelChoice {
+                id: "a:cloud".into(),
+                detail: String::new(),
+                supports_tools: true,
+            },
+            smith_core::ModelChoice {
+                id: "b:cloud".into(),
+                detail: String::new(),
+                supports_tools: true,
+            },
+        ],
+    });
+    let picker = app.modal.model().expect("the picker is open");
+    assert_eq!(picker.selected, 1, "starts on the model in use");
+}
+
+/// An empty catalogue must not open an empty picker: the provider could not
+/// be asked, and the way out is typing a name.
+#[test]
+fn an_unreadable_catalogue_says_so_instead_of_opening_nothing() {
+    let mut app = test_app();
+    app.on_agent_event(AgentEvent::ModelsAvailable {
+        provider: "9router".to_string(),
+        models: Vec::new(),
+    });
+    assert!(app.modal.is_none());
+    assert!(app
+        .lines
+        .iter()
+        .any(|l| l.text.contains("could not read") && l.text.contains("/model <name>")));
+}
+
+/// Typing filters. Substring, not sub-sequence — `gpt` matching
+/// `google/gemma-4-31b-it` is a picker that surprises you.
+#[test]
+fn typing_narrows_the_list_by_substring() {
+    let mut app = picker_app(&[
+        ("gpt-oss:20b-cloud", true),
+        ("gemma4:31b-cloud", true),
+        ("nemotron-3-super:cloud", true),
+    ]);
+    for c in "gpt".chars() {
+        app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    let picker = app.modal.model().unwrap();
+    let ids: Vec<&str> = picker.matches().iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["gpt-oss:20b-cloud"]);
+
+    app.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+    app.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+    app.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(app.modal.model().unwrap().matches().len(), 3);
+}
+
+/// Enter switches for this session only. Persisting on a keystroke would make
+/// it outlive the conversation it was meant for.
+#[test]
+fn enter_switches_without_saving_and_esc_changes_nothing() {
+    let mut app = picker_app(&[("a:cloud", true), ("b:cloud", true)]);
+    app.on_key(KeyCode::Down, KeyModifiers::NONE);
+    let action = app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+    match action {
+        Some(Action::SwitchModel { model, save, .. }) => {
+            assert_eq!(model, "b:cloud");
+            assert!(!save, "a keystroke must not persist");
+        }
+        other => panic!("expected a switch, got {other:?}"),
+    }
+    assert!(app.modal.is_none());
+
+    let mut app = picker_app(&[("a:cloud", true)]);
+    assert!(app.on_key(KeyCode::Esc, KeyModifiers::NONE).is_none());
+    assert!(app.modal.is_none(), "Esc closes without switching");
+}
+
+/// The cursor cannot leave the filtered list, and the window follows it.
+#[test]
+fn the_cursor_and_the_window_stay_inside_the_list() {
+    let models: Vec<(&str, bool)> = vec![
+        ("m0", true),
+        ("m1", true),
+        ("m2", true),
+        ("m3", true),
+        ("m4", true),
+        ("m5", true),
+        ("m6", true),
+        ("m7", true),
+    ];
+    let mut app = picker_app(&models);
+    for _ in 0..20 {
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+    }
+    let picker = app.modal.model_mut().unwrap();
+    picker.clamp(3);
+    assert_eq!(picker.selected, 7, "clamped to the last row");
+    assert_eq!(picker.scroll, 5, "the window followed it");
+
+    for _ in 0..20 {
+        app.on_key(KeyCode::Up, KeyModifiers::NONE);
+    }
+    let picker = app.modal.model_mut().unwrap();
+    picker.clamp(3);
+    assert_eq!(picker.selected, 0);
+    assert_eq!(picker.scroll, 0);
 }

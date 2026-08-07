@@ -104,6 +104,18 @@ pub struct ResourceStats {
     pub vram_total_mb: Option<u64>,
 }
 
+/// One row of a model picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    pub id: String,
+    /// What the row says beyond the id — size, context window, warnings.
+    /// Empty when the provider offers nothing but a name.
+    pub detail: String,
+    /// An agent that cannot call tools is a chatbot, so this is worth showing
+    /// on the row rather than discovering a turn later.
+    pub supports_tools: bool,
+}
+
 /// Actions flowing from input handling into the agent orchestrator.
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -125,6 +137,12 @@ pub enum Action {
         model: String,
         save: bool,
     },
+    /// Ask what the current provider can actually run, for a picker.
+    ///
+    /// The frontend cannot fetch this itself: `smith-tui` deliberately does
+    /// not depend on `smith-provider`, and a catalogue is a network call in
+    /// any case. So it asks, and gets `ModelsAvailable` back.
+    ListModels,
     SetPermissionPolicy {
         policy: PermissionPolicy,
         save: bool,
@@ -264,6 +282,16 @@ pub enum AgentEvent {
         provider: String,
         model: String,
         saved: bool,
+    },
+    /// Answers `Action::ListModels`.
+    ///
+    /// `models` is what the provider says it has *now*, not a list compiled
+    /// into the binary — a gateway serves whatever its owner configured, and
+    /// an Ollama daemon whatever has been pulled. Empty means the provider
+    /// could not be asked; the frontend says so rather than showing nothing.
+    ModelsAvailable {
+        provider: String,
+        models: Vec<ModelChoice>,
     },
     /// Confirms a successful `Action::SetPermissionPolicy`.
     PermissionPolicyChanged {

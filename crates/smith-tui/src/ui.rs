@@ -232,6 +232,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // behind a table nobody asked to keep open is how a turn appears to hang.
     match &mut app.modal {
         Modal::Question(modal) => draw_question_modal(frame, modal, &theme, frame.area()),
+        Modal::Model(modal) => draw_model_picker(frame, modal, &theme, frame.area()),
         Modal::Plan(modal) => draw_plan_modal(frame, modal, &theme, frame.area()),
         Modal::Permission(modal) => draw_permission_modal(frame, modal, &theme, frame.area()),
         Modal::None => {
@@ -1998,3 +1999,96 @@ fn draw_question_modal(
 
 #[cfg(test)]
 mod tests;
+
+/// The `/model` picker: a filter line, a scrolling list, and a hint row.
+///
+/// Sized to the terminal rather than to the list — a gateway can offer dozens,
+/// and a modal that grows past the frame is one that cannot be read at the
+/// bottom.
+fn draw_model_picker(
+    frame: &mut Frame,
+    modal: &mut crate::app::ModelPicker,
+    theme: &Theme,
+    area: Rect,
+) {
+    let outer = clamp_width(area, 76.min(area.width));
+    let width = outer.width as usize - panel::box_chrome_width();
+    let rows = area.height.saturating_sub(9).clamp(3, 14) as usize;
+    modal.clamp(rows);
+
+    let matches = modal.matches();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let (filter, filter_style) = if modal.filter.is_empty() {
+        ("type to filter".to_string(), theme.disabled())
+    } else {
+        (modal.filter.clone(), theme.text())
+    };
+    lines.push(panel::fill_line(
+        vec![Span::styled(filter, filter_style)],
+        width,
+        theme.overlay_bg(),
+    ));
+    lines.push(panel::fill_line(Vec::new(), width, theme.raised_bg()));
+
+    if matches.is_empty() {
+        lines.push(panel::fill_line(
+            vec![Span::styled("nothing matches", theme.disabled())],
+            width,
+            theme.raised_bg(),
+        ));
+    }
+    for (offset, model) in matches.iter().enumerate().skip(modal.scroll).take(rows) {
+        let picked = offset == modal.selected;
+        let bg = if picked {
+            theme.hover_bg()
+        } else {
+            theme.raised_bg()
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("{} ", if picked { theme.marker_selected() } else { " " }),
+                theme.ember(),
+            ),
+            Span::styled(
+                model.id.clone(),
+                if picked { theme.bold() } else { theme.text() },
+            ),
+        ];
+        if !model.detail.is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", model.detail),
+                theme.disabled(),
+            ));
+        }
+        if !model.supports_tools {
+            // Loudest thing on the row: picking it produces an agent that
+            // cannot read a file, and the failure arrives a turn later.
+            spans.push(Span::styled("  NO TOOLS", theme.danger()));
+        }
+        lines.push(panel::fill_line(spans, width, bg));
+    }
+
+    lines.push(panel::fill_line(Vec::new(), width, theme.raised_bg()));
+    let mut hint = vec![Span::styled(
+        format!("{} of {}   ", modal.selected + 1, matches.len().max(1)),
+        theme.disabled(),
+    )];
+    hint.extend(chips::key_hint("Enter", "switch", theme.success, theme));
+    hint.extend(chips::cancel_hint("Esc", "cancel", theme));
+    lines.push(panel::fill_line(hint, width, theme.raised_bg()));
+
+    let title = format!(" {} models ", modal.provider);
+    let boxed = panel::themed_rounded_box_titled(
+        theme,
+        Some((title.as_str(), theme.ember_bold())),
+        &lines,
+        width,
+        theme.ember(),
+        theme.raised_bg(),
+    );
+    let height = boxed.len() as u16;
+    let rect = center_vertically(outer, height);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(Text::from(boxed)), rect);
+}

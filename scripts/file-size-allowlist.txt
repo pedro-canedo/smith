@@ -19,6 +19,10 @@ crates/smith-tui/src/app/tests.rs
 
 # The composition layer: layout arithmetic, tool cards, sidebar, modals.
 crates/smith-tui/src/ui.rs
+# Follows its module. Splitting the tests before the production file would
+# leave two half-arbitrary boundaries instead of one; they come apart together
+# when `ui/` gets its submodules.
+crates/smith-tui/src/ui/tests.rs
 
 # One lexer with ~50 small scanner functions. Cohesive as it stands — this is
 # the entry least likely to be paid off, and splitting it into six files would

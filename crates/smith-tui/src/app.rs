@@ -539,6 +539,61 @@ pub struct QuestionModal {
 /// practice — a state combination like "plan modal AND question modal both
 /// open" is no longer representable at all, instead of just avoided by
 /// convention.
+/// The `/model` picker.
+///
+/// A filter rather than a plain list, because a gateway can list dozens and
+/// scrolling to `openrouter/nvidia/nemotron-3-nano-30b-a3b:free` with arrow
+/// keys is worse than typing four characters of it.
+#[derive(Debug, Clone, Default)]
+pub struct ModelPicker {
+    pub provider: String,
+    /// Everything the provider offered, in the order it offered it.
+    pub all: Vec<smith_core::ModelChoice>,
+    /// What has been typed to narrow the list.
+    pub filter: String,
+    /// Index into `matches()`, not into `all`.
+    pub selected: usize,
+    /// Top row of the visible window, so a long list scrolls.
+    pub scroll: usize,
+}
+
+impl ModelPicker {
+    /// Case-insensitive substring, which is what someone types when they
+    /// half remember a name. Sub-sequence matching was considered and rejected:
+    /// it turns `gpt` into a match for `google/gemma-4-31b-it`, and a picker
+    /// that surprises you is worse than one that finds less.
+    pub fn matches(&self) -> Vec<&smith_core::ModelChoice> {
+        let needle = self.filter.trim().to_ascii_lowercase();
+        self.all
+            .iter()
+            .filter(|m| needle.is_empty() || m.id.to_ascii_lowercase().contains(&needle))
+            .collect()
+    }
+
+    pub fn selected_id(&self) -> Option<String> {
+        self.matches().get(self.selected).map(|m| m.id.clone())
+    }
+
+    /// Keeps the cursor inside the filtered list and the window around the
+    /// cursor. Called after anything that can change either.
+    pub fn clamp(&mut self, visible: usize) {
+        let len = self.matches().len();
+        if len == 0 {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.selected = self.selected.min(len - 1);
+        let visible = visible.max(1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + visible {
+            self.scroll = self.selected + 1 - visible;
+        }
+        self.scroll = self.scroll.min(len.saturating_sub(1));
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum Modal {
     #[default]
@@ -546,6 +601,7 @@ pub enum Modal {
     Permission(PermissionModal),
     Plan(PlanModal),
     Question(QuestionModal),
+    Model(ModelPicker),
 }
 
 impl Modal {
@@ -563,6 +619,24 @@ impl Modal {
 
     pub fn is_question(&self) -> bool {
         matches!(self, Modal::Question(_))
+    }
+
+    pub fn is_model(&self) -> bool {
+        matches!(self, Modal::Model(_))
+    }
+
+    pub fn model(&self) -> Option<&ModelPicker> {
+        match self {
+            Modal::Model(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn model_mut(&mut self) -> Option<&mut ModelPicker> {
+        match self {
+            Modal::Model(m) => Some(m),
+            _ => None,
+        }
     }
 
     pub fn permission(&self) -> Option<&PermissionModal> {
@@ -1276,6 +1350,53 @@ impl App {
         // deliberate presses in a row, not any two presses.
         self.quit_armed_at = None;
 
+        // Before every other modal: the picker owns the keyboard while it is
+        // open, including plain characters, which are its filter rather than
+        // prompt text.
+        if self.modal.is_model() {
+            match code {
+                KeyCode::Esc => {
+                    self.modal = Modal::None;
+                    return None;
+                }
+                KeyCode::Enter => {
+                    let picked = self.modal.model().and_then(|m| m.selected_id());
+                    self.modal = Modal::None;
+                    return picked.map(|model| Action::SwitchModel {
+                        provider: None,
+                        model,
+                        // A pick is for this session. Persisting silently
+                        // would make a keystroke outlive the conversation it
+                        // was meant for; `/model <name> --save` is the way to
+                        // say otherwise, and it still works.
+                        save: false,
+                    });
+                }
+                KeyCode::Up | KeyCode::Down | KeyCode::Backspace | KeyCode::Char(_) => {
+                    if let Some(m) = self.modal.model_mut() {
+                        match code {
+                            KeyCode::Up => m.selected = m.selected.saturating_sub(1),
+                            KeyCode::Down => m.selected = m.selected.saturating_add(1),
+                            KeyCode::Backspace => {
+                                m.filter.pop();
+                                // A narrower list can leave the cursor past
+                                // the end; the renderer clamps, but the state
+                                // must not be nonsense in the meantime.
+                                m.selected = 0;
+                            }
+                            KeyCode::Char(c) => {
+                                m.filter.push(c);
+                                m.selected = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
         if self.modal.is_question() {
             return match code {
                 KeyCode::Char('1') => self.submit_question_choice(0),
@@ -1972,7 +2093,15 @@ impl App {
     }
 
     fn run_model_command(&mut self, args: &str) -> Option<Action> {
-        if args.is_empty() || args.eq_ignore_ascii_case("list") {
+        if args.is_empty() {
+            // Ask for the catalogue; the picker opens when it arrives. The
+            // frontend cannot fetch it — `smith-tui` does not depend on
+            // `smith-provider`, and it is a network call besides.
+            self.lines
+                .push(ChatLine::new(ChatRole::System, "reading the model list…"));
+            return Some(Action::ListModels);
+        }
+        if args.eq_ignore_ascii_case("list") {
             self.show_model_info();
             return None;
         }
@@ -2418,7 +2547,9 @@ impl App {
         let scroll = match &mut self.modal {
             Modal::Permission(m) => &mut m.scroll,
             Modal::Plan(m) => &mut m.scroll,
-            Modal::Question(_) | Modal::None => return,
+            // The picker scrolls by moving its own cursor, so the shared
+            // page-scroll does not apply to it.
+            Modal::Question(_) | Modal::Model(_) | Modal::None => return,
         };
         *scroll = (*scroll as i32).saturating_add(delta).max(0) as u16;
     }
@@ -2980,6 +3111,29 @@ impl App {
             }
             AgentEvent::TasksUpdated(tasks) => {
                 self.tasks = tasks;
+            }
+            AgentEvent::ModelsAvailable { provider, models } => {
+                if models.is_empty() {
+                    self.lines.push(ChatLine::new(
+                        ChatRole::System,
+                        format!(
+                            "could not read {provider}'s model list — switch by name: \
+                             /model <name> [--save]"
+                        ),
+                    ));
+                    return;
+                }
+                let selected = models
+                    .iter()
+                    .position(|m| m.id == self.model_label)
+                    .unwrap_or(0);
+                self.modal = Modal::Model(ModelPicker {
+                    provider,
+                    all: models,
+                    filter: String::new(),
+                    selected,
+                    scroll: 0,
+                });
             }
             AgentEvent::ModelChanged {
                 provider,

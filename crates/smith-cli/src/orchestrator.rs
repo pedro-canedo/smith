@@ -1006,6 +1006,20 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
                     queue.push_back(text);
                 }
             }
+            Action::ListModels => {
+                // Spawned: a catalogue is a network call, and the action loop
+                // must keep answering Esc while it is in flight.
+                let config = config.clone();
+                let event_tx = event_tx.clone();
+                let provider = provider_kind;
+                tokio::spawn(async move {
+                    let models = live_models(provider, &config).await;
+                    let _ = event_tx.send(AgentEvent::ModelsAvailable {
+                        provider: provider.label().to_string(),
+                        models,
+                    });
+                });
+            }
             Action::SwitchModel {
                 provider,
                 model,
@@ -1307,3 +1321,70 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
 
 #[cfg(test)]
 mod tests;
+
+/// What a provider can run right now, for the `/model` picker.
+///
+/// Live where a live answer exists — an Ollama daemon lists what has been
+/// pulled, a 9Router gateway lists what its owner configured — and the
+/// curated list otherwise, because a catalogue call for the hosted providers
+/// needs the key and offering the shortlist costs nothing.
+///
+/// An empty result is not an error here. The frontend says "could not read
+/// the catalogue" and leaves the user able to type a name, which is strictly
+/// better than a picker that refuses to open.
+pub async fn live_models(kind: ProviderKind, config: &Config) -> Vec<smith_core::ModelChoice> {
+    let choice = |id: String, detail: String, supports_tools: bool| smith_core::ModelChoice {
+        id,
+        detail,
+        supports_tools,
+    };
+
+    match kind {
+        ProviderKind::Ollama => {
+            let base = config
+                .ollama
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_OLLAMA_BASE_URL.to_string());
+            let live = smith_provider::ollama_tags(&base).await.unwrap_or_default();
+            let mut out: Vec<smith_core::ModelChoice> = live
+                .iter()
+                .map(|m| {
+                    let detail = m.summary().trim_start_matches(&m.name).trim().to_string();
+                    choice(m.name.clone(), detail, m.supports_tools)
+                })
+                .collect();
+            // The daemon lists only what is pulled, so a fresh install shows
+            // almost nothing — and the free cloud models are exactly what is
+            // worth offering there. Same merge the wizard and the web UI do.
+            for name in smith_store::models::OLLAMA_FREE_CLOUD_MODELS {
+                if live.iter().any(|m| m.name == *name) {
+                    continue;
+                }
+                out.push(choice(
+                    (*name).to_string(),
+                    "cloud · free tier".to_string(),
+                    true,
+                ));
+            }
+            out
+        }
+        ProviderKind::NineRouter => {
+            let base = config
+                .nine_router
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
+            crate::node_runtime::ninerouter_upstreams(&base)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| choice(id, String::new(), true))
+                .collect()
+        }
+        other => smith_store::models::known_models(other.label())
+            .iter()
+            .map(|id| choice((*id).to_string(), String::new(), true))
+            .collect(),
+    }
+}
