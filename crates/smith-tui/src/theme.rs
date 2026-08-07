@@ -597,6 +597,20 @@ impl Theme {
         }
     }
 
+    /// Whether a collapsible card is currently open.
+    ///
+    /// A card that hides rows has to look like one: without the glyph, a
+    /// settled research card and a plain one-call card are the same row, and
+    /// nothing on screen says the first is worth pressing Enter on.
+    pub fn disclosure(&self, expanded: bool) -> &'static str {
+        match (self.unicode, expanded) {
+            (true, true) => "▾",
+            (true, false) => "▸",
+            (false, true) => "v",
+            (false, false) => ">",
+        }
+    }
+
     pub fn ellipsis(&self) -> &'static str {
         if self.unicode {
             "…"

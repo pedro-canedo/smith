@@ -708,6 +708,11 @@ fn tool_card(
     let target = tool_target(line);
     // Per-card expansion (`Enter`) on top of the global default.
     let verbose = verbose || line.expanded();
+    // A card standing for a whole run of calls is a different card: its header
+    // is a summary rather than a target, and its body is a step list that
+    // collapses once the run settles.
+    let grouped = !line.grouped().is_empty();
+    let summary = line.group_summary();
 
     let (icon, icon_style) = match line.tool_status() {
         Some(ActivityStatus::Running) | None => (
@@ -721,7 +726,11 @@ fn tool_card(
     // The header speaks in activity labels, not tool names: "Searching the
     // web…" while running, "Search completed" when done, "Search failed" on
     // error. The raw name (`web_search`) moves to the verbose body.
-    let labels = crate::app::tool_labels(&name);
+    let labels = if grouped {
+        crate::app::group_labels(&name)
+    } else {
+        crate::app::tool_labels(&name)
+    };
     let (header_label, running_header) = match line.tool_status() {
         Some(ActivityStatus::Running) | None => (labels.running, true),
         Some(ActivityStatus::Done) => (labels.done, false),
@@ -739,7 +748,28 @@ fn tool_card(
         Span::styled(format!("{icon} "), icon_style),
         Span::styled(header_label, theme.bold()),
     ]);
-    if !target.is_empty() {
+    if grouped {
+        // The counts stand in for the target: on a run that mixed six queries
+        // with four URLs, the first call's query described none of the others.
+        let separator = theme.separator();
+        left.push(Span::styled(
+            format!(
+                "{separator}{} {}",
+                summary.steps,
+                plural(summary.steps, "step")
+            ),
+            theme.secondary(),
+        ));
+        if summary.failed > 0 {
+            // Named on the header itself, collapsed or not — this is what
+            // lets `settle_group` stop marking a whole burst failed over one
+            // 404 without the failure going quiet.
+            left.push(Span::styled(
+                format!("{separator}{} failed", summary.failed),
+                theme.danger(),
+            ));
+        }
+    } else if !target.is_empty() {
         // Running reads as a sentence ("Reading src/main.rs"); a settled card
         // separates verdict from target ("Read · src/main.rs").
         let separator = if running_header {
@@ -767,33 +797,51 @@ fn tool_card(
             .map(|s| format!(" {} ", format_thought(s)))
             .unwrap_or_default(),
     };
+    // Only a settled group hides anything, so only a settled group claims the
+    // affordance. While it runs, its steps are on screen and there is nothing
+    // for the glyph to promise.
+    let chevron = if grouped && !running_header {
+        format!("{} ", theme.disclosure(verbose))
+    } else {
+        String::new()
+    };
     let pad = w
-        .saturating_sub(left_width + duration.chars().count())
+        .saturating_sub(left_width + duration.chars().count() + chevron.chars().count())
         .max(1);
     left.push(Span::styled(" ".repeat(pad), theme.disabled()));
     left.push(Span::styled(duration, theme.disabled()));
+    left.push(Span::styled(chevron, theme.info_bold()));
 
     let mut out = vec![panel::fill_line(left, w, bg)];
 
-    // Folded siblings, one row each: the header says what activity is running
-    // and these say what it is running *on*. The first target is already in
-    // the header, so the list starts with the second call.
-    if !line.grouped().is_empty() {
+    // Every call the card stands for, one row each — its own first, now that
+    // the header is a summary and no longer carries the first call's target.
+    //
+    // Live while the run is: that is the whole point, one card whose steps
+    // tick by in place instead of a fresh card per call. Once it settles the
+    // list folds away and the header is the entire card, until Enter or a
+    // second click brings it back.
+    if grouped && (running_header || verbose) {
         let branch = if theme.unicode {
             "\u{2514}\u{2500} "
         } else {
             "|- "
         };
-        for call in line.grouped() {
-            let (glyph, style) = match call.status {
-                ActivityStatus::Running => (
+        let steps = std::iter::once((tool_target(line), line.own_status())).chain(
+            line.grouped()
+                .iter()
+                .map(|call| (call.label.clone(), Some(call.status))),
+        );
+        for (label, status) in steps {
+            let (glyph, style) = match status {
+                None | Some(ActivityStatus::Running) => (
                     spinner_frame_for(line, spinner_frame, theme).to_string(),
                     theme.ember(),
                 ),
-                ActivityStatus::Done => (theme.icon_ok().to_string(), theme.success()),
-                ActivityStatus::Error => (theme.icon_error().to_string(), theme.danger()),
+                Some(ActivityStatus::Done) => (theme.icon_ok().to_string(), theme.success()),
+                Some(ActivityStatus::Error) => (theme.icon_error().to_string(), theme.danger()),
             };
-            let text = truncate_chars(&call.label, w.saturating_sub(branch.chars().count() + 4));
+            let text = truncate_chars(&label, w.saturating_sub(branch.chars().count() + 4));
             out.push(panel::fill_line(
                 vec![
                     Span::styled(format!("  {branch}"), theme.disabled()),
@@ -812,8 +860,10 @@ fn tool_card(
         Some(ActivityStatus::Done) | Some(ActivityStatus::Error)
     );
 
-    // Running: show what the call is actually doing.
-    if matches!(line.tool_status(), Some(ActivityStatus::Running) | None) {
+    // Running: show what the call is actually doing. A group says it in its
+    // step list instead — repeating the newest target under it would say the
+    // same thing twice.
+    if !grouped && matches!(line.tool_status(), Some(ActivityStatus::Running) | None) {
         if name == "run_bash" {
             if let Some(cmd) = tool_field(line, "command") {
                 let row = Line::from(vec![
@@ -841,8 +891,11 @@ fn tool_card(
         }
     }
 
-    // Errors always surface the tail of the failure output.
-    if finished_error {
+    // Errors always surface the tail of the failure output — except on a
+    // collapsed group, whose contract is that the header is the whole card.
+    // `tool_output` there is only the *own* call's anyway, so the tail would
+    // describe one step out of ten.
+    if finished_error && (!grouped || verbose) {
         for l in error_tail(line, ERROR_TAIL_LINES) {
             let mut spans = vec![Span::styled(
                 theme.assistant_gutter().0.to_string(),
@@ -857,7 +910,12 @@ fn tool_card(
     }
 
     // Verbose: full input + output (+ a real diff for edit_file).
-    if verbose && finished {
+    //
+    // Never for a group: `tool_input` and `tool_output` there belong to its
+    // own call alone, so this would answer "what did those ten steps do?" with
+    // the raw name and output of the first one. Expanding a group already has
+    // a meaning — the step list above — and that is the honest one.
+    if verbose && finished && !grouped {
         // The raw tool name lives here now that the header speaks in
         // friendly labels — verbose is exactly the "what actually ran" view.
         out.extend(panel::inset(
@@ -966,6 +1024,17 @@ fn tool_target(line: &ChatLine) -> String {
 }
 
 const MAX_LABEL_CHARS_DISPLAY: usize = 64;
+
+/// "1 step" / "2 steps" — English pluralisation, for the one word that needs
+/// it. A count that reads "1 steps" is the sort of thing you stop seeing after
+/// a week and no user ever does.
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
 
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

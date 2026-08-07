@@ -785,11 +785,27 @@ fn search(app: &mut App, id: &str, query: &str) {
     });
 }
 
+fn fetch(app: &mut App, id: &str, url: &str) {
+    app.on_agent_event(AgentEvent::ToolCallStarted {
+        id: id.to_string(),
+        tool_name: "web_fetch".into(),
+        input: serde_json::json!({ "url": url }),
+    });
+}
+
 fn finish(app: &mut App, id: &str) {
     app.on_agent_event(AgentEvent::ToolCallResult {
         id: id.to_string(),
         output: "3 results".into(),
         is_error: false,
+    });
+}
+
+fn fail(app: &mut App, id: &str, why: &str) {
+    app.on_agent_event(AgentEvent::ToolCallResult {
+        id: id.to_string(),
+        output: why.to_string(),
+        is_error: true,
     });
 }
 
@@ -828,20 +844,101 @@ fn a_grouped_card_stays_running_until_its_last_child_lands() {
     assert_eq!(card.tool_status(), Some(ActivityStatus::Done));
 }
 
-/// One failure inside the group is visible on the card.
+/// A real research burst alternates searching and fetching. Keying the group
+/// on the tool *name* gave that one card per call — the stack the grouping
+/// exists to remove.
 #[test]
-fn a_failed_child_makes_the_group_report_failure() {
+fn searches_and_fetches_share_one_research_card() {
+    let mut app = test_app();
+    search(&mut app, "s1", "brasileirão rodada 21");
+    fetch(&mut app, "f1", "https://ge.globo.com/brasileirao");
+    search(&mut app, "s2", "brasileirão placares");
+    fetch(&mut app, "f2", "https://flashscore.com.br/serie-a");
+
+    let cards: Vec<_> = app
+        .lines
+        .iter()
+        .filter(|l| l.role == ChatRole::Tool)
+        .collect();
+    assert_eq!(cards.len(), 1, "the run split into {} cards", cards.len());
+    assert_eq!(cards[0].group_summary().steps, 4);
+}
+
+/// A `+ Thought: 4.0s` row is the pause *inside* one activity — the card's own
+/// timer already covers it. Letting it close the run put the transcript back
+/// to one card per search, which is exactly the wall being removed here.
+#[test]
+fn a_thought_row_does_not_break_a_research_run() {
+    let mut app = test_app();
+    search(&mut app, "s1", "one");
+    finish(&mut app, "s1");
+    app.lines.push(ChatLine::new(ChatRole::Thought, "4.0s"));
+    search(&mut app, "s2", "two");
+
+    let cards: Vec<_> = app
+        .lines
+        .iter()
+        .filter(|l| l.role == ChatRole::Tool)
+        .collect();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].group_summary().steps, 2);
+    assert!(
+        !app.lines.iter().any(|l| l.role == ChatRole::Thought),
+        "the row was stepped over instead of dropped, so the group's newest \
+         step now renders above a separator belonging to the previous one"
+    );
+}
+
+/// …but a reply between two searches does. That is the agent moving on, and
+/// folding the next call into a card above it would reorder the transcript.
+#[test]
+fn a_reply_between_two_searches_closes_the_run() {
+    let mut app = test_app();
+    search(&mut app, "s1", "one");
+    finish(&mut app, "s1");
+    app.lines
+        .push(ChatLine::new(ChatRole::Assistant, "ESPN só tem sábado"));
+    search(&mut app, "s2", "two");
+
+    assert_eq!(
+        app.lines
+            .iter()
+            .filter(|l| l.role == ChatRole::Tool)
+            .count(),
+        2
+    );
+}
+
+/// One blocked search among several does not make the whole run a failure —
+/// the header counts it instead. A burst that loses two fetches to a 404 and
+/// answers on the other eight is a research that worked.
+#[test]
+fn one_failed_step_is_counted_not_promoted_to_the_whole_group() {
     let mut app = test_app();
     search(&mut app, "s1", "one");
     search(&mut app, "s2", "two");
     finish(&mut app, "s1");
-    app.on_agent_event(AgentEvent::ToolCallResult {
-        id: "s2".into(),
-        output: "blocked".into(),
-        is_error: true,
-    });
+    fail(&mut app, "s2", "blocked");
+
+    let card = app.lines.iter().find(|l| l.role == ChatRole::Tool).unwrap();
+    assert_eq!(card.tool_status(), Some(ActivityStatus::Done));
+    let summary = card.group_summary();
+    assert_eq!(summary.steps, 2);
+    assert_eq!(summary.failed, 1, "the failure has to be stated somewhere");
+}
+
+/// A run where nothing got through is the case that really failed.
+#[test]
+fn a_group_whose_every_step_failed_reports_failure() {
+    let mut app = test_app();
+    search(&mut app, "s1", "one");
+    search(&mut app, "s2", "two");
+    fail(&mut app, "s1", "blocked");
+    fail(&mut app, "s2", "blocked");
+
     let card = app.lines.iter().find(|l| l.role == ChatRole::Tool).unwrap();
     assert_eq!(card.tool_status(), Some(ActivityStatus::Error));
+    assert_eq!(card.group_summary().failed, 2);
 }
 
 /// Only *consecutive* calls fold. A search after a reply is a new
