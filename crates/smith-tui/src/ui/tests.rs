@@ -1,6 +1,14 @@
 use super::*;
-use crate::app::ChatRole;
+// `use super::*` reaches what `ui.rs` still names; the rest moved into sibling
+// modules and is imported here by its own path.
+use super::card::tool_card;
+use super::chrome::QUIT_HINT;
+use super::message::{assistant_block, fit_lines, user_bubble};
+use crate::app::{ActivityStatus, ChatLine, ChatRole};
 use crate::testkit::test_app;
+use crate::theme::Theme;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Paragraph, Wrap};
 
 /// Rows the input box actually *gets* once `vertical_layout` has protected
 /// the transcript's floor. `draw` composes the two itself (it also has a

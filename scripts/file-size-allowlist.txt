@@ -6,11 +6,8 @@
 # Every entry below is the same debt — a module that still holds more than one
 # concern. Splitting them is planned work, not a discovery.
 
-# The composition layer: layout arithmetic, tool cards, sidebar, modals.
-crates/smith-tui/src/ui.rs
-# Follows its module. Splitting the tests before the production file would
-# leave two half-arbitrary boundaries instead of one; they come apart together
-# when `ui/` gets its submodules.
+# The production module came apart into `ui/` — five submodules, none over 512
+# lines. What is left is the test file, which splits along the same seams next.
 crates/smith-tui/src/ui/tests.rs
 
 # One lexer with ~50 small scanner functions. Cohesive as it stands — this is
