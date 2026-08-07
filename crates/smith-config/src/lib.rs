@@ -64,6 +64,9 @@ pub struct Config {
     /// `web_search` backend settings that are not credentials.
     #[serde(default)]
     pub search: SearchSettings,
+    /// `[web]` — the local web console (`--web`, `docs/web-console.md`).
+    #[serde(default, skip_serializing_if = "WebSettings::is_default")]
+    pub web: WebSettings,
     /// Which palette the TUI paints in. Must stay ahead of `runtime` for the
     /// ordering reason below *and* because its own `colors` field serializes
     /// as a nested table: a plain-table field written after it would land
@@ -184,6 +187,30 @@ pub struct OllamaSettings {
     /// writes an Ollama fallback for almost everyone, so almost everyone's
     /// chain pointed at a model they had probably never pulled.
     pub model: Option<String>,
+}
+
+/// `[web]` — the local web console served beside the TUI when enabled.
+///
+/// Off by default, and headless never starts it regardless: the console is
+/// an interactive surface, and CI must stay byte-identical with or without
+/// this table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSettings {
+    /// Start the console with every interactive session (`--web` for one
+    /// session at a time).
+    pub enabled: Option<bool>,
+    /// Pin the port. Unset means an ephemeral one, which is the safer
+    /// default — predictable is the one property a privileged loopback
+    /// endpoint should not have.
+    pub port: Option<u16>,
+    /// Open the browser on the console URL at startup.
+    pub open_browser: Option<bool>,
+}
+
+impl WebSettings {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// `[search]` — how `web_search` looks things up.
@@ -567,6 +594,15 @@ impl Config {
         self.search.backend = backend.or(self.search.backend.take());
         self.search.searxng_url = searxng_url.or(self.search.searxng_url.take());
         self.search.market = market.or(self.search.market.take());
+
+        let WebSettings {
+            enabled,
+            port,
+            open_browser,
+        } = other.web;
+        self.web.enabled = enabled.or(self.web.enabled.take());
+        self.web.port = port.or(self.web.port.take());
+        self.web.open_browser = open_browser.or(self.web.open_browser.take());
 
         // A project may restyle smith without restating the whole palette, so
         // the overrides merge per token rather than wholesale — the same rule
@@ -1098,6 +1134,32 @@ mod tests {
     fn load_layered_is_fine_with_no_project_file() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Config::load_layered(dir.path()).is_ok());
+    }
+
+    /// `[web]` merges field-wise like every other table: a project turning
+    /// the console on must not erase a globally pinned port, and vice versa.
+    #[test]
+    fn web_settings_merge_field_wise_across_layers() {
+        let mut global = Config {
+            web: WebSettings {
+                enabled: None,
+                port: Some(4321),
+                open_browser: Some(false),
+            },
+            ..Config::default()
+        };
+        let project = Config {
+            web: WebSettings {
+                enabled: Some(true),
+                port: None,
+                open_browser: None,
+            },
+            ..Config::default()
+        };
+        global.merge_over(project);
+        assert_eq!(global.web.enabled, Some(true));
+        assert_eq!(global.web.port, Some(4321));
+        assert_eq!(global.web.open_browser, Some(false));
     }
 
     #[test]

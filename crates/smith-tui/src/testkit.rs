@@ -52,6 +52,7 @@ fn app_with_commands(commands: SlashRegistry) -> App {
         keys: Default::default(),
         history: Vec::new(),
         logs: LogBuffer::default(),
+        console_url: None,
     })
 }
 

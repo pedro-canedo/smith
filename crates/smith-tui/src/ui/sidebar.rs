@@ -214,6 +214,16 @@ pub(super) fn session_tab_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'sta
         )));
     }
 
+    // The console link, visible mid-session — the idle splash carries it too,
+    // but the splash is gone the moment the first message lands. `fit_lines`
+    // wraps the URL over a few rows; the token has to be copyable, so
+    // truncating it would show a link that does not work.
+    if let Some(url) = &app.console_url {
+        below.push(Line::from(""));
+        below.push(sidebar_head(theme, "WEB CONSOLE"));
+        below.push(Line::from(Span::styled(url.clone(), theme.info())));
+    }
+
     (lines, below)
 }
 

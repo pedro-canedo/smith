@@ -177,6 +177,13 @@ pub(super) fn draw_idle(frame: &mut Frame, app: &App, area: Rect) {
         "PgUp/PgDn scroll   Home/End jump   Ctrl+B sidebar   Ctrl+L logs",
         theme.disabled(),
     )));
+    if let Some(url) = &app.console_url {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Web console  ", theme.bold()),
+            Span::styled(url.clone(), theme.info()),
+        ]));
+    }
     lines.push(Line::from(""));
 
     match &app.idle_hint {

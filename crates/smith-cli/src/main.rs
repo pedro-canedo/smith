@@ -32,6 +32,7 @@ mod subagents;
 mod uninstall;
 mod update;
 mod webconfig;
+mod webconsole;
 mod webguard;
 
 const GENERIC_TIP: &str = "run `smith setup` to add or change your provider or model";
@@ -105,6 +106,17 @@ struct Cli {
     /// see `prompts::system_prompt_with`.
     #[arg(long, value_name = "NAME")]
     persona: Option<String>,
+
+    /// Serve the local web console for this session and show its link in
+    /// the TUI. Loopback only, behind a per-run token; also enabled by
+    /// `[web] enabled = true` in the config. Headless runs never start it.
+    #[arg(long)]
+    web: bool,
+
+    /// Pin the console's port (default: an ephemeral one). Implies nothing
+    /// on its own — the console still needs `--web` or the config switch.
+    #[arg(long, value_name = "PORT")]
+    web_port: Option<u16>,
 
     #[command(subcommand)]
     command: Option<Commands>,

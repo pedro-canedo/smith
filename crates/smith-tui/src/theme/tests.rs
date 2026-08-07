@@ -453,6 +453,7 @@ fn no_cell_falls_through_to_the_terminals_own_background() {
             keys: Default::default(),
             history: Vec::new(),
             logs: crate::logbuf::LogBuffer::default(),
+            console_url: None,
         });
         app.modal = modal;
         // Both width tiers: with the sidebar (>= 80) and without it.

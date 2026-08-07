@@ -327,6 +327,9 @@ pub struct App {
     /// Diagnostics from the whole workspace, shown by `Ctrl+L`. Shared with
     /// the `tracing` subscriber `smith-cli` installs.
     pub logs: LogBuffer,
+    /// The web console's URL, shown on the idle splash and in the sidebar
+    /// when the session was started with `--web`.
+    pub console_url: Option<String>,
     /// Money spent this session, as the agent reports it: `(usd, unpriced
     /// turns)`. `None` until the first `SessionCost` event.
     ///
@@ -411,6 +414,7 @@ impl App {
             queued: std::collections::VecDeque::new(),
             overlay: None,
             logs: config.logs,
+            console_url: config.console_url,
             session_cost: None,
             sidebar_visible: true,
             sidebar_tab: SidebarTab::default(),

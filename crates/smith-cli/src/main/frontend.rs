@@ -29,6 +29,15 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         }
     };
 
+    let web_enabled = cli.web || startup.config.web.enabled.unwrap_or(false);
+    // The console URL names the session, so a fresh session needs its id
+    // *now* rather than lazily on the first message. Persistence keeps its
+    // lazy row creation — `ensure_session_id` reuses this id and only
+    // touches the database when something is actually persisted.
+    if web_enabled && startup.session_id.is_none() {
+        startup.session_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+
     let commands = std::mem::take(&mut startup.commands);
     // A command file that would not load is announced at startup. A `/deploy`
     // that silently does not exist is indistinguishable from one the user
@@ -53,7 +62,7 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         ));
     }
 
-    let tui_config = TuiConfig {
+    let mut tui_config = TuiConfig {
         banner: smith_tui::banner::banner(),
         provider_label: startup.provider_kind.label().to_string(),
         model_label: startup.model.clone(),
@@ -69,6 +78,8 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         history: prompt_history(&startup.initial_messages),
         commands: smith_tui::slash::SlashRegistry::new(commands),
         logs,
+        // Filled in below once the console server has a port.
+        console_url: None,
     };
 
     let (action_tx, chans, event_rx, permission_rx, question_rx) = channels();
@@ -108,11 +119,83 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         chans.event_tx.clone(),
     ));
 
+    // With the console off, `event_rx` goes to the TUI untouched — this
+    // path is byte-identical to a smith without a web console. With it on,
+    // the pump tees events into the projection and the SSE broadcast on
+    // their way to the TUI.
+    let mut pump_task = None;
+    let mut server_task = None;
+    let event_rx = if web_enabled {
+        let session_id = startup
+            .session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let tee = webconsole::state::Tee::new(
+            session_id.clone(),
+            startup.provider_kind.label().to_string(),
+            startup.model.clone(),
+        );
+        let (to_tui, tui_rx) = tokio::sync::mpsc::unbounded_channel();
+        pump_task = Some(tokio::spawn(webconsole::state::pump(
+            event_rx,
+            to_tui,
+            tee.clone(),
+        )));
+
+        let port = cli.web_port.or(startup.config.web.port).unwrap_or(0);
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => match listener.local_addr() {
+                Ok(addr) => {
+                    let guard = std::sync::Arc::new(crate::webguard::Guard {
+                        host: format!("127.0.0.1:{}", addr.port()),
+                        token: crate::webguard::mint_token(),
+                    });
+                    let url = format!("http://{}/s/{}?t={}", guard.host, session_id, guard.token);
+                    let handles = webconsole::Handles {
+                        guard,
+                        tee,
+                        action_tx: action_tx.clone(),
+                        ask_tx: ask_tx.clone(),
+                        session_id,
+                        // Empty when the project store cannot be located;
+                        // history endpoints then answer 500 per request
+                        // rather than the console refusing to start.
+                        store_dir: smith_config::project_store_dir(&startup.cwd)
+                            .unwrap_or_default(),
+                    };
+                    server_task = Some(tokio::spawn(webconsole::server::serve(
+                        listener,
+                        handles,
+                        webconsole::PAGE,
+                    )));
+                    if startup.config.web.open_browser.unwrap_or(false) {
+                        crate::webconfig::open_browser(&url);
+                    }
+                    tui_config.console_url = Some(url);
+                }
+                Err(e) => eprintln!("smith: web console could not read its address: {e}"),
+            },
+            Err(e) => eprintln!("smith: web console could not listen on 127.0.0.1: {e}"),
+        }
+        tui_rx
+    } else {
+        event_rx
+    };
+
     let orchestrator = tokio::spawn(run_orchestrator(opts, chans));
 
     let result = smith_tui::run(tui_config, action_tx, event_rx, ask_tx).await;
     orchestrator.abort();
     broker.abort();
+    // The console dies with the session — that is its whole lifetime story
+    // (docs/web-console.md §4.2). EventSource reconnects then fail and the
+    // page shows "session ended".
+    if let Some(server) = server_task {
+        server.abort();
+    }
+    if let Some(pump) = pump_task {
+        pump.abort();
+    }
     if let Some(poller) = resource_poller {
         poller.abort();
     }

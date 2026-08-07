@@ -50,6 +50,9 @@ pub struct TuiConfig {
     /// Default-constructed for a frontend that installs no subscriber, in
     /// which case the panel simply reports that it is empty.
     pub logs: LogBuffer,
+    /// The web console's URL for this session (`--web`), token included.
+    /// `None` — the default — draws nothing anywhere.
+    pub console_url: Option<String>,
 }
 
 /// Prompts kept in the recall ring. Generous — an entry is a short string,

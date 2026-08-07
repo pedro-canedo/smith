@@ -244,7 +244,7 @@ async fn write_response(
 /// WSL leads on purpose: `xdg-open` exists there and does nothing useful, so
 /// a Linux-first table would silently fail on the one platform this was
 /// developed against.
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     let candidates: Vec<(&str, Vec<&str>)> = if is_wsl() {
         vec![
             ("wslview", vec![url]),

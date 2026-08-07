@@ -26,7 +26,9 @@ pub enum SessionError {
     NoSuchSession(String),
 }
 
-#[derive(Debug, Clone)]
+// `Serialize` because the web console's `/api/sessions` answers with the
+// summaries verbatim — the row a session list renders from.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
