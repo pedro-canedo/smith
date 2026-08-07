@@ -1227,6 +1227,84 @@ fn rendered(app: &mut App, width: u16, height: u16) -> String {
         .collect()
 }
 
+/// A research run, driven through the events that produce one.
+fn research_run(searches: &[&str]) -> App {
+    let mut app = test_app();
+    for (i, query) in searches.iter().enumerate() {
+        app.on_agent_event(smith_core::AgentEvent::ToolCallStarted {
+            id: format!("s{i}"),
+            tool_name: "web_search".into(),
+            input: serde_json::json!({ "query": query }),
+        });
+    }
+    app
+}
+
+/// While the run is live, one header for the activity and one row per step.
+#[test]
+fn a_live_research_card_lists_its_steps_under_one_header() {
+    let mut app = research_run(&["rust 1.97 release", "rust release schedule"]);
+    let text = rendered(&mut app, 90, 24);
+
+    assert_eq!(
+        text.matches("Researching the web").count(),
+        1,
+        "the activity header repeated: {text}"
+    );
+    // Both queries, including the first — that one is the card's *own* call,
+    // which the header no longer carries, so a step list that forgot to
+    // include it fails here.
+    assert!(text.contains("rust 1.97 release"), "{text}");
+    assert!(text.contains("rust release schedule"), "{text}");
+    assert!(text.contains("2 steps"), "{text}");
+}
+
+/// The point of the whole thing: a settled run is one row, and its steps come
+/// back on demand.
+#[test]
+fn a_settled_research_card_collapses_to_its_summary_and_expands_again() {
+    let mut app = research_run(&["rust 1.97 release", "rust release schedule"]);
+    for i in 0..2 {
+        app.on_agent_event(smith_core::AgentEvent::ToolCallResult {
+            id: format!("s{i}"),
+            output: "3 results".into(),
+            is_error: i == 1,
+        });
+    }
+
+    let collapsed = rendered(&mut app, 90, 24);
+    assert!(collapsed.contains("Research"), "{collapsed}");
+    assert!(collapsed.contains("2 steps"), "{collapsed}");
+    // Named on the header, which is what lets the card settle as done without
+    // the blocked search going quiet.
+    assert!(collapsed.contains("1 failed"), "{collapsed}");
+    assert!(
+        !collapsed.contains("rust release schedule"),
+        "a settled group must not still list its steps: {collapsed}"
+    );
+
+    // Opened through the gesture the feature is about: click to select the
+    // card, click again to expand it.
+    let index = app
+        .lines
+        .iter()
+        .position(|l| l.role() == ChatRole::Tool)
+        .unwrap();
+    let (start, _) = app.transcript.entry_rows(index).unwrap();
+    let click = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: app.message_area.x,
+        row: app.message_area.y + (start as u16).saturating_sub(app.scroll),
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    };
+    app.on_mouse(click);
+    app.on_mouse(click);
+
+    let expanded = rendered(&mut app, 90, 24);
+    assert!(expanded.contains("rust 1.97 release"), "{expanded}");
+    assert!(expanded.contains("rust release schedule"), "{expanded}");
+}
+
 /// Scrolling a modal to its end must leave no blank rows at the bottom.
 ///
 /// `Paragraph::line_count` takes the **outer** width and returns the
@@ -1236,45 +1314,6 @@ fn rendered(app: &mut App, width: u16, height: u16) -> String {
 /// could sit two rows past its own content. Asserting "the last line is
 /// still visible" is not enough to catch that: overscrolled by two, it is
 /// visible, just with dead space under it. The dead space is the symptom.
-/// The card the user asked for: one activity header, one row per query.
-#[test]
-fn a_grouped_search_card_shows_one_row_per_query_under_one_header() {
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    let mut app = test_app();
-    for (i, query) in ["rust 1.97 release", "rust release schedule"]
-        .iter()
-        .enumerate()
-    {
-        app.on_agent_event(smith_core::AgentEvent::ToolCallStarted {
-            id: format!("s{i}"),
-            tool_name: "web_search".into(),
-            input: serde_json::json!({ "query": query }),
-        });
-    }
-
-    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-    terminal.draw(|f| draw(f, &mut app)).unwrap();
-    let text: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|c| c.symbol())
-        .collect();
-
-    // One header for the activity…
-    assert_eq!(
-        text.matches("Searching the web").count(),
-        1,
-        "the activity header repeated: {text}"
-    );
-    // …and both queries visible under it.
-    assert!(text.contains("rust 1.97 release"), "{text}");
-    assert!(text.contains("rust release schedule"), "{text}");
-}
-
 #[test]
 fn scrolling_a_modal_to_the_end_leaves_no_dead_space_under_it() {
     use ratatui::backend::TestBackend;

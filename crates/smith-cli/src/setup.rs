@@ -86,6 +86,28 @@ fn permission_summary(config: &Config) -> String {
         .unwrap_or_else(|| "ask (default)".to_string())
 }
 
+/// Whether a browser could plausibly open on this machine.
+///
+/// Not a capability check — nothing here can prove a browser exists. It is a
+/// check for a *display*, which is the thing whose absence makes the offer
+/// useless: over a plain SSH session the link opens nowhere, and a menu row
+/// that leads to a dead end is worse than one that is missing.
+///
+/// WSL counts even without `DISPLAY`, because the Windows host opens the link.
+fn browser_plausible() -> bool {
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+        return true;
+    }
+    [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "WSL_DISTRO_NAME",
+        "WSL_INTEROP",
+    ]
+    .iter()
+    .any(|var| std::env::var_os(var).is_some())
+}
+
 fn browser_summary(config: &Config) -> String {
     match runtime::find_browser(&config.runtime) {
         Some(_) => "available".to_string(),
@@ -120,26 +142,51 @@ pub async fn run(jump_to_model: bool) -> color_eyre::Result<()> {
     println!("smith setup — pick a section to configure. Esc backs out of any level;");
     println!("each section saves as soon as it completes.\n");
 
+    // The browser row exists only where a browser plausibly does. Offering it
+    // over SSH would send someone to a link nothing can open — and this menu
+    // is the *only* way anyone finds the feature, since `smith setup web` is
+    // a subcommand nobody guesses.
+    let offer_web = browser_plausible();
+
     loop {
-        let items = [
+        let mut items = Vec::new();
+        if offer_web {
+            items.push("Configure in a browser   (a page on this machine)".to_string());
+        }
+        items.extend([
             format!("Provider & model   [{}]", provider_summary(&config)),
             format!("Web search         [{}]", search_summary(&config)),
             format!("Browser            [{}]", browser_summary(&config)),
             format!("Permissions        [{}]", permission_summary(&config)),
             "Done".to_string(),
-        ];
+        ]);
         let choice = Select::with_theme(&theme)
             .with_prompt("Section")
             .items(&items)
             .default(0)
             .interact_opt()?;
 
-        let changed = match choice {
-            Some(0) => section_provider(&theme, &mut config).await?,
-            Some(1) => section_search(&theme, &mut config)?,
-            Some(2) => section_browser(&theme, &mut config).await?,
-            Some(3) => section_permissions(&theme, &mut config)?,
-            _ => break, // Done, or Esc at the top level.
+        // One offset rather than two index tables: the rows below shift by
+        // exactly one when the browser row is present, and a second table is
+        // how the labels and the arms drift apart.
+        let Some(row) = choice else { break };
+        let section = row as isize - isize::from(offer_web);
+
+        let changed = match section {
+            -1 => {
+                crate::webconfig::run(false, None)
+                    .await
+                    .map_err(color_eyre::eyre::Error::msg)?;
+                // The page writes the global config itself, so re-read rather
+                // than keep a copy that is now stale.
+                config = Config::load().unwrap_or_default();
+                false
+            }
+            0 => section_provider(&theme, &mut config).await?,
+            1 => section_search(&theme, &mut config)?,
+            2 => section_browser(&theme, &mut config).await?,
+            3 => section_permissions(&theme, &mut config)?,
+            _ => break, // Done.
         };
         if changed {
             save(&config)?;
@@ -345,10 +392,20 @@ async fn setup_openrouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
     println!("Free-tier limits: 20 req/min; 50 free-model requests/day, or 1000/day after a");
     println!("one-time $10 top-up. smith falls back automatically when the day runs out.\n");
 
-    let existing_key = config.openrouter.api_key.clone();
-    let prompt = match &existing_key {
-        Some(_) => "OpenRouter API key (already set — blank keeps it)".to_string(),
-        None => "OpenRouter API key".to_string(),
+    // `build_provider` prefers `OPENROUTER_API_KEY` over anything saved, so
+    // prompting for a key that would be ignored is worse than not asking: the
+    // user types a secret and smith uses a different one.
+    let from_env = std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let existing_key = config.openrouter.api_key.clone().or(from_env.clone());
+    let prompt = match (&from_env, &existing_key) {
+        (Some(_), _) => {
+            println!("Using OPENROUTER_API_KEY from the environment; it outranks anything saved.");
+            "OpenRouter API key (env is in use — blank keeps it)".to_string()
+        }
+        (None, Some(_)) => "OpenRouter API key (already set — blank keeps it)".to_string(),
+        (None, None) => "OpenRouter API key".to_string(),
     };
     let entered: String = Password::with_theme(theme)
         .with_prompt(prompt)
@@ -419,28 +476,26 @@ async fn setup_openrouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
     config.general.provider = Some("openrouter".to_string());
     config.general.model = Some(primary);
 
-    // The second layer: where smith itself goes when the *account* quota
-    // dies. Offered, not imposed — but defaulted on, because the account
-    // limit is the one failure the server-side chain cannot absorb.
-    let wants_fallback = Confirm::with_theme(theme)
-        .with_prompt(
-            "Also fall back to other providers automatically when the daily quota runs out?",
-        )
-        .default(true)
-        .interact_opt()?
-        .unwrap_or(false);
-    if wants_fallback {
-        let mut providers = Vec::new();
-        if config.nine_router.api_key.is_some() {
-            providers.push("9router".to_string());
-        }
+    // The second layer: where smith itself goes when the *account* quota dies.
+    // This used to be a `Confirm` defaulted to yes, which is a prompt that is
+    // not asking anything. It is computed now, from what is actually on the
+    // machine — and only entries that could work are written, because an
+    // unusable entry is a hard error at startup, not a skip.
+    let mut providers = Vec::new();
+    if config.nine_router.api_key.is_some() {
+        providers.push("9router".to_string());
+    }
+    if ollama_model_count().await.is_some_and(|n| n > 0) {
         providers.push("ollama".to_string());
+    }
+    if providers.is_empty() {
+        println!("No local fallback available yet — set up Ollama or 9Router to add one.");
+    } else {
         config.fallback.providers = providers;
         println!(
-            "[fallback] providers = {:?} — entries without a working setup are skipped with an",
-            config.fallback.providers
+            "Falling back to {} when the daily quota runs out; change with `smith setup`.",
+            config.fallback.providers.join(", ")
         );
-        println!("error naming what to configure. The 9Router section adds the local gateway.");
     }
     Ok(true)
 }
@@ -523,8 +578,49 @@ async fn setup_ninerouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
             .map_err(color_eyre::eyre::Error::msg)?;
     }
     println!("Gateway answering on {base_url}.");
-    println!("Open http://localhost:20128 in a browser, configure your upstream providers");
-    println!("there, and copy an API key from its dashboard.\n");
+
+    // A gateway with no upstreams answers `200 {"data":[]}` and is "healthy"
+    // by every check smith had. It then 404s on the first message with
+    // `No active credentials for provider: openai`, in the middle of a
+    // conversation, which is the worst possible place to learn it. So the
+    // section waits here until the dashboard has something in it.
+    let upstreams = loop {
+        match crate::node_runtime::ninerouter_upstreams(&base_url).await {
+            Ok(models) if !models.is_empty() => break models,
+            Ok(_) => {
+                println!("The gateway is running but routes to nothing yet.");
+                println!("Open http://localhost:20128, add a provider under `Providers`,");
+                println!("then come back — smith will check again.");
+            }
+            Err(e) => println!("Could not read the gateway's model list: {e}"),
+        }
+        let again = Confirm::with_theme(theme)
+            .with_prompt("Check again?")
+            .default(true)
+            .interact_opt()?;
+        if again != Some(true) {
+            println!("Section left unchanged — a gateway with no providers cannot answer.");
+            return Ok(false);
+        }
+    };
+    println!(
+        "{} models available through the gateway.\n",
+        upstreams.len()
+    );
+
+    // Offer them. `auto` used to be written unconditionally, and this gateway
+    // does not have a model by that name: it was resolved to a provider called
+    // `openai` with no credentials, which is where the 404 came from. It is
+    // still offered when the gateway itself lists it.
+    let Some(model) = select_model(
+        theme,
+        &upstreams.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?
+    else {
+        return Ok(false);
+    };
+
+    println!("Copy an API key from the dashboard at http://localhost:20128.\n");
 
     let existing_key = config.nine_router.api_key.clone();
     let prompt = match &existing_key {
@@ -549,13 +645,11 @@ async fn setup_ninerouter(theme: &ColorfulTheme, config: &mut Config) -> color_e
         config.nine_router.base_url = Some(base_url);
     }
     config.general.provider = Some("9router".to_string());
-    config.general.model = Some(
-        config
-            .nine_router
-            .model
-            .clone()
-            .unwrap_or_else(|| "auto".to_string()),
-    );
+    // Both, because `[9router] model` is what a *fallback* chain entry reads
+    // and `[general] model` is what the primary uses — writing only one left
+    // the chain asking for something else.
+    config.nine_router.model = Some(model.clone());
+    config.general.model = Some(model);
     Ok(true)
 }
 
@@ -566,21 +660,47 @@ async fn setup_ollama(theme: &ColorfulTheme, config: &mut Config) -> color_eyre:
         return Ok(false);
     }
 
-    let Some(model) = select_model(theme, known_models("ollama"))? else {
+    // The daemon has to be up before it can be asked what it has.
+    ensure_ollama_running().await?;
+
+    let base_url = config
+        .ollama
+        .base_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string());
+    let live = smith_provider::ollama_tags(&base_url)
+        .await
+        .unwrap_or_default();
+
+    let Some(model) = pick_ollama_model(theme, &live)? else {
         return Ok(false);
     };
 
-    ensure_ollama_running().await?;
+    // A cloud model is proxied to ollama.com; there are no weights to fetch,
+    // and `ollama pull` on one is either a no-op or an error depending on the
+    // version. A local one still needs its gigabytes.
+    let is_cloud = live
+        .iter()
+        .find(|m| m.name == model)
+        .map(|m| m.is_cloud)
+        .unwrap_or_else(|| model.ends_with(":cloud"));
 
-    println!("Pulling {model} (this can take a while)...");
-    let status = tokio::process::Command::new("ollama")
-        .arg("pull")
-        .arg(&model)
-        .stdin(Stdio::null())
-        .status()
-        .await?;
-    if !status.success() {
-        color_eyre::eyre::bail!("`ollama pull {model}` failed");
+    if !is_cloud {
+        println!("Pulling {model} (this can take a while)...");
+        let status = tokio::process::Command::new("ollama")
+            .arg("pull")
+            .arg(&model)
+            .stdin(Stdio::null())
+            .status()
+            .await?;
+        if !status.success() {
+            // Not fatal, deliberately: a four-gigabyte download that failed
+            // should not throw away a wizard section, the same way a failed
+            // browser provision does not. Same treatment as `section_browser`.
+            println!("`ollama pull {model}` failed — section left unchanged.");
+            println!("Fix the pull (disk space? network?) and re-run `smith setup`.");
+            return Ok(false);
+        }
     }
 
     config.general.provider = Some("ollama".to_string());
@@ -589,6 +709,50 @@ async fn setup_ollama(theme: &ColorfulTheme, config: &mut Config) -> color_eyre:
         config.ollama.base_url = Some(DEFAULT_OLLAMA_BASE_URL.to_string());
     }
     Ok(true)
+}
+
+/// Offers what the daemon actually has, cloud first.
+///
+/// The wizard used to show nine hardcoded names, so a machine's own models
+/// were invisible and one keypress picked something it had never pulled. The
+/// static list survives as the fallback for a daemon that did not answer —
+/// and says that it is a fallback, the way the OpenRouter section already
+/// does when its catalogue call fails.
+fn pick_ollama_model(
+    theme: &ColorfulTheme,
+    live: &[smith_provider::OllamaModel],
+) -> color_eyre::Result<Option<String>> {
+    if live.is_empty() {
+        println!("Could not read the local model list — showing the built-in one.");
+        return select_model(theme, known_models("ollama"));
+    }
+
+    // Cloud first: those are the ones that need no VRAM and no download, so
+    // they are what a machine that just installed ollama can actually run.
+    // Within each group, a model that cannot call tools sorts last — it is
+    // offered, but it is not what the cursor lands on.
+    let mut ordered: Vec<&smith_provider::OllamaModel> = live.iter().collect();
+    ordered.sort_by_key(|m| (!m.is_cloud, !m.supports_tools));
+
+    let mut items: Vec<String> = ordered.iter().map(|m| m.summary()).collect();
+    items.push("Other (type a model name)".to_string());
+
+    let Some(idx) = Select::with_theme(theme)
+        .with_prompt("Model")
+        .items(&items)
+        .default(0)
+        .interact_opt()?
+    else {
+        return Ok(None);
+    };
+    if idx == ordered.len() {
+        let custom: String = Input::with_theme(theme)
+            .with_prompt("Model name")
+            .interact_text()?;
+        let custom = custom.trim().to_string();
+        return Ok((!custom.is_empty()).then_some(custom));
+    }
+    Ok(Some(ordered[idx].name.clone()))
 }
 
 // ---- section: web search ----------------------------------------------------
@@ -855,6 +1019,46 @@ async fn ollama_reachable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The browser row shifts every other row by one, which is exactly the
+    /// kind of arithmetic that silently sends someone into the wrong section.
+    /// One offset, asserted both ways.
+    #[test]
+    fn the_menu_rows_map_to_the_same_sections_with_or_without_the_browser_row() {
+        let section = |row: usize, offered: bool| row as isize - isize::from(offered);
+
+        // Without the browser row, the sections start at 0.
+        assert_eq!(section(0, false), 0, "provider");
+        assert_eq!(section(3, false), 3, "permissions");
+
+        // With it, row 0 is the browser and everything else keeps its meaning.
+        assert_eq!(section(0, true), -1, "browser");
+        assert_eq!(section(1, true), 0, "provider");
+        assert_eq!(section(4, true), 3, "permissions");
+    }
+
+    /// A machine with no display must not be offered a link nothing can open.
+    /// Asserted through the env, because that is the only input.
+    #[test]
+    fn a_display_is_what_makes_the_browser_row_worth_offering() {
+        if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            assert!(browser_plausible(), "a desktop OS always has one");
+            return;
+        }
+        let has_any = [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "WSL_DISTRO_NAME",
+            "WSL_INTEROP",
+        ]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some());
+        assert_eq!(
+            browser_plausible(),
+            has_any,
+            "the offer must follow the display, not the platform"
+        );
+    }
 
     /// Row order and the id table are two lists that have to agree. They are
     /// next to each other in the file, which is exactly the kind of pairing

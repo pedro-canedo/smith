@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>smith setup</title>
+<style>
+/* Ember, transcribed from crates/smith-tui/src/theme.rs::truecolor().
+   A test asserts these match token for token; see webconfig/tests.rs.
+   The TUI's idioms are translated rather than replaced — the assistant's
+   left gutter becomes a border-left, key chips become pills, uppercase
+   secondary stays the section label. */
+:root {
+  --base:#101215; --raised:#16181c; --overlay:#1e2126; --hover:#262a30;
+  --primary:#e2e5e9; --secondary:#949aa3; --disabled:#727882;
+  --ember:#ff8c3c; --amber:#ffbe5a; --success:#58ce80; --danger:#f36666;
+  --warning:#facc15; --info:#56b6ff; --plan:#c684ff;
+  --radius:10px; --radius-sm:6px;
+  --line:rgba(255,255,255,.06); --line-hi:rgba(255,255,255,.13);
+  --shadow:0 1px 3px rgba(0,0,0,.45);
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --base:#faf9f7; --raised:#f2f0ec; --overlay:#e8e5e0; --hover:#dcd8d1;
+    --primary:#1c1b19; --secondary:#55524e; --disabled:#76726c;
+    --ember:#a03600; --amber:#7c4e00; --success:#136638; --danger:#ae1c1c;
+    --warning:#7c5200; --info:#1454ac; --plan:#6c30a2;
+    --line:rgba(0,0,0,.08); --line-hi:rgba(0,0,0,.16);
+    --shadow:0 1px 3px rgba(0,0,0,.07);
+  }
+}
+* { box-sizing:border-box; }
+html, body { height:100%; }
+body {
+  margin:0; background:var(--base); color:var(--primary); display:flex;
+  font:13.5px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+.mono, code { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* ---- sidebar ---------------------------------------------------------- */
+aside {
+  width:224px; flex:none; background:var(--raised);
+  border-right:1px solid var(--line); padding:20px 12px;
+  display:flex; flex-direction:column; gap:2px;
+}
+.brand { display:flex; align-items:baseline; gap:8px; padding:2px 10px 22px; }
+.brand b { color:var(--ember); font-size:16px; letter-spacing:.4px; }
+.brand span { color:var(--disabled); font-size:11px; }
+.nav {
+  display:flex; align-items:center; gap:10px; width:100%;
+  padding:8px 10px; border-radius:var(--radius-sm); border:none;
+  background:none; color:var(--secondary); font:inherit; cursor:pointer; text-align:left;
+}
+.nav:hover { background:var(--hover); color:var(--primary); }
+.nav[aria-current="true"] { background:var(--overlay); color:var(--ember); font-weight:600; }
+.nav .dot { width:6px; height:6px; border-radius:50%; background:currentColor; opacity:.6; flex:none; }
+.spacer { flex:1; }
+.sidefoot { padding:10px; color:var(--disabled); font-size:11px; line-height:1.5; }
+
+/* ---- main ------------------------------------------------------------- */
+main { flex:1; overflow:auto; padding:26px 32px 96px; }
+.panel { display:none; max-width:940px; }
+.panel.on { display:block; }
+.view { display:none; }
+.view.on { display:block; }
+.head { margin-bottom:20px; }
+h1 { font-size:19px; margin:0 0 4px; font-weight:650; letter-spacing:-.2px; }
+.head p { margin:0; color:var(--secondary); font-size:12.5px; }
+
+/* ---- group of provider cards ------------------------------------------ */
+.grouphead {
+  display:flex; align-items:center; gap:12px; margin:26px 0 10px;
+}
+.grouphead h2 {
+  font-size:12px; margin:0; font-weight:650; letter-spacing:.3px; color:var(--primary);
+}
+.grouphead .why { color:var(--disabled); font-size:11.5px; flex:1; }
+.tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(238px,1fr)); gap:10px; }
+.tile {
+  display:flex; align-items:center; gap:12px; text-align:left;
+  background:var(--raised); border:1px solid var(--line);
+  border-radius:var(--radius); padding:13px 14px; cursor:pointer;
+  font:inherit; color:var(--primary); width:100%;
+  transition:border-color .15s, background .15s, transform .1s;
+}
+.tile:hover { border-color:var(--line-hi); background:var(--overlay); }
+.tile:active { transform:translateY(1px); }
+.tile.sel { border-color:var(--ember); }
+.mark {
+  width:34px; height:34px; flex:none; border-radius:9px;
+  display:grid; place-items:center; font-weight:700; font-size:14px;
+  color:var(--base); letter-spacing:-.5px;
+}
+.tile .tname { font-weight:600; font-size:13px; }
+.tile .tsub { color:var(--disabled); font-size:11.5px; margin-top:2px; display:flex; align-items:center; gap:5px; }
+.tile .live { width:6px; height:6px; border-radius:50%; flex:none; }
+
+/* ---- detail ----------------------------------------------------------- */
+.crumb {
+  display:flex; align-items:center; gap:7px; margin-bottom:18px;
+  color:var(--secondary); font-size:12px;
+}
+.crumb button {
+  background:none; border:none; color:var(--secondary); font:inherit;
+  cursor:pointer; padding:0; display:flex; align-items:center; gap:6px;
+}
+.crumb button:hover { color:var(--ember); background:none; }
+.dhead { display:flex; align-items:center; gap:14px; margin-bottom:20px; }
+.dhead .mark { width:44px; height:44px; border-radius:11px; font-size:18px; }
+.dhead h1 { margin:0; font-size:21px; }
+.dhead .sub { color:var(--secondary); font-size:12.5px; margin-top:3px; }
+
+/* ---- cards ------------------------------------------------------------ */
+.card {
+  background:var(--raised); border:1px solid var(--line);
+  border-radius:var(--radius); box-shadow:var(--shadow);
+  padding:16px 18px; margin-bottom:12px;
+}
+.cardhead { display:flex; align-items:center; gap:10px; margin-bottom:4px; }
+.cardhead h3 { margin:0; font-size:13.5px; font-weight:650; }
+.grow { flex:1; }
+.hint { color:var(--disabled); font-size:11.5px; }
+
+/* ---- pills ------------------------------------------------------------ */
+.pill {
+  font-size:10.5px; font-weight:650; letter-spacing:.2px;
+  padding:3px 9px; border-radius:999px; white-space:nowrap;
+  background:var(--overlay); color:var(--secondary);
+}
+.pill.ok{color:var(--success)} .pill.bad{color:var(--danger)}
+.pill.warn{color:var(--warning)} .pill.cloud{color:var(--plan)}
+
+/* ---- controls --------------------------------------------------------- */
+label { display:block; color:var(--secondary); font-size:11.5px; margin:14px 0 5px; font-weight:500; }
+input[type=text], input[type=password], select {
+  width:100%; background:var(--overlay); color:var(--primary);
+  border:1px solid var(--line); border-radius:var(--radius-sm);
+  padding:9px 11px; font:inherit; transition:border-color .15s, box-shadow .15s;
+}
+input:focus, select:focus {
+  outline:none; border-color:var(--ember);
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--ember) 20%, transparent);
+}
+input::placeholder { color:var(--disabled); }
+button {
+  background:var(--overlay); color:var(--primary);
+  border:1px solid var(--line); border-radius:var(--radius-sm);
+  padding:7px 14px; font:inherit; font-weight:550; cursor:pointer;
+  transition:background .15s, border-color .15s;
+}
+button:hover { background:var(--hover); border-color:var(--line-hi); }
+button.primary { background:var(--ember); color:var(--base); border-color:var(--ember); font-weight:650; }
+button.primary:hover { filter:brightness(1.08); }
+button.sm { padding:4px 11px; font-size:11.5px; }
+button.ghost { background:none; color:var(--secondary); border-color:transparent; }
+.radio { display:flex; align-items:flex-start; gap:10px; cursor:pointer; padding:4px 0; }
+.radio input { margin-top:3px; accent-color:var(--ember); }
+
+/* ---- model chips ------------------------------------------------------ */
+.chips { display:grid; grid-template-columns:repeat(auto-fill, minmax(232px,1fr)); gap:8px; margin-top:10px; }
+.chip {
+  background:var(--overlay); border:1px solid var(--line);
+  border-radius:var(--radius-sm); padding:9px 11px; cursor:pointer;
+  transition:border-color .15s, background .15s;
+}
+.chip:hover { border-color:var(--line-hi); }
+.chip.sel { border-color:var(--ember); background:color-mix(in srgb, var(--ember) 10%, var(--overlay)); }
+.chip .cid { font-size:11.5px; font-weight:600; word-break:break-all; font-family:ui-monospace, Menlo, monospace; }
+.chip .csub { color:var(--disabled); font-size:10.5px; margin-top:4px; display:flex; gap:5px; align-items:center; flex-wrap:wrap; }
+
+/* ---- notices ---------------------------------------------------------- */
+.notice {
+  border-left:3px solid var(--warning); background:var(--overlay);
+  padding:10px 13px; border-radius:0 var(--radius-sm) var(--radius-sm) 0;
+  font-size:12px; color:var(--secondary); margin:12px 0;
+}
+.notice.bad{border-left-color:var(--danger)} .notice.ok{border-left-color:var(--success)}
+.empty {
+  border:1px dashed var(--line-hi); border-radius:var(--radius);
+  padding:22px; text-align:center; color:var(--disabled); font-size:12px;
+}
+
+/* ---- action bar ------------------------------------------------------- */
+.bar {
+  position:fixed; left:224px; right:0; bottom:0; background:var(--raised);
+  border-top:1px solid var(--line); padding:12px 32px;
+  display:flex; align-items:center; gap:10px;
+}
+@media (max-width:760px) {
+  body { flex-direction:column; }
+  aside { width:100%; flex-direction:row; flex-wrap:wrap; padding:10px; }
+  .brand, .sidefoot, .spacer { display:none; }
+  .nav { width:auto; }
+  .bar { left:0; }
+}
+</style>
+</head>
+<body>
+
+<aside>
+  <div class="brand"><b>smith</b><span>setup</span></div>
+  <button class="nav" data-panel="provider" aria-current="true"><i class="dot"></i>Providers</button>
+  <button class="nav" data-panel="search"><i class="dot"></i>Web search</button>
+  <button class="nav" data-panel="browser"><i class="dot"></i>Browser</button>
+  <button class="nav" data-panel="perms"><i class="dot"></i>Permissions</button>
+  <div class="spacer"></div>
+  <div class="sidefoot">
+    Keys are written, never read back.<br>
+    <span class="mono" id="path">~/.smith/config.toml</span>
+  </div>
+</aside>
+
+<main>
+  <section class="panel on" id="p-provider">
+    <!-- index -->
+    <div class="view on" id="v-index">
+      <div class="head">
+        <h1>Providers</h1>
+        <p>Pick where smith sends your requests. Click one to configure it.</p>
+      </div>
+      <div id="groups"></div>
+    </div>
+
+    <!-- detail -->
+    <div class="view" id="v-detail">
+      <div class="crumb">
+        <button id="back">← Back to providers</button>
+      </div>
+      <div class="dhead">
+        <div class="mark" id="d-mark"></div>
+        <div>
+          <h1 id="d-name"></h1>
+          <div class="sub" id="d-sub"></div>
+        </div>
+      </div>
+      <div id="d-notice"></div>
+
+      <div class="card" id="d-keycard">
+        <div class="cardhead"><h3>Credential</h3><span id="d-keypill"></span><span class="grow"></span>
+          <button class="sm" id="d-test">Test</button></div>
+        <div id="d-keybody"></div>
+        <div id="d-testout"></div>
+      </div>
+
+      <div class="card">
+        <div class="cardhead"><h3>Models</h3><span class="hint grow" id="d-mcount"></span>
+          <button class="sm" id="d-refresh">Refresh</button></div>
+        <div id="d-models"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-search">
+    <div class="head"><h1>Web search</h1>
+      <p>Works with nothing configured. These only make it better.</p></div>
+    <div class="card">
+      <label>Backend</label>
+      <select id="search_backend">
+        <option value="">auto — try every tier in order</option>
+        <option value="searxng">searxng</option><option value="exa">exa</option>
+        <option value="tavily">tavily</option><option value="bing">bing</option>
+        <option value="google_news">google_news</option><option value="duckduckgo">duckduckgo</option>
+      </select>
+      <div class="notice">A pin never falls back. If what you pin is not configured, the search fails and says so — that is the point of pinning.</div>
+      <label>Bing market <span class="hint">blank follows the query's own language</span></label>
+      <input type="text" id="search_market" placeholder="auto — e.g. pt-BR, en-US">
+      <div class="notice">A Portuguese query under an American market returns ten well-formed results about nothing, which reads exactly like success.</div>
+      <label>SearXNG URL <span class="hint">your own instance — the only backend with no shared IP reputation</span></label>
+      <input type="text" id="searxng_url" placeholder="https://searx.example.org">
+      <label>Tavily API key <span class="hint" id="tavily-st"></span></label>
+      <input type="password" id="tavily_api_key" placeholder="paste key">
+      <label>Exa API key <span class="hint" id="exa-st"></span></label>
+      <input type="password" id="exa_api_key" placeholder="paste key">
+    </div>
+  </section>
+
+  <section class="panel" id="p-browser">
+    <div class="head"><h1>Browser</h1>
+      <p>A headless Chromium for <span class="mono">web_search</span>'s strongest free tier. Optional.</p></div>
+    <div class="card">
+      <div class="cardhead"><h3>Chromium</h3><span id="browser-pill"></span>
+        <span class="hint grow mono" id="browser-path"></span>
+        <button class="sm" id="browser-get">Download</button></div>
+      <div id="browser-out"></div>
+    </div>
+    <div class="notice">Around 150 MB, once. It takes a few minutes and this page waits — progress prints in the terminal you launched from. Skipping it costs one search tier, not search.</div>
+  </section>
+
+  <section class="panel" id="p-perms">
+    <div class="head"><h1>Permissions</h1><p>What smith may do without stopping to ask.</p></div>
+    <div class="card">
+      <label class="radio"><input type="radio" name="pol" value="ask">
+        <span><b>ask</b><br><span class="hint">prompt before every mutating tool — the default</span></span></label>
+      <label class="radio"><input type="radio" name="pol" value="session">
+        <span><b>session</b><br><span class="hint">allow a tool for the rest of this session once approved</span></span></label>
+      <label class="radio"><input type="radio" name="pol" value="skip">
+        <span><b>skip</b><br><span class="hint">never prompt — an unapproved plan still blocks everything</span></span></label>
+    </div>
+  </section>
+</main>
+
+<div class="bar">
+  <button class="primary" id="save">Save</button>
+  <button class="ghost" id="done">Done</button>
+  <span id="status" class="hint"></span>
+</div>
+
+<script>
+// The token arrives once, in the URL, and leaves the address bar, the history
+// entry and any referrer immediately. Every call after this carries it in a
+// header, which a cross-site page cannot set.
+const TOKEN = new URLSearchParams(location.search).get('t') || '';
+history.replaceState(null, '', '/');
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const api = async (path, opts = {}) => {
+  const res = await fetch(path, { ...opts, headers: {
+    'X-Smith-Token': TOKEN, ...(opts.body ? {'Content-Type':'application/json'} : {}) } });
+  return res.json();
+};
+
+// Grouped the way the choice is actually made: what does this cost me before
+// it answers anything. Keyless first — it is the only group that can answer
+// without leaving the terminal.
+const GROUPS = [
+  { title:'Keyless', why:'nothing to sign up for', ids:['ollama'] },
+  { title:'Free, with an account', why:'a free key, no card', ids:['openrouter','9router'] },
+  { title:'Paid API key', why:'billed per token', ids:['anthropic','openai'] },
+];
+const META = {
+  ollama:     { name:'Ollama',     mark:'OL', colour:'var(--success)', blurb:'local weights and cloud models, proxied by the daemon' },
+  openrouter: { name:'OpenRouter', mark:'OR', colour:'var(--ember)',   blurb:'many providers behind one key; the :free ones cost nothing' },
+  '9router':  { name:'9Router',    mark:'9R', colour:'var(--plan)',    blurb:'a local gateway — configure its own dashboard first' },
+  anthropic:  { name:'Anthropic',  mark:'AN', colour:'var(--amber)',   blurb:'Claude' },
+  openai:     { name:'OpenAI',     mark:'AI', colour:'var(--info)',    blurb:'GPT' },
+};
+const KEY_FIELD = { anthropic:'anthropic_api_key', openai:'openai_api_key',
+                    openrouter:'openrouter_api_key', '9router':'ninerouter_api_key' };
+
+let state=null, chosen=null, model=null, models=[], viewing=null, pending={};
+
+const status = p =>
+  p.source === 'not needed' ? ['ok','no key needed']
+  : !p.key_set              ? ['bad','needs key']
+  : p.source === 'environment' ? ['warn','key from environment']
+  : ['ok','key set'];
+
+/* ---- index ---- */
+function renderIndex() {
+  $('groups').innerHTML = GROUPS.map(g => `
+    <div class="grouphead"><h2>${g.title}</h2><span class="why">${g.why}</span></div>
+    <div class="tiles">${g.ids.map(id => {
+      const m = META[id], p = state.providers[id] || {}, [cls, text] = status(p);
+      const active = id === chosen;
+      const colour = cls === 'ok' ? 'var(--success)' : cls === 'warn' ? 'var(--warning)' : 'var(--danger)';
+      return `<button class="tile ${active?'sel':''}" data-open="${id}">
+        <span class="mark" style="background:${m.colour}">${m.mark}</span>
+        <span class="grow">
+          <span class="tname">${m.name}${active?' <span class="pill ok">in use</span>':''}</span>
+          <span class="tsub"><i class="live" style="background:${colour}"></i>${text}</span>
+        </span></button>`;
+    }).join('')}</div>`).join('');
+  document.querySelectorAll('[data-open]').forEach(el =>
+    el.onclick = () => openDetail(el.dataset.open));
+}
+
+/* ---- detail ---- */
+function openDetail(id) {
+  viewing = id;
+  const m = META[id], p = state.providers[id] || {}, [cls, text] = status(p);
+  $('d-mark').textContent = m.mark;
+  $('d-mark').style.background = m.colour;
+  $('d-name').textContent = m.name;
+  $('d-sub').textContent = m.blurb;
+  $('d-keypill').innerHTML = `<span class="pill ${cls}">${text}</span>`;
+  $('d-testout').innerHTML = '';
+
+  const field = KEY_FIELD[id];
+  $('d-keycard').style.display = '';
+  $('d-keybody').innerHTML = field
+    ? `<label>API key ${p.key_set ? '<span class="hint">(set — blank keeps it)</span>' : ''}</label>
+       <input type="password" id="d-key" placeholder="${p.key_set ? '••••••••••••' : 'paste key'}"
+              value="${esc(pending[field] || '')}">
+       ${p.source === 'environment'
+         ? '<div class="notice">An exported environment variable outranks anything saved here, so this box has no effect until you unset it.</div>' : ''}
+       ${id === '9router'
+         ? '<div class="notice">The key comes from the own dashboard of the gateway at <span class="mono">http://localhost:20128</span>, and the gateway must have at least one provider configured there or every request fails.</div>' : ''}`
+    : '<div class="empty">Nothing to enter. The Ollama daemon holds its own credential, so smith sends none.<br>Cloud models still need <span class="mono">ollama signin</span> once — free, no card.</div>';
+  if ($('d-key')) $('d-key').oninput = e => { pending[field] = e.target.value; };
+
+  $('d-models').innerHTML = '<div class="empty">reading the catalogue…</div>';
+  show('v-detail');
+  loadModels(id);
+}
+
+function renderModels() {
+  if (!models.length) { $('d-models').innerHTML = '<div class="empty">nothing to show</div>'; return; }
+  $('d-models').innerHTML = `<div class="chips">${models.map(m => `
+    <div class="chip ${m.id === model ? 'sel':''}" data-model="${esc(m.id)}">
+      <div class="cid">${esc(m.id)}</div>
+      <div class="csub">
+        ${m.cloud ? '<span class="pill cloud">cloud</span>' : ''}
+        ${!m.tools ? '<span class="pill bad">no tools</span>' : ''}
+        ${esc(String(m.detail).replace(m.id, '').trim())}
+      </div></div>`).join('')}</div>`;
+  document.querySelectorAll('[data-model]').forEach(el => el.onclick = () => {
+    model = el.dataset.model; chosen = viewing; renderModels();
+    $('status').innerHTML = `<span class="pill warn">unsaved — press Save</span>`;
+  });
+}
+
+async function loadModels(id) {
+  const r = await api('/api/models?provider=' + encodeURIComponent(id));
+  if (!r.ok) {
+    models = [];
+    $('d-models').innerHTML = `<div class="notice bad">${esc(r.error)}</div>`;
+    $('d-mcount').textContent = '';
+    return;
+  }
+  models = r.models;
+  if (id === chosen && models.some(m => m.id === state.model)) model = state.model;
+  else if (!models.some(m => m.id === model)) model = (models[0] || {}).id;
+  const toolless = models.filter(m => !m.tools).length;
+  $('d-mcount').textContent = `${models.length} available` +
+    (toolless ? ` · ${toolless} cannot call tools, and an agent without tools is a chatbot` : '');
+  renderModels();
+}
+
+function show(view) {
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('on', v.id === view));
+}
+$('back').onclick = () => { renderIndex(); show('v-index'); };
+$('d-refresh').onclick = () => viewing && loadModels(viewing);
+$('d-test').onclick = async () => {
+  $('d-testout').innerHTML = '<div class="notice">testing…</div>';
+  const r = await api('/api/test', { method:'POST', body: JSON.stringify({ provider: viewing }) });
+  $('d-testout').innerHTML = r.ok
+    ? `<div class="notice ok">${esc(r.detail)}</div>`
+    : `<div class="notice bad">${esc(r.error)}</div>`;
+};
+
+document.querySelectorAll('.nav').forEach(btn => btn.onclick = () => {
+  document.querySelectorAll('.nav').forEach(b => b.setAttribute('aria-current', String(b === btn)));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('on'));
+  $('p-' + btn.dataset.panel).classList.add('on');
+  if (btn.dataset.panel === 'provider') { renderIndex(); show('v-index'); }
+});
+
+$('browser-get').onclick = async () => {
+  $('browser-out').innerHTML = '<div class="notice">downloading… a few minutes, keep this tab open</div>';
+  const r = await api('/api/browser', { method:'POST', body:'{}' });
+  $('browser-out').innerHTML = r.ok
+    ? `<div class="notice ok">${esc(r.detail)}</div>` : `<div class="notice bad">${esc(r.error)}</div>`;
+  if (r.ok) {
+    state = await api('/api/state');
+    $('browser-pill').innerHTML = '<span class="pill ok">available</span>';
+    $('browser-path').textContent = state.browser.path || '';
+  }
+};
+
+$('save').onclick = async () => {
+  const body = { provider: chosen, model,
+    permission_policy: document.querySelector('input[name=pol]:checked')?.value };
+  Object.assign(body, pending);
+  for (const f of ['search_backend','search_market','searxng_url','tavily_api_key','exa_api_key'])
+    if ($(f)) body[f] = $(f).value;
+  const r = await api('/api/config', { method:'POST', body: JSON.stringify(body) });
+  $('status').innerHTML = r.ok
+    ? `<span class="pill ok">saved ${r.saved.length} setting(s)</span>`
+    : `<span class="pill bad">${esc(r.error)}</span>`;
+  if (r.ok) {
+    pending = {};
+    state = await api('/api/state');
+    if (viewing && $('v-detail').classList.contains('on')) openDetail(viewing); else renderIndex();
+  }
+};
+
+$('done').onclick = async () => {
+  await api('/api/close', { method:'POST', body:'{}' });
+  document.body.innerHTML =
+    '<main><div class="head"><h1>Done</h1>' +
+    '<p>Saved. You can close this tab — the server has stopped.</p></div></main>';
+};
+
+(async () => {
+  state = await api('/api/state');
+  chosen = state.provider; model = state.model;
+  $('path').textContent = state.config_path || '~/.smith/config.toml';
+  document.querySelectorAll('input[name=pol]')
+    .forEach(r => { r.checked = r.value === (state.permission_policy || 'ask'); });
+  if (state.browser) {
+    $('browser-pill').innerHTML = state.browser.path
+      ? '<span class="pill ok">available</span>' : '<span class="pill warn">not installed</span>';
+    $('browser-path').textContent = state.browser.path || '';
+  }
+  if (state.search) {
+    $('search_backend').value = state.search.backend || '';
+    $('search_market').value = state.search.market || '';
+    $('searxng_url').value = state.search.searxng_url || '';
+    $('tavily-st').textContent = state.search.tavily.key_set ? '(set — blank keeps it)' : '';
+    $('exa-st').textContent = state.search.exa.key_set ? '(set — blank keeps it)' : '';
+  }
+  renderIndex();
+})();
+</script>
+</body>
+</html>

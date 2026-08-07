@@ -60,7 +60,12 @@ impl ProviderKind {
             ProviderKind::Openrouter => "nvidia/nemotron-3-ultra-550b-a55b:free",
             // The gateway routes by its own prefixes; `auto` lets it pick.
             ProviderKind::NineRouter => "auto",
-            ProviderKind::Ollama => "llama3.2",
+            // Cloud, not a local weight. `llama3.2` was a model almost
+            // nobody had pulled, so the last-resort default failed with "model
+            // not found"; this one needs no download and no VRAM, and when it
+            // fails it is because the daemon is signed out — which now says so
+            // and names the free, cardless fix.
+            ProviderKind::Ollama => "nemotron-3-super:cloud",
         }
     }
 
@@ -210,14 +215,15 @@ pub fn build_provider_stack(
                  worst possible moment — configure it or remove it from the list)"
             )
         })?;
+        // A chain entry carries its own model, because `[general] model`
+        // belongs to the primary — asking OpenRouter's model of Ollama is how
+        // a fallback fails on arrival.
         let model = match fallback_kind {
-            ProviderKind::NineRouter => config
-                .nine_router
-                .model
-                .clone()
-                .unwrap_or_else(|| fallback_kind.default_model().to_string()),
-            _ => fallback_kind.default_model().to_string(),
-        };
+            ProviderKind::NineRouter => config.nine_router.model.clone(),
+            ProviderKind::Ollama => config.ollama.model.clone(),
+            _ => None,
+        }
+        .unwrap_or_else(|| fallback_kind.default_model().to_string());
         entries.push(FallbackEntry {
             provider,
             model,
@@ -734,7 +740,29 @@ pub async fn run_orchestrator(opts: OrchestratorOptions, chans: OrchestratorChan
         || config.fallback.providers.iter().any(|p| p == "9router");
     let ninerouter_starting = uses_ninerouter.then(|| {
         let config = config.clone();
-        tokio::spawn(async move { crate::node_runtime::ensure_ninerouter_running(&config).await })
+        tokio::spawn(async move {
+            crate::node_runtime::ensure_ninerouter_running(&config).await?;
+            // Running is not ready. A gateway with no upstreams answers every
+            // health probe and then 404s on the first message — the one place
+            // a user cannot do anything about it. Saying so before the turn
+            // costs one request and turns a mid-conversation failure into a
+            // sentence at startup.
+            let base_url = config
+                .nine_router
+                .base_url
+                .clone()
+                .unwrap_or_else(|| smith_config::DEFAULT_NINEROUTER_BASE_URL.to_string());
+            match crate::node_runtime::ninerouter_upstreams(&base_url).await {
+                Ok(models) if models.is_empty() => Err(format!(
+                    "the 9router gateway on {base_url} is running but routes to nothing \
+                     — open http://localhost:20128 and add a provider under `Providers`, \
+                     or every request will fail with `No active credentials`"
+                )),
+                // A list smith could not read is not evidence of a problem;
+                // the gateway is up, and the turn will report its own failure.
+                _ => Ok(()),
+            }
+        })
     });
 
     let provider = match provider_override {

@@ -262,6 +262,21 @@ impl Theme {
         })
     }
 
+    /// A token as `#rrggbb`, for somewhere that cannot speak `ratatui::Color`.
+    ///
+    /// Exists so the config page's CSS can be checked against this palette
+    /// from a crate that does not depend on ratatui. Ember is defined here and
+    /// nowhere else; a second copy in a stylesheet is exactly the pairing that
+    /// drifts, and a test that can read both is what stops it.
+    ///
+    /// `None` for an unknown token, or for one whose colour is a named ANSI
+    /// variant — those have no measurable value, which is the same reason
+    /// `rgb_of` refuses them rather than guessing.
+    pub fn token_hex(&self, name: &str) -> Option<String> {
+        let (r, g, b) = rgb_of(self.token(name)?)?;
+        Some(format!("#{r:02x}{g:02x}{b:02x}"))
+    }
+
     /// The same palette with every glyph forced to ASCII — acceptance
     /// criterion #7's terminal.
     pub fn ascii_glyphs(mut self) -> Self {
@@ -579,6 +594,20 @@ impl Theme {
             " · "
         } else {
             " | "
+        }
+    }
+
+    /// Whether a collapsible card is currently open.
+    ///
+    /// A card that hides rows has to look like one: without the glyph, a
+    /// settled research card and a plain one-call card are the same row, and
+    /// nothing on screen says the first is worth pressing Enter on.
+    pub fn disclosure(&self, expanded: bool) -> &'static str {
+        match (self.unicode, expanded) {
+            (true, true) => "▾",
+            (true, false) => "▸",
+            (false, true) => "v",
+            (false, false) => ">",
         }
     }
 

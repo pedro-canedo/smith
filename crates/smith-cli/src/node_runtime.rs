@@ -444,6 +444,49 @@ pub async fn ninerouter_healthy(base_url: &str) -> bool {
     matches!(client.get(&url).send().await, Ok(r) if r.status().as_u16() < 500)
 }
 
+/// The models the gateway will actually route to.
+///
+/// `ninerouter_healthy` answers "is the port alive", which a gateway with no
+/// upstreams configured also answers yes to — it returns `200 {"data":[]}`.
+/// That is how a session could start against a gateway that could not serve a
+/// single request, and only find out on the first message, as
+/// `404 No active credentials for provider: openai`.
+///
+/// Longer timeout than the health probe on purpose: this one is not gating a
+/// spawn decision on every startup, it is answering a question the user is
+/// waiting on.
+pub async fn ninerouter_upstreams(base_url: &str) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(parse_ninerouter_models(&body))
+}
+
+/// Pulls `data[].id` out of an OpenAI-shaped `/models` body.
+fn parse_ninerouter_models(body: &serde_json::Value) -> Vec<String> {
+    body.get("data")
+        .and_then(|d| d.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Starts the gateway if it is not already answering.
 ///
 /// Spawned **detached**, like `ensure_ollama_running`: the gateway is a
@@ -588,6 +631,47 @@ fn port_of(base_url: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug behind a reported 404. The gateway answered every health
+    /// probe, so smith started a session against it, sent the hardcoded model
+    /// `auto`, and the gateway — which has no model by that name — resolved it
+    /// to a provider called `openai` with no credentials. `data: []` is the
+    /// state that had to become visible.
+    #[test]
+    fn a_gateway_that_routes_to_nothing_reports_no_models() {
+        let empty = serde_json::json!({ "object": "list", "data": [] });
+        assert!(parse_ninerouter_models(&empty).is_empty());
+    }
+
+    #[test]
+    fn the_models_a_gateway_lists_are_read_off_their_ids() {
+        let body = serde_json::json!({
+            "data": [
+                { "id": "ag/gemini-3-flash", "object": "model" },
+                { "id": "cx/gpt-5.6-sol", "object": "model" },
+                { "id": "openrouter/nvidia/nemotron", "object": "model" },
+            ]
+        });
+        assert_eq!(
+            parse_ninerouter_models(&body),
+            [
+                "ag/gemini-3-flash",
+                "cx/gpt-5.6-sol",
+                "openrouter/nvidia/nemotron"
+            ]
+        );
+    }
+
+    /// A body smith cannot read is not evidence that the gateway is broken —
+    /// it is evidence smith does not understand this gateway. Reporting zero
+    /// models would be a claim; reporting none is an absence.
+    #[test]
+    fn an_unreadable_model_list_yields_nothing_rather_than_a_claim() {
+        assert!(parse_ninerouter_models(&serde_json::json!({})).is_empty());
+        assert!(parse_ninerouter_models(&serde_json::json!({"data": "nope"})).is_empty());
+        let junk = serde_json::json!({"data": [{"name": "no id"}, {"id": "  "}]});
+        assert!(parse_ninerouter_models(&junk).is_empty());
+    }
 
     /// The regression this file was fixed for. Without `--tray` the gateway
     /// binds its port, drops into an interactive menu, reads EOF from the null

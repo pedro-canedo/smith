@@ -25,7 +25,11 @@ smith-mcp = { workspace = true }
 smith-store = { workspace = true }
 smith-config = { workspace = true }
 smith-tui = { workspace = true }
-tokio = { workspace = true }
+# `net` is for the local config server (`smith setup web`). It is already on
+# transitively via reqwest's hyper-util, but depending on feature unification
+# for a listener is how a listener stops compiling after an unrelated dependency
+# bump. Named here so it is a decision rather than an accident.
+tokio = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 color-eyre = "0.6"
 clap = { workspace = true }
@@ -51,6 +55,10 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # is and isn't worth.
 md-5 = "0.11"
 base64 = "0.23"
+# The config server's session token. Already in the tree via smith-store, so
+# this adds nothing to the lockfile — and `v4` is 122 bits from the OS CSPRNG,
+# which is what the token needs to be unguessable.
+uuid = { workspace = true }
 
 [dev-dependencies]
 # `testkit` brings in `ScriptedProvider`, so the orchestrator/headless tests

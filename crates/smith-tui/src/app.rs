@@ -41,13 +41,22 @@ pub enum ChatRole {
     Thought,
 }
 
-/// Tools whose consecutive calls collapse into one card.
+/// The activity a tool's card belongs to, for the tools whose card is pure
+/// status.
 ///
-/// Deliberately a short list rather than "any repeated tool": the trade is
-/// only worth it when the card is pure status. A search card is its query; a
-/// `read_file` card can carry a diff or an error tail, and folding those would
-/// hide the thing you wanted to see.
-const GROUPABLE_TOOLS: &[&str] = &["web_search", "web_fetch"];
+/// Two calls share a card when they share a *class*, not when they share a
+/// name. A research burst alternates `web_search` and `web_fetch`, so keying
+/// on the name gave it one card per call — the stack this exists to remove.
+///
+/// `None` means the tool always gets its own card, which is deliberate for
+/// everything else: a `read_file` or `edit_file` card carries a diff or an
+/// error tail, and folding those hides the thing you opened the card for.
+fn group_class(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "web_search" | "web_fetch" => Some("research"),
+        _ => None,
+    }
+}
 
 /// Source of `LineStamp`s. Process-wide and monotonic, so a stamp is never
 /// reused across lines or across successive states of the same line.
@@ -68,6 +77,16 @@ pub(crate) struct LineStamp(u64);
 
 fn next_stamp() -> LineStamp {
     LineStamp(NEXT_STAMP.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The two numbers a grouped card's header carries — see
+/// `ChatLine::group_summary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupSummary {
+    /// Calls this card stands for, its own included.
+    pub steps: usize,
+    /// How many of them failed.
+    pub failed: usize,
 }
 
 /// One call folded into a grouped card — see `ChatLine::grouped`.
@@ -277,9 +296,10 @@ impl ChatLine {
     /// around one fact. A `read_file` or an `edit_file` card carries content
     /// worth its own frame, so those are never folded.
     fn can_group(&self, name: &str) -> bool {
+        let class = group_class(name);
         self.role == ChatRole::Tool
-            && self.tool_name.as_deref() == Some(name)
-            && GROUPABLE_TOOLS.contains(&name)
+            && class.is_some()
+            && group_class(self.tool_name.as_deref().unwrap_or_default()) == class
     }
 
     /// Folds another call of the same tool into this card.
@@ -297,9 +317,38 @@ impl ChatLine {
         self.touch();
     }
 
-    /// Every call this card stands for, its own first.
+    /// The calls folded into this card *after* its own — see `group_summary`
+    /// for the count that includes its own.
     pub fn grouped(&self) -> &[GroupedCall] {
         &self.grouped
+    }
+
+    /// How this card's own call ended, as opposed to the group's verdict.
+    /// `None` while it is still running.
+    pub fn own_status(&self) -> Option<ActivityStatus> {
+        self.own_status
+    }
+
+    /// What a grouped card's header says in place of a target: how many calls
+    /// it stands for, and how many of them failed.
+    ///
+    /// Counts this card's own call first — `grouped` holds only the ones
+    /// folded in after it, so a card with three siblings stands for four
+    /// steps.
+    pub fn group_summary(&self) -> GroupSummary {
+        let statuses =
+            std::iter::once(self.own_status).chain(self.grouped.iter().map(|c| Some(c.status)));
+        let mut summary = GroupSummary {
+            steps: 0,
+            failed: 0,
+        };
+        for status in statuses {
+            summary.steps += 1;
+            if status == Some(ActivityStatus::Error) {
+                summary.failed += 1;
+            }
+        }
+        summary
     }
 
     /// Marks one folded call finished. `true` when this card owned it.
@@ -315,9 +364,15 @@ impl ChatLine {
 
     /// Recomputes a grouped card's verdict from its own call and its children.
     ///
-    /// Running while anything under it is; failed if any part failed, because
-    /// a group reported as clean when one search was blocked would hide the
-    /// only fact worth acting on.
+    /// Running while anything under it is. Failed only when *nothing* got
+    /// through: a research burst that lost two fetches to a 404 while eight
+    /// other steps answered is not a failed research, and marking the card
+    /// failed made every real burst look broken. This used to fail on any one
+    /// child, to stop a group reading as clean when a search was blocked —
+    /// what actually protects that now is the header, which counts the
+    /// failures out loud (`GroupSummary::failed`) whether the card is expanded
+    /// or not. The fact is still stated; it is no longer stated by mislabelling
+    /// the whole activity.
     fn settle_group(&mut self) {
         let pending = self.own_status.is_none()
             || self
@@ -328,11 +383,8 @@ impl ChatLine {
             self.tool_status = Some(ActivityStatus::Running);
             return;
         }
-        let failed = self.own_status == Some(ActivityStatus::Error)
-            || self
-                .grouped
-                .iter()
-                .any(|c| c.status == ActivityStatus::Error);
+        let summary = self.group_summary();
+        let failed = summary.failed == summary.steps;
         self.tool_status = Some(if failed {
             ActivityStatus::Error
         } else {
@@ -1139,6 +1191,34 @@ impl App {
         if self.thinking_since.is_none() {
             self.thinking_since = Some(Instant::now());
         }
+    }
+
+    /// The card an incoming call of `name` folds into, with whatever was only
+    /// separating the two already dropped. `None` when the call opens a new
+    /// card.
+    ///
+    /// A run stays open across a `Thought` row and closes on anything else.
+    /// That row is the pause *inside* one activity and the card's own timer
+    /// already covers it, so letting it close the run put the transcript back
+    /// to one card per search — the stack this exists to remove. A reply, a
+    /// system line or a different tool's card do close it: those read as the
+    /// agent moving on, and folding a call into a card that sits above them
+    /// would reorder the transcript.
+    ///
+    /// The `Thought` rows are dropped rather than stepped over, because a card
+    /// is appended to in place: leaving them would put the group's newest step
+    /// above rows that belong to the gap before it.
+    fn join_groupable_card(&mut self, name: &str) -> Option<usize> {
+        let mut end = self.lines.len();
+        while end > 0 && self.lines[end - 1].role() == ChatRole::Thought {
+            end -= 1;
+        }
+        let index = end.checked_sub(1)?;
+        if !self.lines[index].can_group(name) {
+            return None;
+        }
+        self.lines.truncate(end);
+        Some(index)
     }
 
     /// End the thinking gap — called when the first text delta arrives or
@@ -2638,20 +2718,18 @@ impl App {
                 // checklist panel — neither needs the generic tool-call line.
                 if tool_name != "ask_user" && tool_name != "write_tasks" {
                     self.phase = AgentPhase::Working;
-                    // Consecutive calls of a status-only tool fold into the
-                    // card above rather than stacking. Only when it is the
-                    // *last* line: a search after a reply is a new activity,
-                    // and joining it to a card further up would reorder the
-                    // transcript.
-                    match self.lines.last_mut() {
-                        Some(last) if last.can_group(&tool_name) => {
+                    // Calls of one activity fold into a single card rather
+                    // than stacking — `join_groupable_card` owns what keeps a
+                    // run open and what closes it.
+                    match self.join_groupable_card(&tool_name) {
+                        Some(index) => {
                             // The child's row carries only its target: the
                             // header above it already says the activity, and
                             // repeating "Searching the web…" per row is the
                             // noise this exists to remove.
-                            last.group(id.clone(), group_target(&tool_name, &input));
+                            self.lines[index].group(id.clone(), group_target(&tool_name, &input));
                         }
-                        _ => {
+                        None => {
                             // Permanent transcript record — the tool card
                             // replaces the old activity strip, so this line is
                             // all we need.
@@ -3019,6 +3097,26 @@ pub(crate) fn tool_labels(tool_name: &str) -> ToolLabels {
                 failed: format!("{pretty} failed"),
             };
         }
+    };
+    ToolLabels {
+        running: running.to_string(),
+        done: done.to_string(),
+        failed: failed.to_string(),
+    }
+}
+
+/// The header of a card standing for a whole run of calls.
+///
+/// Not `tool_labels`, which speaks for exactly one call: "Search completed" is
+/// wrong on a card holding six searches and four page fetches, and picking the
+/// first call's wording makes the header change meaning depending on which
+/// tool happened to start the run.
+pub(crate) fn group_labels(tool_name: &str) -> ToolLabels {
+    let (running, done, failed) = match group_class(tool_name) {
+        Some("research") => ("Researching the web…", "Research", "Research failed"),
+        // Unreachable while `group_class` has one class, and a plain fallback
+        // rather than a panic so adding a class can never take the UI down.
+        _ => return tool_labels(tool_name),
     };
     ToolLabels {
         running: running.to_string(),
