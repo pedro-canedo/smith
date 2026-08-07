@@ -4,6 +4,35 @@ All notable user-facing changes are tracked here.
 
 ## Unreleased
 
+### Added
+
+- **The web console.** `smith --web` serves the running session to a browser
+  on `127.0.0.1`, behind a per-run token shown in the TUI chrome: the live
+  transcript over SSE (each frame is one `--output-format stream-json` line,
+  verbatim), a composer that submits when idle and interjects mid-turn, the
+  permission and question prompts, the task board, and the project's session
+  history. First answer wins across frontends — approving in the browser
+  closes the TUI's modal and vice versa. Off by default; `[web]` in the
+  config (`enabled`, `port`, `open_browser`) or `--web`/`--web-port` per
+  run; headless runs never start it. Design record: `docs/web-console.md`.
+
+- **The task checklist grew into a board.** `write_tasks` now accepts
+  `blocked` (with a one-line `blocked_reason`) and `review` statuses, and
+  optional stable `id`s the model echoes back; smith stamps `updated_at` at
+  receipt (never model-supplied) and persists the board per session, so
+  `--resume` restores it stamps-and-all instead of re-scanning history.
+
+### Changed
+
+- **stream-json, two compatibility notes.** New `AgentEvent` variants
+  `permission_resolved` and `question_resolved` join the contract (emitted
+  by the interactive ask broker; never in headless output today — but treat
+  unknown `type`s as skippable). `tasks_updated` payloads may now carry
+  `status: "blocked" | "review"` plus optional `id`/`blocked_reason`/
+  `updated_at` fields whenever the model uses them; consumers matching
+  `status` exhaustively need the two new arms. A task using none of the new
+  fields serializes byte-identically to before.
+
 ### Fixed
 
 - **`smith --version` told the truth again, and `smith update` stopped looping.**

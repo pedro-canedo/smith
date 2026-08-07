@@ -200,6 +200,22 @@ conservative: if a file changed after the original turn, Smith refuses to
 overwrite it unless you explicitly use `--force`. It never claims to undo
 `run_bash` or MCP side effects.
 
+### The web console
+
+```sh
+smith --web
+```
+
+Starts a local web console beside the TUI and shows its link in the chrome:
+the same session, live, in a browser — transcript and tool cards over SSE, a
+composer that submits when idle and interjects mid-turn, the permission and
+question prompts (first answer wins, across the TUI and the browser), the
+task board with `blocked`/`review` columns, and this project's session
+history. Loopback only, behind a per-run token; the console lives exactly as
+long as the session and cannot outlive it. Configure with `[web]`
+(`enabled`, `port`, `open_browser`) or pin a port with `--web-port`.
+Headless runs never start it. Design: [docs/web-console.md](docs/web-console.md).
+
 ## Providers and configuration
 
 ### Free by default
@@ -356,6 +372,8 @@ smith [OPTIONS] [COMMAND]
 | `--cwd <DIR>` | Run against another project directory |
 | `--allowed-tools <LIST>` | Allow named tools in headless mode |
 | `--persona <NAME>` | Select an output style |
+| `--web` | Serve the local web console for this session |
+| `--web-port <PORT>` | Pin the console's port (default: ephemeral) |
 | `setup` | Configure provider, key, and model |
 | `remember` | Add a standing instruction to `SMITH.md` |
 | `sessions` | List, export, fork, or inspect sessions |
@@ -378,7 +396,7 @@ Smith is an eight-crate Rust workspace with a one-way dependency flow toward
 | `smith-store` | SQLite session persistence |
 | `smith-config` | Layered config, memory, and extensions |
 | `smith-tui` | `ratatui`/`crossterm` interface |
-| `smith-cli` | CLI, orchestration, prompts, and headless mode |
+| `smith-cli` | CLI, orchestration, prompts, headless mode, and the web console server |
 
 The TUI communicates with the agent through `Action` and `AgentEvent` channels;
 it never talks directly to providers or tools. See [CLAUDE.md](CLAUDE.md) for
