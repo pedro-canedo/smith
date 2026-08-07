@@ -136,7 +136,13 @@ Workflow:
 - To find things, use grep (content) and glob (filenames). Both are read-only and never prompt — running grep or find through run_bash instead makes the user approve a shell command for a search, which is friction with no benefit.
 - For existing files: read_file, then edit_file. Use multi_edit when changing several places in one file — it applies all of them or none. Use write_file only to create a file or fully overwrite one you have already read — overwriting a file this session has not read is refused, and so is overwriting one that changed on disk since you read it.
 - After each tool result, briefly verify success or failure before the next mutation.
+- Read surgically: locate with grep/glob first, then read_file with offset/limit around the match instead of whole large files. Don't re-read a file you already read unless it changed or the read was truncated — an unchanged file is already known.
 - Do not produce large plans unless the user ran /plan.
+
+Code quality:
+- Match the file you are editing: its naming, error handling, formatting and libraries. Reuse an existing helper before writing a new one, and never add a dependency without saying so.
+- Never invent an API. If you are not certain a function, flag or config key exists, read the source or search before using it.
+- Find the project's own quality gates — test, lint and format commands in CI config, Makefile, package.json, Cargo.toml or the README — and run them before declaring work done. Done means the gates pass, not that the code looks right.
 
 Deliverables:
 - The answer to a question or a research request is your reply in chat, in prose. Never create files (reports, HTML pages, notes, summaries, scripts) the user did not ask for. \"pesquise X\" / \"search for X\" / \"what is X\" is answered in chat: zero writes. (Whether it needs a web_search first is a separate judgement — see Research.)
@@ -421,6 +427,21 @@ mod system_prompt_composition_tests {
         // And says which way the tie breaks, since the sources are the thing
         // pulling the other way.
         assert!(super::PROMPT_INVARIANTS.contains("not the language of what you read"));
+    }
+
+    /// The golden rules land in the *style* half: every one of them is a
+    /// working default a persona may legitimately replace, unlike the
+    /// invariants above them.
+    #[test]
+    fn the_style_carries_the_token_economy_and_code_quality_rules() {
+        assert!(super::PROMPT_STYLE.contains("Read surgically"));
+        assert!(super::PROMPT_STYLE.contains("already known"));
+        assert!(super::PROMPT_STYLE.contains("Code quality:"));
+        assert!(super::PROMPT_STYLE.contains("Never invent an API"));
+        assert!(super::PROMPT_STYLE.contains("quality gates"));
+        assert!(super::PROMPT_STYLE.contains("Done means the gates pass"));
+        // ...and none of it leaked into the half a persona cannot replace.
+        assert!(!super::PROMPT_INVARIANTS.contains("Code quality"));
     }
 
     use std::sync::Arc;
