@@ -1,12 +1,23 @@
 # Files allowed past the limit in scripts/check-file-size.sh, each with the
-# reason it earns the exception. This list is a backlog, not a record: the
-# check fails on an entry that has dropped under the limit, so removing a name
-# from here is part of the commit that shrinks the file.
+# reason it earns the exception. The check fails on an entry that has dropped
+# under the limit, so removing a name from here is part of the commit that
+# shrinks the file — and adding one is a line in a diff somebody has to agree
+# with.
 #
-# Every entry below is the same debt — a module that still holds more than one
-# concern. Splitting them is planned work, not a discovery.
+# This list used to be a backlog: eight entries, every one the same debt — a
+# module holding more than one concern. All eight are paid. What is left is one
+# argued, permanent exception, and the list should be read that way now: a name
+# appearing here is a claim that splitting the file would make it worse, not a
+# promise to split it later.
+#
+# If a second entry ever shows up, the honest question is which of the two it
+# is. A file that is genuinely one cohesive thing over 1500 lines is rare; a
+# file that is three things and nobody has got to it yet is the normal case,
+# and that one belongs in a commit, not here.
 
-# One lexer with ~50 small scanner functions. Cohesive as it stands — this is
-# the entry least likely to be paid off, and splitting it into six files would
-# make the state machine harder to follow, not easier.
+# One lexer, ~50 small scanner functions, plus ~310 lines of keyword tables.
+# Cohesive as it stands: the scanners are the arms of a single state machine
+# and splitting them across six files would mean reading the machine by jumping
+# between files, which is harder than reading it long. Deliberately not split
+# when everything around it was.
 crates/smith-tui/src/highlight.rs
