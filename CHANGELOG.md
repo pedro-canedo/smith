@@ -4,6 +4,38 @@ All notable user-facing changes are tracked here.
 
 ## Unreleased
 
+### Fixed
+
+- **`smith --version` told the truth again, and `smith update` stopped looping.**
+  Tags `v0.2.1`, `v0.2.2` and `v0.2.3` were released without bumping
+  `[workspace.package] version`, which is what `env!("CARGO_PKG_VERSION")` bakes
+  into the binary. Every one of those releases therefore reported `smith 0.2.0`
+  — and because `smith update` compares the latest tag against that baked-in
+  number, it saw a newer release, installed it, still reported the old version,
+  and offered the same update again on the next run. If you installed
+  0.2.1–0.2.3 you have the right binary; it was only ever describing itself
+  wrongly. The release workflow now fails when the tag and the manifest
+  disagree, so this cannot ship again.
+
+### Added
+
+- **Prerequisites are installed rather than reported.** `smith setup` opens on a
+  `Runtimes` section that resolves what this configuration actually needs —
+  Node for the 9router gateway, the gateway itself, Chrome for Testing,
+  and any Ollama model named in the config — asking before each download.
+  `smith doctor --fix` applies the same resolver without the wizard.
+  Requirements are read from `[fallback] providers` as well as the primary
+  provider, so a gateway that only appears in the fallback chain is set up
+  before a turn reaches for it rather than when one does.
+
+### Changed
+
+- **A Node the machine already has is used when it is new enough.** smith
+  checks the Node on `PATH` against 9router's own floor (`>=18`) instead of
+  taking the first one it finds on faith, and only downloads its private
+  Node 24.19.0 when there is nothing usable. Previously a too-old Node was
+  launched anyway and failed with whatever the gateway happened to print.
+
 ## 0.2.0 — 2026-08-06
 
 ### Added

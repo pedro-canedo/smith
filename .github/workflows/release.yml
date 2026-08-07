@@ -58,6 +58,28 @@ jobs:
           RAW_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: echo "VERSION=${RAW_TAG#v}" >> "$GITHUB_ENV"
 
+      # The tag names the artifacts; `Cargo.toml` is what `env!("CARGO_PKG_VERSION")`
+      # bakes into the binary, and therefore what `smith --version` says and what
+      # `smith update` compares against. When they disagree the release is a
+      # binary that lies about itself — and worse, `update` then sees the newer
+      # tag forever, installs it, still reports the old version, and offers the
+      # same update again. v0.2.1 through v0.2.3 shipped that way.
+      #
+      # Checked rather than auto-bumped on purpose: auto-bumping would mean the
+      # version in the published artifact never appears in any commit, so
+      # `git checkout <tag> && cargo build` would not reproduce the release.
+      # One source of truth, and tagging without bumping is a red release.
+      - name: Version matches the tag
+        shell: bash
+        run: |
+          manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$manifest" != "$VERSION" ]; then
+            echo "::error::Cargo.toml says $manifest but the tag says $VERSION." >&2
+            echo "Bump [workspace.package] version to $VERSION, commit, then re-tag." >&2
+            exit 1
+          fi
+          echo "Cargo.toml and the tag agree on $VERSION."
+
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:

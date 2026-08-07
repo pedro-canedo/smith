@@ -27,6 +27,7 @@ mod resources;
 mod runtime;
 mod setup;
 mod subagents;
+mod uninstall;
 mod update;
 mod webconfig;
 
@@ -158,6 +159,18 @@ enum Commands {
     },
     /// Check for and install the latest published Smith release.
     Update,
+    /// Remove everything installing smith put on this machine: the runtimes it
+    /// downloaded, its global config, and the binary itself. Shows the plan and
+    /// its size before removing anything.
+    Uninstall {
+        /// Skip the confirmations. For scripts; pair with `--keep-config` if
+        /// the credentials should survive.
+        #[arg(long)]
+        yes: bool,
+        /// Leave `~/.smith/config.toml` (and the API keys in it) in place.
+        #[arg(long)]
+        keep_config: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -296,6 +309,16 @@ async fn main() -> ExitCode {
     // After `--cwd`, because the project config layer, `.smith/` and the
     // session store it inspects all hang off the working directory — doctor
     // has to be looking at the same project a real run would.
+    if let Some(Commands::Uninstall { yes, keep_config }) = &command {
+        return match uninstall::run(*yes, *keep_config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("smith: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
     if let Some(Commands::Doctor { fix }) = &command {
         return ExitCode::from(doctor::run(*fix).await);
     }
