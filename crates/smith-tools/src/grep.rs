@@ -23,6 +23,7 @@ use ignore::WalkBuilder;
 use smith_core::{PermissionClass, Tool, ToolContext, ToolResult};
 use tokio_util::sync::CancellationToken;
 
+use crate::args::{field_bool, field_str, field_u64};
 use crate::fs_tools::{build_globset, clip_line, jail_root, path_is_inside, relative_to, resolve};
 
 /// Matching lines carried back in `content` mode.
@@ -168,9 +169,7 @@ Output is capped and any truncation is stated in the last line — re-run narrow
 }
 
 fn build_opts(input: &serde_json::Value, ctx: &ToolContext) -> Result<SearchOpts, String> {
-    let pattern = input
-        .get("pattern")
-        .and_then(|v| v.as_str())
+    let pattern = field_str(input, "pattern")
         .ok_or("missing required field: pattern")?
         .to_string();
     if pattern.is_empty() {
@@ -178,26 +177,23 @@ fn build_opts(input: &serde_json::Value, ctx: &ToolContext) -> Result<SearchOpts
     }
 
     let root = jail_root(ctx);
-    let scope = resolve(
-        ctx,
-        input.get("path").and_then(|v| v.as_str()).unwrap_or("."),
-    )?;
+    let scope = resolve(ctx, field_str(input, "path").unwrap_or("."))?;
     if !scope.exists() {
         return Err(format!("{} does not exist", relative_to(&root, &scope)));
     }
 
-    let mode = match input.get("mode").and_then(|v| v.as_str()) {
+    let mode = match field_str(input, "mode") {
         None => Mode::Content,
         Some(m) => Mode::parse(m)
             .ok_or_else(|| format!("unknown mode '{m}' (content, files_with_matches, count)"))?,
     };
 
-    let globs = match input.get("glob").and_then(|v| v.as_str()) {
+    let globs = match field_str(input, "glob") {
         Some(g) if !g.is_empty() => Some(build_globset(g)?),
         _ => None,
     };
 
-    let types = match input.get("type").and_then(|v| v.as_str()) {
+    let types = match field_str(input, "type") {
         Some(t) if !t.is_empty() => {
             let mut builder = ignore::types::TypesBuilder::new();
             builder.add_defaults();
@@ -212,11 +208,7 @@ fn build_opts(input: &serde_json::Value, ctx: &ToolContext) -> Result<SearchOpts
     };
 
     let num = |key: &str| -> usize {
-        input
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            .min(MAX_CONTEXT as u64) as usize
+        field_u64(input, key).unwrap_or(0).min(MAX_CONTEXT as u64) as usize
     };
     let both = num("context");
 
@@ -224,21 +216,12 @@ fn build_opts(input: &serde_json::Value, ctx: &ToolContext) -> Result<SearchOpts
         root,
         scope,
         pattern,
-        literal: input
-            .get("literal")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        case_insensitive: input
-            .get("case_insensitive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        literal: field_bool(input, "literal").unwrap_or(false),
+        case_insensitive: field_bool(input, "case_insensitive").unwrap_or(false),
         mode,
         globs,
         types,
-        include_hidden: input
-            .get("include_hidden")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        include_hidden: field_bool(input, "include_hidden").unwrap_or(false),
         before: num("before_context").max(both),
         after: num("after_context").max(both),
     })

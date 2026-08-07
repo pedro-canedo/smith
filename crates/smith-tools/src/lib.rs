@@ -1,5 +1,6 @@
 //! Built-in tools (file, shell), the ToolRegistry, and the permission gate.
 
+mod args;
 pub mod ask_user;
 pub mod bing;
 pub mod checkpoint;

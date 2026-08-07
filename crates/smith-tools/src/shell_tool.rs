@@ -1,3 +1,4 @@
+use crate::args::{field_str, field_u64};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -79,13 +80,10 @@ impl Tool for RunBashTool {
         ctx: &ToolContext,
         cancel: CancellationToken,
     ) -> ToolResult {
-        let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
+        let Some(command) = field_str(&input, "command") else {
             return ToolResult::error("missing required field: command");
         };
-        let timeout_secs = input
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = field_u64(&input, "timeout_secs").unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")

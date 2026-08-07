@@ -37,6 +37,7 @@
 //! with the model quietly answering from training data. [`Unavailable`] keeps
 //! them apart all the way to the message the model reads.
 
+use crate::args::{field_str, field_u64};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -237,17 +238,11 @@ impl Tool for WebSearchTool {
         ctx: &ToolContext,
         cancel: CancellationToken,
     ) -> ToolResult {
-        let query = input
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
+        let query = field_str(&input, "query").unwrap_or("").trim();
         if query.is_empty() {
             return ToolResult::error("web_search requires a non-empty `query`");
         }
-        let num_results = input
-            .get("num_results")
-            .and_then(|v| v.as_u64())
+        let num_results = field_u64(&input, "num_results")
             .unwrap_or(DEFAULT_NUM_RESULTS)
             .clamp(1, MAX_NUM_RESULTS) as usize;
 

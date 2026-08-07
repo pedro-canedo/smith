@@ -26,6 +26,7 @@
 //! the redirect loop, the SSRF gate, the HTML conversion and the size cap are
 //! all exercised with no socket in sight.
 
+use crate::args::{field_str, field_u64};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -470,17 +471,11 @@ impl Tool for WebFetchTool {
         ctx: &ToolContext,
         cancel: CancellationToken,
     ) -> ToolResult {
-        let url = input
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
+        let url = field_str(&input, "url").unwrap_or("").trim();
         if url.is_empty() {
             return ToolResult::error("web_fetch requires a non-empty `url`");
         }
-        let max_chars = input
-            .get("max_chars")
-            .and_then(|v| v.as_u64())
+        let max_chars = field_u64(&input, "max_chars")
             .unwrap_or(DEFAULT_MAX_CHARS as u64)
             .clamp(MIN_MAX_CHARS, MAX_MAX_CHARS) as usize;
 

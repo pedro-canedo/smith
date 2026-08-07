@@ -39,6 +39,7 @@
 //! no skills at all the frontend does not register the tool, so the cost is
 //! exactly zero — see `smith_cli::orchestrator`.
 
+use crate::args::field_str;
 use async_trait::async_trait;
 use smith_core::{PermissionClass, Tool, ToolContext, ToolResult};
 use tokio_util::sync::CancellationToken;
@@ -143,7 +144,7 @@ impl Tool for SkillTool {
         _ctx: &ToolContext,
         _cancel: CancellationToken,
     ) -> ToolResult {
-        let Some(requested) = input.get("name").and_then(|v| v.as_str()) else {
+        let Some(requested) = field_str(&input, "name") else {
             return ToolResult::error(format!(
                 "`skill` needs a `name`. Available: {}.",
                 self.names()

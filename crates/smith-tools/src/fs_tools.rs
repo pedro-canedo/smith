@@ -3,6 +3,8 @@ use smith_core::{PermissionClass, Tool, ToolContext, ToolResult};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::args::{field_bool, field_str};
+
 mod jail;
 
 pub(crate) use jail::{
@@ -34,14 +36,6 @@ const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
 /// Paths returned by one `glob` call.
 const MAX_GLOB_RESULTS: usize = 500;
-
-fn field_str<'a>(input: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    input.get(key).and_then(|v| v.as_str())
-}
-
-fn field_bool(input: &serde_json::Value, key: &str) -> Option<bool> {
-    input.get(key).and_then(|v| v.as_bool())
-}
 
 /// The single file a `write_file`/`edit_file`/`multi_edit` call will change,
 /// resolved exactly the way `execute` will resolve it.
