@@ -1,5 +1,12 @@
 use super::*;
+// `use super::*` reaches only what `main.rs` itself still names; the rest moved
+// into sibling modules and is imported here by its own path.
+use crate::frontend::{color_enabled, headless_color, term_is_dumb, tui_theme};
+use crate::startup::{first_run_needed, PROVIDER_KEY_ENVS};
+use crate::subcommands::browser_path_to_export;
 use clap::CommandFactory;
+use smith_config::Config;
+use smith_tui::Theme;
 use smith_tui::ThemeName;
 use std::ffi::OsStr;
 

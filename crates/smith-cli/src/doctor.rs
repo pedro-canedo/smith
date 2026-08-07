@@ -1094,9 +1094,6 @@ async fn check_mcp_server(server: &McpServerConfig) -> Check {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 /// Whether the daemon can actually reach the cloud models it is linked to.
 ///
 /// A separate check because it is a separate failure: `ollama` can be
@@ -1212,3 +1209,6 @@ fn pick_cloud_probe(configured: &str, linked: &[smith_provider::OllamaModel]) ->
         .or_else(|| linked.iter().find(|m| m.is_cloud))
         .map(|m| m.name.clone())
 }
+
+#[cfg(test)]
+mod tests;

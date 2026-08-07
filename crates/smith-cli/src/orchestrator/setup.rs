@@ -234,7 +234,7 @@ pub(super) async fn wire(
         // `--allowed-tools` is the only gate the run has.
         .with_unattended(unattended);
     agent.set_goal(initial_goal);
-    let seeded_tasks = crate::last_write_tasks_call(&initial_messages);
+    let seeded_tasks = crate::startup::last_write_tasks_call(&initial_messages);
     if !initial_messages.is_empty() {
         agent.seed_history(initial_messages);
     }
