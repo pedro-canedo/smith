@@ -495,41 +495,71 @@ impl LlmProvider for OpenAiProvider {
             return Err(self.translate_error(api_error(resp).await));
         }
 
-        let mut events = resp.bytes_stream().eventsource();
+        Ok(events_from_sse(resp.bytes_stream().eventsource()))
+    }
+}
 
-        let stream = async_stream::stream! {
-            let mut state = SseState::default();
+/// Normalizes a stream of SSE events into `StreamEvent`s.
+///
+/// Split out of `stream_completion` so a test can drive it without a socket.
+/// What needs driving is the *end* of the body, and no mocked response can
+/// express "the connection closed here" as directly as handing this function
+/// a stream that stops.
+fn events_from_sse<S, E>(mut events: S) -> BoxStream<'static, Result<StreamEvent, ProviderError>>
+where
+    S: futures::Stream<Item = Result<eventsource_stream::Event, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    Box::pin(async_stream::stream! {
+        let mut state = SseState::default();
+        let mut completed = false;
 
-            while let Some(ev) = events.next().await {
-                let ev = match ev {
-                    Ok(ev) => ev,
-                    Err(e) => {
-                        yield Err(ProviderError::Http(e.to_string()));
-                        break;
-                    }
-                };
-                if ev.data.is_empty() {
-                    continue;
-                }
-                if ev.data.trim() == "[DONE]" {
-                    yield Ok(StreamEvent::MessageComplete { stop_reason: state.stop_reason, usage: state.usage });
+        while let Some(ev) = events.next().await {
+            let ev = match ev {
+                Ok(ev) => ev,
+                Err(e) => {
+                    // The turn is over either way, and the error is what the
+                    // caller acts on — a trailing MessageComplete after it
+                    // would be unreachable at best and misleading at worst.
+                    completed = true;
+                    yield Err(ProviderError::Http(e.to_string()));
                     break;
                 }
-                let payload: serde_json::Value = match serde_json::from_str(&ev.data) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        yield Err(ProviderError::Parse(e.to_string()));
-                        continue;
-                    }
-                };
-                for out in parse_chunk(&payload, &mut state) {
-                    yield Ok(out);
-                }
+            };
+            if ev.data.is_empty() {
+                continue;
             }
-        };
+            if ev.data.trim() == "[DONE]" {
+                completed = true;
+                yield Ok(StreamEvent::MessageComplete { stop_reason: state.stop_reason, usage: state.usage });
+                break;
+            }
+            let payload: serde_json::Value = match serde_json::from_str(&ev.data) {
+                Ok(v) => v,
+                Err(e) => {
+                    yield Err(ProviderError::Parse(e.to_string()));
+                    continue;
+                }
+            };
+            for out in parse_chunk(&payload, &mut state) {
+                yield Ok(out);
+            }
+        }
 
-        Ok(Box::pin(stream))
-    }
+        // The 9router gateway ends the body after the chunk carrying
+        // `finish_reason` and `usage`, without the `[DONE]` sentinel. A closed
+        // body is an end of message just as much as the sentinel is, and
+        // `MessageComplete` is the only carrier for the two things that chunk
+        // brought: dropping it left `stop_reason` at its `EndTurn` default, so
+        // a turn whose whole content was a tool call reached `run_turn` as a
+        // finished turn with nothing to show, and the tool never ran. The
+        // usage went with it, which is why the context gauge read zero all
+        // session. OpenAI, OpenRouter and Ollama all send `[DONE]`, so for
+        // them this is dead code.
+        if !completed {
+            yield Ok(StreamEvent::MessageComplete { stop_reason: state.stop_reason, usage: state.usage });
+        }
+    })
 }
 
 #[derive(Default)]
@@ -1059,6 +1089,68 @@ mod tests {
         let finished = parse_chunk(&finish, &mut state);
         assert!(matches!(&finished[0], StreamEvent::ToolUseComplete { id } if id == "call_1"));
         assert_eq!(state.stop_reason, StopReason::ToolUse);
+    }
+
+    /// Feeds `events_from_sse` the `data:` payloads of one response, in order,
+    /// and collects what it normalizes them into.
+    async fn drain_sse(payloads: &[&str]) -> Vec<StreamEvent> {
+        let events = futures::stream::iter(
+            payloads
+                .iter()
+                .map(|data| {
+                    Ok::<_, std::convert::Infallible>(eventsource_stream::Event {
+                        data: (*data).to_string(),
+                        ..Default::default()
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        events_from_sse(events)
+            .map(|ev| ev.expect("no error was scripted"))
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_body_that_ends_without_done_still_completes_the_message() {
+        // 9router closes the connection after the `finish_reason` chunk. Left
+        // uncompleted, the stop reason fell back to `EndTurn` and `run_turn`
+        // finished the turn without ever dispatching the tool call.
+        let events = drain_sse(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"x\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2928,"completion_tokens":217}}"#,
+        ])
+        .await;
+
+        let Some(StreamEvent::MessageComplete { stop_reason, usage }) = events.last() else {
+            panic!("the stream must complete the message it never saw `[DONE]` for: {events:?}");
+        };
+        assert_eq!(*stop_reason, StopReason::ToolUse);
+        assert_eq!(usage.input_tokens, 2928);
+        assert_eq!(usage.output_tokens, 217);
+    }
+
+    #[tokio::test]
+    async fn the_done_sentinel_still_completes_the_message_exactly_once() {
+        let events = drain_sse(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+            "[DONE]",
+        ])
+        .await;
+
+        let completions = events
+            .iter()
+            .filter(|ev| matches!(ev, StreamEvent::MessageComplete { .. }))
+            .count();
+        assert_eq!(completions, 1, "the fallback must not double-complete");
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::MessageComplete {
+                stop_reason: StopReason::EndTurn,
+                ..
+            })
+        ));
     }
 
     #[test]

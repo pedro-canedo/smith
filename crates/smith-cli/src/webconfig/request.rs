@@ -25,6 +25,7 @@ pub enum Route {
     Models,
     Config,
     Test,
+    Browser,
     Close,
 }
 
@@ -37,6 +38,7 @@ impl Route {
             ("GET", "/api/models") => (Self::Models, false),
             ("POST", "/api/config") => (Self::Config, true),
             ("POST", "/api/test") => (Self::Test, true),
+            ("POST", "/api/browser") => (Self::Browser, true),
             ("POST", "/api/close") => (Self::Close, true),
             _ => return None,
         })

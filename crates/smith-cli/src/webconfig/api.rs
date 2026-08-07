@@ -25,6 +25,7 @@ pub async fn dispatch(req: super::request::Request) -> (u16, String) {
         Route::Models => models(req.query.get("provider").map(String::as_str)).await,
         Route::Config => write_config(&req.body),
         Route::Test => test(&req.body).await,
+        Route::Browser => provision_browser().await,
         // Handled by the server loop, which has to shut down rather than
         // reply — it never reaches here.
         Route::Close | Route::Page => Ok(json!({ "ok": true })),
@@ -69,8 +70,14 @@ async fn state() -> Result<Value, String> {
         "search": {
             "backend": config.search.backend,
             "searxng_url": config.search.searxng_url,
+            "market": config.search.market,
             "tavily": key(config.tavily.api_key.as_ref(), "TAVILY_API_KEY"),
             "exa": key(config.exa.api_key.as_ref(), "EXA_API_KEY"),
+        },
+        "browser": {
+            "path": crate::runtime::find_browser(&config.runtime)
+                .map(|found| found.path.display().to_string()),
+            "version": config.runtime.chromium_version,
         },
         "config_path": smith_config::config_path().ok().map(|p| p.display().to_string()),
     }))
@@ -180,6 +187,7 @@ fn write_config(body: &str) -> Result<Value, String> {
     apply("ninerouter_model", &mut config.nine_router.model);
     apply("ollama_model", &mut config.ollama.model);
     apply("search_backend", &mut config.search.backend);
+    apply("search_market", &mut config.search.market);
     apply("searxng_url", &mut config.search.searxng_url);
     apply("tavily_api_key", &mut config.tavily.api_key);
     apply("exa_api_key", &mut config.exa.api_key);
@@ -222,5 +230,48 @@ async fn test(body: &str) -> Result<Value, String> {
     match crate::orchestrator::build_provider(kind, &config) {
         Ok(_) => Ok(json!({ "ok": true, "detail": "configured and ready" })),
         Err(e) => Ok(json!({ "ok": false, "error": e })),
+    }
+}
+
+/// Downloads the headless browser `web_search`'s strongest free tier needs.
+///
+/// Synchronous, and the page says so before you press it. The server handles
+/// one request at a time by design — a single human is filling in a form — so
+/// a long download blocks it rather than racing anything, and the alternative
+/// (a job id and polling) is machinery for a button pressed once.
+///
+/// Never fatal, matching `section_browser`: `web_search` still works over
+/// plain HTTP, with weaker results, so a failed provision costs the tier and
+/// not the session.
+async fn provision_browser() -> Result<Value, String> {
+    let mut config = Config::load().unwrap_or_default();
+    let root = smith_config::runtime_dir().map_err(|e| e.to_string())?;
+    let source = crate::runtime::HttpAssetSource::new()?;
+
+    // Progress goes to the terminal that launched this, not to the browser.
+    // The download is the one thing here that takes minutes, and the terminal
+    // is already the audit log for everything else this page does.
+    match crate::runtime::provision_chromium(&source, &root, &mut std::io::stdout()).await {
+        Ok(installed) => {
+            config.runtime.chromium_path = Some(installed.binary.to_string_lossy().into_owned());
+            config.runtime.chromium_version = Some(installed.version.clone());
+            config.save().map_err(|e| e.to_string())?;
+            println!("  saved: runtime.chromium_path");
+            Ok(json!({
+                "ok": true,
+                "detail": if installed.reused {
+                    format!("{} was already current", installed.reported_version)
+                } else {
+                    format!("{} ready", installed.reported_version)
+                },
+            }))
+        }
+        // Never fatal, matching `section_browser`: web_search still works over
+        // plain HTTP with weaker results, so a failed provision costs the tier
+        // and not the session.
+        Err(e) => Ok(json!({
+            "ok": false,
+            "error": format!("{e} — web_search still works over plain HTTP, with weaker results"),
+        })),
     }
 }
