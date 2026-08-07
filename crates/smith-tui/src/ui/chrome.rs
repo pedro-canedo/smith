@@ -3,7 +3,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::{App, IdleHint, Overlay, OverlayBody};
@@ -324,7 +324,6 @@ pub(super) fn draw_slash_suggestions(
     area: Rect,
 ) {
     let theme = &app.theme;
-    let w = area.width as usize;
     let prefix = app.completion_kind.prefix();
     // A path is the whole entry and carries no description, so padding it to
     // a command's column width would just push every row right.
@@ -332,33 +331,40 @@ pub(super) fn draw_slash_suggestions(
         crate::complete::CompletionKind::Slash => 12,
         crate::complete::CompletionKind::File => 0,
     };
-    let mut lines: Vec<Line> = suggestions
+
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+
+    // Every suggestion becomes an item, not just the first windowful, and
+    // `ListState` scrolls to keep the selected one on screen. Drawing a fixed
+    // six and letting the cursor run past them meant that from the seventh
+    // match on, the highlighted row was off screen: nothing looked selected,
+    // and Enter accepted something the user could not see.
+    let items: Vec<ListItem> = suggestions
         .iter()
-        .take(6)
-        .enumerate()
-        .map(|(i, s)| {
-            let selected = i == app.slash_selected;
-            let marker = if selected { "› " } else { "  " };
-            let spans = vec![Span::styled(
-                format!("{marker}{prefix}{:<name_width$} {}", s.name, s.description),
-                if selected {
-                    theme.info_bold()
-                } else {
-                    theme.secondary()
-                },
-            )];
-            if selected {
-                panel::fill_line(spans, w, theme.hover_bg())
-            } else {
-                Line::from(spans)
-            }
+        .map(|s| {
+            ListItem::new(Line::from(Span::styled(
+                format!("{prefix}{:<name_width$} {}", s.name, s.description),
+                theme.secondary(),
+            )))
         })
         .collect();
-    lines.push(Line::from(Span::styled(
-        "  Tab complete · ↑↓ select · Enter accept",
-        theme.disabled(),
-    )));
-    frame.render_widget(Paragraph::new(lines), area);
+    let marker = format!("{} ", theme.marker_selected());
+    let list = List::new(items)
+        .highlight_style(theme.info_bold().bg(theme.hover))
+        .highlight_symbol(marker.as_str());
+    let mut state = ListState::default().with_selected(Some(app.slash_selected));
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    let hint = if theme.unicode {
+        "  Tab complete · ↑↓ select · Enter accept"
+    } else {
+        "  Tab complete | up/down select | Enter accept"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, theme.disabled()))),
+        hint_area,
+    );
 }
 
 pub(super) fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {

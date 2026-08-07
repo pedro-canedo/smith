@@ -1,9 +1,9 @@
 //! The four modal drawers.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::components::{chips, panel, scrollbar};
@@ -273,6 +273,10 @@ pub(super) fn draw_question_modal(
 /// Sized to the terminal rather than to the list — a gateway can offer dozens,
 /// and a modal that grows past the frame is one that cannot be read at the
 /// bottom.
+/// Rows the picker spends on everything that is not a model: both borders,
+/// the filter line, the two blank separators and the hint row.
+const PICKER_CHROME_ROWS: u16 = 6;
+
 pub(super) fn draw_model_picker(
     frame: &mut Frame,
     modal: &mut crate::app::ModelPicker,
@@ -280,83 +284,131 @@ pub(super) fn draw_model_picker(
     area: Rect,
 ) {
     let outer = clamp_width(area, 76.min(area.width));
-    let width = outer.width as usize - panel::box_chrome_width();
-    let rows = area.height.saturating_sub(9).clamp(3, 14) as usize;
-    modal.clamp(rows);
+    // What the frame can spare, then what the list actually has to show: a
+    // box that keeps its full height for three models is mostly blank rows,
+    // and the hint at the bottom drifts away from the row it describes.
+    let room = area.height.saturating_sub(9).clamp(3, 14);
+    let rows = room.min((modal.matches().len() as u16).max(1));
+    modal.clamp(rows as usize);
 
+    // Copied out before `matches()` borrows the modal, so the list can be
+    // built from the borrow while the state values stay usable.
+    let (selected, offset, filter, provider) = (
+        modal.selected,
+        modal.scroll,
+        modal.filter.clone(),
+        modal.provider.clone(),
+    );
     let matches = modal.matches();
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let total = matches.len();
 
-    let (filter, filter_style) = if modal.filter.is_empty() {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.block_border_set())
+        .padding(panel::block_padding())
+        .title(Span::styled(
+            format!(" {provider} models "),
+            theme.ember_bold(),
+        ))
+        .border_style(theme.ember())
+        .style(theme.raised_bg());
+
+    let rect = center_vertically(outer, rows + PICKER_CHROME_ROWS);
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+
+    let [filter_area, _, list_area, _, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let (filter_text, filter_style) = if filter.is_empty() {
         ("type to filter".to_string(), theme.disabled())
     } else {
-        (modal.filter.clone(), theme.text())
+        (filter, theme.text())
     };
-    lines.push(panel::fill_line(
-        vec![Span::styled(filter, filter_style)],
-        width,
-        theme.overlay_bg(),
-    ));
-    lines.push(panel::fill_line(Vec::new(), width, theme.raised_bg()));
+    frame.render_widget(
+        Paragraph::new(panel::fill_line(
+            vec![Span::styled(filter_text, filter_style)],
+            filter_area.width as usize,
+            theme.overlay_bg(),
+        )),
+        filter_area,
+    );
 
     if matches.is_empty() {
-        lines.push(panel::fill_line(
-            vec![Span::styled("nothing matches", theme.disabled())],
-            width,
-            theme.raised_bg(),
-        ));
-    }
-    for (offset, model) in matches.iter().enumerate().skip(modal.scroll).take(rows) {
-        let picked = offset == modal.selected;
-        let bg = if picked {
-            theme.hover_bg()
-        } else {
-            theme.raised_bg()
-        };
-        let mut spans = vec![
-            Span::styled(
-                format!("{} ", if picked { theme.marker_selected() } else { " " }),
-                theme.ember(),
-            ),
-            Span::styled(
-                model.id.clone(),
-                if picked { theme.bold() } else { theme.text() },
-            ),
-        ];
-        if !model.detail.is_empty() {
-            spans.push(Span::styled(
-                format!("  {}", model.detail),
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "nothing matches",
                 theme.disabled(),
-            ));
-        }
-        if !model.supports_tools {
-            // Loudest thing on the row: picking it produces an agent that
-            // cannot read a file, and the failure arrives a turn later.
-            spans.push(Span::styled("  NO TOOLS", theme.danger()));
-        }
-        lines.push(panel::fill_line(spans, width, bg));
+            ))),
+            list_area,
+        );
+    } else {
+        // A real `List`, so the selected row's highlight and the marker column
+        // are the widget's job rather than something every row has to
+        // remember to paint. `ListState` also carries the offset, which is
+        // what lets the scrollbar beside it agree with what is on screen.
+        let items: Vec<ListItem> = matches
+            .iter()
+            .map(|model| {
+                let mut spans = vec![Span::styled(model.id.clone(), theme.text())];
+                if !model.detail.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  {}", model.detail),
+                        theme.disabled(),
+                    ));
+                }
+                if !model.supports_tools {
+                    // Loudest thing on the row: picking it produces an agent
+                    // that cannot read a file, and the failure arrives a turn
+                    // later.
+                    spans.push(Span::styled("  NO TOOLS", theme.danger()));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        let marker = format!("{} ", theme.marker_selected());
+        let list = List::new(items)
+            .highlight_style(theme.bold().bg(theme.hover))
+            .highlight_symbol(marker.as_str())
+            .style(theme.raised_bg());
+        let mut state = ListState::default()
+            .with_selected(Some(selected))
+            .with_offset(offset);
+        frame.render_stateful_widget(list, list_area, &mut state);
+        // Read back: `List` moves the offset itself to keep the selection on
+        // screen, so taking its word is what keeps the track from pointing at
+        // a window the list is no longer showing.
+        modal.scroll = state.offset();
+        scrollbar::vertical(
+            frame,
+            list_area,
+            total as u16,
+            list_area.height,
+            state.offset() as u16,
+            theme,
+        );
     }
 
-    lines.push(panel::fill_line(Vec::new(), width, theme.raised_bg()));
     let mut hint = vec![Span::styled(
-        format!("{} of {}   ", modal.selected + 1, matches.len().max(1)),
+        format!("{} of {}   ", selected + 1, total.max(1)),
         theme.disabled(),
     )];
     hint.extend(chips::key_hint("Enter", "switch", theme.success, theme));
     hint.extend(chips::cancel_hint("Esc", "cancel", theme));
-    lines.push(panel::fill_line(hint, width, theme.raised_bg()));
-
-    let title = format!(" {} models ", modal.provider);
-    let boxed = panel::themed_rounded_box_titled(
-        theme,
-        Some((title.as_str(), theme.ember_bold())),
-        &lines,
-        width,
-        theme.ember(),
-        theme.raised_bg(),
+    frame.render_widget(
+        Paragraph::new(panel::fill_line(
+            hint,
+            hint_area.width as usize,
+            theme.raised_bg(),
+        )),
+        hint_area,
     );
-    let height = boxed.len() as u16;
-    let rect = center_vertically(outer, height);
-    frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(Text::from(boxed)), rect);
 }

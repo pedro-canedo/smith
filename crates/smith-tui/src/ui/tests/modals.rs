@@ -230,3 +230,28 @@ fn the_picker_fits_an_eighty_by_twentyfour_terminal() {
     }
     assert!(rows.join("\n").contains("Enter"), "the hint survived");
 }
+
+/// The picker is the crate's one real `List`: the marker column, the
+/// highlight and the offset are the widget's, and the track beside it is
+/// driven by the same `ListState`.
+#[test]
+fn a_long_model_list_scrolls_under_a_track_and_a_short_one_does_not() {
+    let many: Vec<(&str, &str, bool)> = (0..40).map(|_| ("model-xyz", "detail", true)).collect();
+    let mut modal = picker(&many, "", 0);
+    let long = picker_rows(70, 24, &mut modal).join("\n");
+    assert!(
+        long.contains('\u{2588}'),
+        "a list past its window needs a track:\n{long}"
+    );
+
+    let mut modal = picker(&[("only-one", "", true)], "", 0);
+    let short = picker_rows(70, 24, &mut modal).join("\n");
+    assert!(
+        !short.contains('\u{2588}'),
+        "a list that fits must not claim to scroll:\n{short}"
+    );
+    // ...and the box shrank to the one row it had to show, instead of
+    // keeping a window's worth of blank rows above the hint.
+    let framed = short.lines().filter(|r| r.contains('\u{2502}')).count();
+    assert!(framed <= 6, "the box kept dead rows:\n{short}");
+}

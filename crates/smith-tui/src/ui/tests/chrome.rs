@@ -188,3 +188,33 @@ fn an_overlay_stays_inside_the_frame_at_80x24() {
     assert!(text.contains("session usage"), "{text}");
     assert!(text.is_ascii(), "non-ASCII glyph under an ASCII theme");
 }
+
+/// Regression: the list drew a fixed six rows while `slash_selected` was
+/// bounded only by how many commands matched, so from the seventh match on
+/// the highlighted row was off screen — nothing looked selected, and Enter
+/// accepted a command the user could not see. `ListState` scrolls to the
+/// selection instead.
+#[test]
+fn the_selected_suggestion_stays_on_screen_past_the_first_windowful() {
+    let mut app = test_app();
+    app.input.insert_str("/");
+    let total = app.suggestions().len();
+    assert!(
+        total > 6,
+        "fixture needs more than one window of commands, got {total}"
+    );
+
+    // Walk to the last one.
+    for _ in 0..total {
+        app.on_key(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+    }
+    let picked = app.suggestions()[app.slash_selected].name.clone();
+    let text = rendered(&mut app, 80, 24);
+    assert!(
+        text.contains(&picked),
+        "the selected suggestion `{picked}` was not drawn:\n{text}"
+    );
+}
