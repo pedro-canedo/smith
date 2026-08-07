@@ -86,6 +86,28 @@ fn permission_summary(config: &Config) -> String {
         .unwrap_or_else(|| "ask (default)".to_string())
 }
 
+/// Whether a browser could plausibly open on this machine.
+///
+/// Not a capability check — nothing here can prove a browser exists. It is a
+/// check for a *display*, which is the thing whose absence makes the offer
+/// useless: over a plain SSH session the link opens nowhere, and a menu row
+/// that leads to a dead end is worse than one that is missing.
+///
+/// WSL counts even without `DISPLAY`, because the Windows host opens the link.
+fn browser_plausible() -> bool {
+    if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+        return true;
+    }
+    [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "WSL_DISTRO_NAME",
+        "WSL_INTEROP",
+    ]
+    .iter()
+    .any(|var| std::env::var_os(var).is_some())
+}
+
 fn browser_summary(config: &Config) -> String {
     match runtime::find_browser(&config.runtime) {
         Some(_) => "available".to_string(),
@@ -120,26 +142,51 @@ pub async fn run(jump_to_model: bool) -> color_eyre::Result<()> {
     println!("smith setup — pick a section to configure. Esc backs out of any level;");
     println!("each section saves as soon as it completes.\n");
 
+    // The browser row exists only where a browser plausibly does. Offering it
+    // over SSH would send someone to a link nothing can open — and this menu
+    // is the *only* way anyone finds the feature, since `smith setup web` is
+    // a subcommand nobody guesses.
+    let offer_web = browser_plausible();
+
     loop {
-        let items = [
+        let mut items = Vec::new();
+        if offer_web {
+            items.push("Configure in a browser   (a page on this machine)".to_string());
+        }
+        items.extend([
             format!("Provider & model   [{}]", provider_summary(&config)),
             format!("Web search         [{}]", search_summary(&config)),
             format!("Browser            [{}]", browser_summary(&config)),
             format!("Permissions        [{}]", permission_summary(&config)),
             "Done".to_string(),
-        ];
+        ]);
         let choice = Select::with_theme(&theme)
             .with_prompt("Section")
             .items(&items)
             .default(0)
             .interact_opt()?;
 
-        let changed = match choice {
-            Some(0) => section_provider(&theme, &mut config).await?,
-            Some(1) => section_search(&theme, &mut config)?,
-            Some(2) => section_browser(&theme, &mut config).await?,
-            Some(3) => section_permissions(&theme, &mut config)?,
-            _ => break, // Done, or Esc at the top level.
+        // One offset rather than two index tables: the rows below shift by
+        // exactly one when the browser row is present, and a second table is
+        // how the labels and the arms drift apart.
+        let Some(row) = choice else { break };
+        let section = row as isize - isize::from(offer_web);
+
+        let changed = match section {
+            -1 => {
+                crate::webconfig::run(false, None)
+                    .await
+                    .map_err(color_eyre::eyre::Error::msg)?;
+                // The page writes the global config itself, so re-read rather
+                // than keep a copy that is now stale.
+                config = Config::load().unwrap_or_default();
+                false
+            }
+            0 => section_provider(&theme, &mut config).await?,
+            1 => section_search(&theme, &mut config)?,
+            2 => section_browser(&theme, &mut config).await?,
+            3 => section_permissions(&theme, &mut config)?,
+            _ => break, // Done.
         };
         if changed {
             save(&config)?;
@@ -972,6 +1019,46 @@ async fn ollama_reachable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The browser row shifts every other row by one, which is exactly the
+    /// kind of arithmetic that silently sends someone into the wrong section.
+    /// One offset, asserted both ways.
+    #[test]
+    fn the_menu_rows_map_to_the_same_sections_with_or_without_the_browser_row() {
+        let section = |row: usize, offered: bool| row as isize - isize::from(offered);
+
+        // Without the browser row, the sections start at 0.
+        assert_eq!(section(0, false), 0, "provider");
+        assert_eq!(section(3, false), 3, "permissions");
+
+        // With it, row 0 is the browser and everything else keeps its meaning.
+        assert_eq!(section(0, true), -1, "browser");
+        assert_eq!(section(1, true), 0, "provider");
+        assert_eq!(section(4, true), 3, "permissions");
+    }
+
+    /// A machine with no display must not be offered a link nothing can open.
+    /// Asserted through the env, because that is the only input.
+    #[test]
+    fn a_display_is_what_makes_the_browser_row_worth_offering() {
+        if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            assert!(browser_plausible(), "a desktop OS always has one");
+            return;
+        }
+        let has_any = [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "WSL_DISTRO_NAME",
+            "WSL_INTEROP",
+        ]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some());
+        assert_eq!(
+            browser_plausible(),
+            has_any,
+            "the offer must follow the display, not the platform"
+        );
+    }
 
     /// Row order and the id table are two lists that have to agree. They are
     /// next to each other in the file, which is exactly the kind of pairing
