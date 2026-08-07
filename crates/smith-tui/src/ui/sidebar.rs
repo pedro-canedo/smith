@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Paragraph, Sparkline, Tabs};
 use ratatui::Frame;
 
 use crate::app::{App, SidebarTab};
@@ -37,21 +37,49 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let above = fit_lines(above, width);
     let below = fit_lines(below, width);
 
-    let gauge_rows = u16::from(app.context.is_some() && app.sidebar_tab == SidebarTab::Session);
-    let [above_area, gauge_area, below_area] = Layout::vertical([
+    // The one widget slot, whose occupant depends on the tab: the context
+    // gauge on Session, the throughput graph on Vitals, nothing on Tasks.
+    let widget_rows = match app.sidebar_tab {
+        SidebarTab::Session => u16::from(app.context.is_some()),
+        SidebarTab::Vitals => sparkline_rows(app),
+        SidebarTab::Tasks => 0,
+    };
+    let [above_area, widget_area, below_area] = Layout::vertical([
         Constraint::Length(above.len() as u16),
-        Constraint::Length(gauge_rows),
+        Constraint::Length(widget_rows),
         Constraint::Min(0),
     ])
     .areas(body_area);
 
     frame.render_widget(Paragraph::new(above), above_area);
-    if let Some((used, window, estimated)) = app.context {
-        if gauge_area.height > 0 {
-            frame.render_widget(
-                crate::components::gauge::context_gauge(used, window, estimated, theme),
-                gauge_area,
-            );
+    if widget_area.height > 0 {
+        match app.sidebar_tab {
+            SidebarTab::Session => {
+                if let Some((used, window, estimated)) = app.context {
+                    frame.render_widget(
+                        crate::components::gauge::context_gauge(used, window, estimated, theme),
+                        widget_area,
+                    );
+                }
+            }
+            SidebarTab::Vitals => {
+                // The *last* pane-width samples, not the first. `Sparkline`
+                // renders `data.iter().take(area.width)`, so handing it the
+                // whole series would pin the graph to the opening seconds of
+                // the turn and never move again — a live readout frozen on
+                // history, which is worse than no readout.
+                let series = app.metrics.throughput();
+                let skip = series.len().saturating_sub(widget_area.width as usize);
+                let data: Vec<u64> = series.iter().skip(skip).copied().collect();
+                frame.render_widget(
+                    Sparkline::default()
+                        .data(&data)
+                        .style(theme.ember())
+                        .absent_value_style(theme.disabled()),
+                    widget_area,
+                );
+            }
+            SidebarTab::Tasks => {}
         }
     }
     frame.render_widget(Paragraph::new(below), below_area);
@@ -104,7 +132,7 @@ pub(super) fn sidebar_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>
     match app.sidebar_tab {
         SidebarTab::Session => session_tab_lines(app),
         SidebarTab::Tasks => (Vec::new(), tasks_tab_lines(app)),
-        SidebarTab::Vitals => (Vec::new(), vitals_tab_lines(app)),
+        SidebarTab::Vitals => vitals_tab_lines(app),
     }
 }
 
@@ -197,12 +225,30 @@ pub(super) fn tasks_tab_lines(app: &App) -> Vec<Line<'static>> {
     task_lines(&app.tasks, theme)
 }
 
-pub(super) fn vitals_tab_lines(app: &App) -> Vec<Line<'static>> {
+/// Vitals, split around the throughput sparkline the way the session tab is
+/// split around its gauge: `above` ends on the `THROUGHPUT` header, the graph
+/// occupies the rows after it, and everything else follows.
+pub(super) fn vitals_tab_lines(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let theme = &app.theme;
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut above: Vec<Line<'static>> = Vec::new();
 
     if let Some(stats) = &app.resources {
-        lines.extend(resource_lines(stats, theme));
+        above.extend(resource_lines(stats, theme));
+        above.push(Line::from(""));
+    }
+    if sparkline_rows(app) > 0 {
+        above.push(sidebar_head(theme, "THROUGHPUT"));
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if sparkline_rows(app) > 0 {
+        let series = app.metrics.throughput();
+        let latest = series.back().copied().unwrap_or(0);
+        let peak = series.iter().copied().max().unwrap_or(0);
+        lines.push(Line::from(Span::styled(
+            format!("{latest} tok/s   peak {peak}"),
+            theme.disabled(),
+        )));
         lines.push(Line::from(""));
     }
 
@@ -233,7 +279,22 @@ pub(super) fn vitals_tab_lines(app: &App) -> Vec<Line<'static>> {
         theme.secondary(),
     )));
 
-    lines
+    (above, lines)
+}
+
+/// Rows the throughput graph gets, or zero when there is nothing to draw.
+///
+/// Two samples, not one: a single reading drawn as a sparkline is one full
+/// bar, which looks like a measurement of something rather than the absence
+/// of a series. And two rows rather than one, because a one-row sparkline
+/// quantises every value to eight steps of a single cell — enough to show a
+/// stall, not enough to show a slope.
+pub(super) fn sparkline_rows(app: &App) -> u16 {
+    if app.metrics.throughput().len() < 2 {
+        0
+    } else {
+        2
+    }
 }
 
 /// Checklist section for the sidebar: a "3/8" count, a filled/unfilled

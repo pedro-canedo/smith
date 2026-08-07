@@ -114,3 +114,52 @@ fn hiding_the_sidebar_gives_its_columns_to_the_transcript() {
         "and no strip stood in for it: {hidden}"
     );
 }
+
+/// The throughput graph: absent until a stream has been sampled twice, and
+/// drawn on the Vitals tab under its own header once it has.
+#[test]
+fn the_vitals_tab_graphs_throughput_once_there_is_a_series() {
+    let mut app = app_with_context(100);
+    app.sidebar_tab = crate::app::SidebarTab::Vitals;
+
+    // One reading is not a series — drawn as a sparkline it would be a full
+    // bar, which reads as a measurement rather than as no data.
+    app.metrics.push_throughput_sample_for_test(12);
+    let one = rendered(&mut app, 100, 24);
+    assert!(
+        !one.contains("THROUGHPUT"),
+        "a single sample must not claim to be a graph:\n{one}"
+    );
+
+    for rate in [30, 45, 20, 60] {
+        app.metrics.push_throughput_sample_for_test(rate);
+    }
+    let many = rendered(&mut app, 100, 24);
+    assert!(many.contains("THROUGHPUT"), "{many}");
+    // The legend carries the numbers the bars cannot.
+    assert!(many.contains("60 tok/s"), "latest reading missing:\n{many}");
+    assert!(many.contains("peak 60"), "peak missing:\n{many}");
+}
+
+/// Regression: `Sparkline` renders `data.iter().take(area.width)`, so
+/// feeding it the whole 64-sample series pinned the graph to the opening
+/// seconds of the turn — a live readout frozen on history.
+#[test]
+fn the_throughput_graph_follows_the_newest_samples() {
+    let mut app = app_with_context(100);
+    app.sidebar_tab = crate::app::SidebarTab::Vitals;
+    // Far more samples than the 27-column pane can draw, rising throughout,
+    // so an old window and a new one cannot look alike.
+    for rate in 1..=64u64 {
+        app.metrics.push_throughput_sample_for_test(rate);
+    }
+    let text = rendered(&mut app, 100, 24);
+    assert!(text.contains("64 tok/s"), "latest reading missing:\n{text}");
+    assert!(text.contains("peak 64"), "peak missing:\n{text}");
+    // The newest window is all high values, so the bars are full height —
+    // the opening window would have drawn them at the floor.
+    assert!(
+        text.contains('\u{2588}'),
+        "the graph is not showing the recent, high samples:\n{text}"
+    );
+}

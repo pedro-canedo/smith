@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use smith_core::{Action, AgentPhase, PermissionPolicy, ResourceStats, Task, Usage};
@@ -141,7 +142,22 @@ pub(crate) struct TurnMetrics {
     pub(crate) live_tokens_per_sec: Option<f32>,
     /// Last measured rate from provider `output_tokens / elapsed`.
     pub(crate) tokens_per_sec: Option<f32>,
+    /// Recent tok/s readings, oldest first — what the sidebar sparkline
+    /// draws. Sampled on a clock rather than per delta: deltas arrive in
+    /// bursts of wildly different sizes, so a per-delta series plots the
+    /// provider's chunking, not the throughput.
+    throughput: VecDeque<u64>,
+    last_sample_at: Option<Instant>,
 }
+
+/// Samples kept for the throughput sparkline. A little over two sidebar
+/// widths, so the graph still has history to lose when the pane is wide.
+const MAX_THROUGHPUT_SAMPLES: usize = 64;
+
+/// How often a sample is taken. At the 120 ms spinner tick a per-tick series
+/// would cover eight seconds and jitter with every chunk boundary; half a
+/// second gives the 64 samples about half a minute of turn to describe.
+const THROUGHPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
 impl TurnMetrics {
     /// A turn is starting: the clock runs, and nothing about the last stream
@@ -190,6 +206,49 @@ impl TurnMetrics {
     /// Roughly how many output tokens the current stream has produced.
     pub(crate) fn live_output_tokens_estimate(&self) -> Option<u32> {
         self.stream_started_at.map(|_| self.stream_output_chars / 4)
+    }
+
+    /// Records one throughput reading if the sample clock has come round.
+    ///
+    /// Only while a stream is actually running: sampling the gaps would draw
+    /// a trough for every pause between rounds, which reads as the model
+    /// slowing down rather than as it not being the model's turn.
+    pub(crate) fn sample_throughput(&mut self) {
+        if self.stream_started_at.is_none() {
+            return;
+        }
+        let due = self
+            .last_sample_at
+            .is_none_or(|at| at.elapsed() >= THROUGHPUT_SAMPLE_INTERVAL);
+        if !due {
+            return;
+        }
+        self.last_sample_at = Some(Instant::now());
+        let rate = self
+            .live_tokens_per_sec
+            .or(self.tokens_per_sec)
+            .unwrap_or(0.0);
+        if self.throughput.len() == MAX_THROUGHPUT_SAMPLES {
+            self.throughput.pop_front();
+        }
+        self.throughput.push_back(rate.max(0.0).round() as u64);
+    }
+
+    /// Appends one reading, bypassing the sample clock — tests need a series
+    /// without waiting half a second per point.
+    #[cfg(test)]
+    pub(crate) fn push_throughput_sample_for_test(&mut self, rate: u64) {
+        if self.throughput.len() == MAX_THROUGHPUT_SAMPLES {
+            self.throughput.pop_front();
+        }
+        self.throughput.push_back(rate);
+    }
+
+    /// The series, oldest first. Empty until a stream has run long enough to
+    /// be sampled twice — one point is not a graph, and drawing it as one
+    /// makes a flat bar look like a measurement.
+    pub(crate) fn throughput(&self) -> &VecDeque<u64> {
+        &self.throughput
     }
 }
 
@@ -440,6 +499,10 @@ impl App {
         // Not reduced modulo any frame count: the ASCII and Unicode sets have
         // different lengths, so the wrap belongs at the indexing site.
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        // The one clock the UI already has. `sample_throughput` decides
+        // whether enough of it has passed, so the sparkline's resolution does
+        // not silently become whatever the spinner interval happens to be.
+        self.metrics.sample_throughput();
     }
 
     /// Whether anything on screen is actually moving.
