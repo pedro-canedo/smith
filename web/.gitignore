@@ -1,0 +1,2 @@
+node_modules/
+# dist/index.html IS committed — it is the artifact the Rust binary embeds.

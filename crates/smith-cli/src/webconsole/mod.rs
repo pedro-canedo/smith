@@ -30,10 +30,12 @@ pub mod server;
 pub mod sse;
 pub mod state;
 
-/// The app shell. A placeholder until the built `web/` app replaces it —
-/// same `include_str!` posture as `webconfig::PAGE`, and enough of a client
-/// (snapshot, SSE, composer, approvals) to prove the wire end to end.
-pub const PAGE: &str = include_str!("shell.html");
+/// The app shell: the built `web/` app (Vite + React + Tailwind, Ember
+/// palette), bundled to exactly one committed file — the same `include_str!`
+/// posture as `webconfig::PAGE`, and the reason the route whitelist has zero
+/// static-asset entries. Rebuild with `scripts/build-web.sh`; a palette test
+/// below doubles as the staleness tripwire.
+pub const PAGE: &str = include_str!("../../../../web/dist/index.html");
 
 use std::path::PathBuf;
 use std::sync::Arc;

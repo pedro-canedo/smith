@@ -329,3 +329,38 @@ async fn the_guard_predicates_apply_to_the_console() {
         "the refusal reason must not be sent: {response}"
     );
 }
+
+// ---- the committed bundle --------------------------------------------------
+
+/// The console paints with the Ember palette — `docs/design-system.md` is
+/// the source of truth and `Theme::token_hex` is its machine-readable form.
+/// This is also the coarse staleness tripwire: a rebuild that dropped the
+/// tokens (or a hand-edit of the bundle) fails here.
+#[test]
+fn the_committed_console_page_paints_with_the_ember_palette() {
+    let theme = smith_tui::Theme::preset(smith_tui::ThemeName::Dark, true);
+    for token in ["ember", "amber", "success", "danger", "base", "raised"] {
+        let hex = theme.token_hex(token).unwrap();
+        assert!(
+            PAGE.contains(&hex),
+            "the bundle does not carry the {token} token ({hex}) — \
+             rebuild with scripts/build-web.sh or fix web/src/index.css"
+        );
+    }
+}
+
+/// One file is the contract: the whitelist has no static-asset routes, so a
+/// document-level external script or stylesheet would simply 404.
+#[test]
+fn the_console_page_is_a_single_self_contained_document() {
+    assert!(!PAGE.contains("<script src="), "external script tag");
+    assert!(
+        !PAGE.contains("<script type=\"module\" src="),
+        "external module tag"
+    );
+    assert!(
+        !PAGE.contains("stylesheet\" href="),
+        "external stylesheet link"
+    );
+    assert!(PAGE.contains("smith console"), "the title is gone");
+}

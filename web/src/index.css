@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+/* The Ember palette — source of truth: docs/design-system.md (and
+   smith-tui/src/theme.rs, which a Rust test pins this file's values
+   against). The web console does not invent a brand. */
+@theme {
+  --color-base: #101215;
+  --color-raised: #16181c;
+  --color-overlay: #1e2126;
+  --color-hover: #262a30;
+  --color-text: #e2e5e9;
+  --color-secondary: #949aa3;
+  --color-disabled: #727882;
+  --color-ember: #ff8c3c;
+  --color-amber: #ffbe5a;
+  --color-success: #58ce80;
+  --color-danger: #f36666;
+  --color-warning: #facc15;
+  --color-info: #56b6ff;
+  --color-plan: #c684ff;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+body {
+  background-color: var(--color-base);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+}
