@@ -21,22 +21,9 @@ async fn the_config_server_is_not_exposed_to_the_network() {
     );
 }
 
-/// Guessing the token is the whole attack, so it has to be long and it has to
-/// be different every time. Same-run repetition would mean a second `smith
-/// setup web` could read the first one's session.
-#[test]
-fn every_run_mints_a_different_token_of_useful_length() {
-    let a = mint_token();
-    let b = mint_token();
-    assert_ne!(a, b);
-    // 32 bytes base64url with no padding.
-    assert_eq!(a.len(), 43, "got {a}");
-    assert!(
-        a.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-        "must survive a URL without escaping: {a}"
-    );
-}
+// Token minting moved to `webguard` with the extraction; its length and
+// uniqueness are pinned there now
+// (`a_minted_token_is_43_chars_of_base64url_and_never_repeats`).
 
 /// The page is the only thing that can carry a secret out of this process, so
 /// what it is *allowed* to talk to is load-bearing. `connect-src 'self'` is

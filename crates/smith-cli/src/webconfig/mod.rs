@@ -28,10 +28,10 @@ pub mod request;
 
 use std::time::Duration;
 
-use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::webguard::mint_token;
 use request::{Guard, Refusal, Route, MAX_BODY};
 
 /// How long a connection may take to send its request line and headers.
@@ -88,18 +88,6 @@ pub async fn run(no_browser: bool, port: Option<u16>) -> Result<(), String> {
     serve(listener, guard).await
 }
 
-/// 244 bits from the OS CSPRNG, base64url, never written to disk or logged.
-///
-/// Two v4 UUIDs rather than one: 122 bits is already beyond guessing, but the
-/// token is the only thing standing between another process on this machine
-/// and the user's API keys, and the second one is free.
-fn mint_token() -> String {
-    let mut bytes = [0u8; 32];
-    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
 async fn serve(listener: TcpListener, guard: Guard) -> Result<(), String> {
     let started = tokio::time::Instant::now();
     let mut last_seen = tokio::time::Instant::now();
@@ -141,7 +129,7 @@ async fn handle(mut stream: TcpStream, guard: &Guard) -> bool {
     };
     let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
 
-    let (status, content_type, payload) = match guard.admit(head, body) {
+    let (status, content_type, payload) = match guard.admit(head, body, Route::lookup) {
         Ok(req) if req.route == Route::Close => {
             let _ = write_response(&mut stream, 200, "application/json", "{\"ok\":true}").await;
             return true;

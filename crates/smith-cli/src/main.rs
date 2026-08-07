@@ -30,6 +30,7 @@ mod subagents;
 mod uninstall;
 mod update;
 mod webconfig;
+mod webguard;
 
 const GENERIC_TIP: &str = "run `smith setup` to add or change your provider or model";
 
