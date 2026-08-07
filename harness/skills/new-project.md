@@ -1,5 +1,5 @@
 ---
-description: Scaffold a new Rust, TypeScript/Node, Python, or Go project: layout, tooling, quality gates, first passing test.
+description: Scaffold a new Rust, TypeScript, Python, or Go project: layout, tooling, quality gates, first passing test.
 ---
 
 # Common workflow (every language)

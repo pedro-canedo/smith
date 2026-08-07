@@ -1,5 +1,5 @@
 ---
-description: Fix a reported bug: reproduce it, locate the cause, fix minimally, prove it with a test, run the quality gates.
+description: Fix a reported bug: reproduce it, locate the cause, fix minimally, prove it with a test, run quality gates.
 ---
 
 # Workflow

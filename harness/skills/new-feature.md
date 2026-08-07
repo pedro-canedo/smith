@@ -1,5 +1,5 @@
 ---
-description: Add a feature: survey existing conventions first, plan with write_tasks, implement in small verified increments.
+description: Add a feature: survey existing conventions, plan with write_tasks, implement in small verified increments.
 ---
 
 # Workflow

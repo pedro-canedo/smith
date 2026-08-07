@@ -1,5 +1,5 @@
 ---
-description: Restructure without changing behavior: green test baseline first, one small transformation at a time, verify each.
+description: Restructure without changing behavior: green baseline first, one small transformation at a time, verify each.
 ---
 
 # Workflow

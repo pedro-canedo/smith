@@ -1,5 +1,5 @@
 ---
-description: Long-running looped work: pick the next increment, verify it, record state; emit LOOP_DONE only when truly done.
+description: Looped work: pick the next increment, verify it, record state; emit LOOP_DONE only when truly done.
 ---
 
 # Workflow

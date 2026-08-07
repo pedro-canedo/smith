@@ -1,5 +1,5 @@
 ---
-description: Use the task tool well: when to delegate, how to write a self-contained subagent prompt, how to use the report.
+description: Use the task tool: when to delegate, writing a self-contained subagent prompt, acting on the report.
 ---
 
 # When to delegate

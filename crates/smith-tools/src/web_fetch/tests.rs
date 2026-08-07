@@ -1,4 +1,6 @@
 use super::*;
+// The HTML engine moved to `web_fetch/html.rs`; these reach it by path.
+use super::html::{attr, decode_entities};
 use std::collections::HashMap;
 
 fn ctx() -> ToolContext {

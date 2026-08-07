@@ -45,8 +45,12 @@ use async_trait::async_trait;
 use smith_core::{PermissionClass, Tool, ToolContext, ToolResult};
 use tokio_util::sync::CancellationToken;
 
+mod backends;
+
 const EXA_SEARCH_URL: &str = "https://api.exa.ai/search";
+
 const TAVILY_SEARCH_URL: &str = "https://api.tavily.com/search";
+
 const DUCKDUCKGO_LITE_URL: &str = "https://lite.duckduckgo.com/lite/";
 
 /// Five results by default rather than three: with three, a model that does
@@ -55,6 +59,7 @@ const DUCKDUCKGO_LITE_URL: &str = "https://lite.duckduckgo.com/lite/";
 /// The per-row cost (title, URL, summary) is small next to a second search.
 /// Callers wanting more or fewer say so with `num_results`.
 const DEFAULT_NUM_RESULTS: u64 = 5;
+
 const MAX_NUM_RESULTS: u64 = 10;
 
 /// Caps each backend attempt so a stalled request falls through to the next
@@ -85,6 +90,7 @@ const BING_MAX_ATTEMPTS: u32 = 3;
 /// request; duplicating three constants is cheaper than bending it to cover a
 /// search backend too.
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
 
 /// How many distinct queries one session remembers.
@@ -266,485 +272,6 @@ impl Tool for WebSearchTool {
             }
             Err(failures) => ToolResult::error(failure_message(&failures)),
         }
-    }
-}
-
-impl WebSearchTool {
-    /// Walks the tiers, collecting why each one could not answer.
-    ///
-    /// The first backend that *runs* wins, even when it found nothing —
-    /// "searched and found nothing" is a real answer and must not be retried
-    /// against a weaker engine as if it were a failure.
-    ///
-    /// Each attempted tier reports one progress line through `ctx`, so the
-    /// card in the TUI shows *which* backend a slow search is waiting on
-    /// instead of a bare spinner. A no-op when nothing is attached.
-    async fn run_backends(
-        &self,
-        query: &str,
-        limit: usize,
-        ctx: &ToolContext,
-        cancel: &CancellationToken,
-    ) -> Result<(String, Vec<SearchResult>), Vec<(&'static str, Unavailable)>> {
-        if let Some(pin) = self
-            .settings
-            .backend
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-        {
-            return self.run_pinned(pin, query, limit, ctx, cancel).await;
-        }
-
-        let mut failures: Vec<(&'static str, Unavailable)> = Vec::new();
-
-        macro_rules! tier {
-            ($label:expr, $call:expr) => {
-                ctx.report_progress(format!("trying {}…", $label));
-                match $call {
-                    Ok(results) => return Ok(($label.to_string(), results)),
-                    Err(e) => failures.push(($label, e)),
-                }
-            };
-        }
-
-        match &self.settings.searxng_url {
-            Some(url) if !url.trim().is_empty() => {
-                tier!(
-                    "SearXNG",
-                    crate::searxng::search(&self.client, url, query, limit).await
-                );
-            }
-            _ => failures.push((
-                "SearXNG",
-                Unavailable::NotConfigured("no `[search] searxng_url` configured".into()),
-            )),
-        }
-
-        match &self.settings.exa_api_key {
-            Some(key) if !key.trim().is_empty() => {
-                tier!("Exa", self.search_exa(key, query, limit).await);
-            }
-            // Deliberately not probed without a key: measured HTTP 402.
-            _ => failures.push((
-                "Exa",
-                Unavailable::NotConfigured("no `[exa] api_key` configured".into()),
-            )),
-        }
-
-        match &self.settings.tavily_api_key {
-            Some(key) if !key.trim().is_empty() => {
-                tier!("Tavily", self.search_tavily(key, query, limit).await);
-            }
-            _ => failures.push((
-                "Tavily",
-                Unavailable::NotConfigured("no `[tavily] api_key` configured".into()),
-            )),
-        }
-
-        tier!("Bing", self.search_bing(query, limit, cancel).await);
-        tier!(
-            "Bing via headless browser",
-            self.search_bing_browser(query, limit, cancel).await
-        );
-        tier!("Google News", self.search_google_news(query, limit).await);
-        tier!(
-            "DuckDuckGo",
-            search_duckduckgo_lite(&self.client, query, limit).await
-        );
-
-        Err(failures)
-    }
-
-    /// Runs exactly the pinned backend — no fallback, Hermes-style.
-    ///
-    /// The contract is that an explicit pin **wins even when unavailable**: a
-    /// pin to `tavily` with no key fails saying "set `[tavily] api_key`"
-    /// rather than silently searching somewhere else. Silent rerouting is
-    /// worse than the error for exactly the user who pins — someone routing
-    /// queries through their own SearXNG for privacy would have them leak to
-    /// Bing on the first hiccup, and never know.
-    async fn run_pinned(
-        &self,
-        pin: &str,
-        query: &str,
-        limit: usize,
-        ctx: &ToolContext,
-        cancel: &CancellationToken,
-    ) -> Result<(String, Vec<SearchResult>), Vec<(&'static str, Unavailable)>> {
-        // `google_news` and `google-news` are the same intent; so are case
-        // variants. Normalising is cheap and the pin is typed by a human.
-        let normalized = pin.to_ascii_lowercase().replace('_', "-");
-
-        let (label, outcome): (&'static str, Result<Vec<SearchResult>, Unavailable>) =
-            match normalized.as_str() {
-                "searxng" => (
-                    "SearXNG",
-                    match self
-                        .settings
-                        .searxng_url
-                        .as_deref()
-                        .filter(|u| !u.trim().is_empty())
-                    {
-                        Some(url) => {
-                            ctx.report_progress("trying SearXNG…".to_string());
-                            crate::searxng::search(&self.client, url, query, limit).await
-                        }
-                        None => Err(Unavailable::Misconfigured(
-                            "`[search] backend` is pinned to `searxng` but no `[search] \
-                             searxng_url` is set — set one, or remove the pin"
-                                .into(),
-                        )),
-                    },
-                ),
-                "exa" => (
-                    "Exa",
-                    match self
-                        .settings
-                        .exa_api_key
-                        .as_deref()
-                        .filter(|k| !k.trim().is_empty())
-                    {
-                        Some(key) => {
-                            ctx.report_progress("trying Exa…".to_string());
-                            self.search_exa(key, query, limit).await
-                        }
-                        None => Err(Unavailable::Misconfigured(
-                            "`[search] backend` is pinned to `exa` but no `[exa] api_key` is \
-                             set — set one, or remove the pin"
-                                .into(),
-                        )),
-                    },
-                ),
-                "tavily" => (
-                    "Tavily",
-                    match self
-                        .settings
-                        .tavily_api_key
-                        .as_deref()
-                        .filter(|k| !k.trim().is_empty())
-                    {
-                        Some(key) => {
-                            ctx.report_progress("trying Tavily…".to_string());
-                            self.search_tavily(key, query, limit).await
-                        }
-                        None => Err(Unavailable::Misconfigured(
-                            "`[search] backend` is pinned to `tavily` but no `[tavily] api_key` \
-                             is set — set one, or remove the pin"
-                                .into(),
-                        )),
-                    },
-                ),
-                "bing" => {
-                    ctx.report_progress("trying Bing…".to_string());
-                    ("Bing", self.search_bing(query, limit, cancel).await)
-                }
-                "bing-browser" => {
-                    ctx.report_progress("trying Bing via headless browser…".to_string());
-                    (
-                        "Bing via headless browser",
-                        self.search_bing_browser(query, limit, cancel).await,
-                    )
-                }
-                "google-news" => {
-                    ctx.report_progress("trying Google News…".to_string());
-                    ("Google News", self.search_google_news(query, limit).await)
-                }
-                "duckduckgo" | "ddg" => {
-                    ctx.report_progress("trying DuckDuckGo…".to_string());
-                    (
-                        "DuckDuckGo",
-                        search_duckduckgo_lite(&self.client, query, limit).await,
-                    )
-                }
-                _ => (
-                    "web_search config",
-                    Err(Unavailable::Misconfigured(format!(
-                        "`[search] backend = \"{pin}\"` names no backend — valid values: \
-                         searxng, exa, tavily, bing, bing-browser, google-news, duckduckgo \
-                         (or remove the key to use the full chain)"
-                    ))),
-                ),
-            };
-
-        match outcome {
-            Ok(results) => Ok((format!("{label} (pinned)"), results)),
-            Err(e) => Err(vec![(label, e)]),
-        }
-    }
-
-    /// Bing over plain HTTP, retried across markets and then over time.
-    ///
-    /// The retries answer measured failures: a market that does not match the
-    /// query's language yields a poisoned result set, and a transport error or
-    /// a 429 clears on its own. Attempts stop at [`BING_MAX_ATTEMPTS`].
-    ///
-    /// A `Weak` set — one coincidentally-matching term, see
-    /// [`crate::bing::Relevance`] — is kept as a fallback while the next
-    /// market gets a try, with no backoff in between (weakness is a relevance
-    /// judgement, not a throttle). It is only returned once every market has
-    /// had its chance to do better.
-    async fn search_bing(
-        &self,
-        query: &str,
-        limit: usize,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<SearchResult>, Unavailable> {
-        let markets = crate::bing::markets_to_try(
-            self.settings.market.as_deref(),
-            system_locale().as_deref(),
-            query,
-        );
-
-        let mut weak_fallback: Option<Vec<SearchResult>> = None;
-        let mut last = Unavailable::Transient("no attempt was made".into());
-        for attempt in 1..=BING_MAX_ATTEMPTS {
-            // Cycle the markets, so a second pass re-tries the primary one
-            // after a pause rather than giving a third market a turn.
-            let market = &markets[(attempt as usize - 1) % markets.len()];
-            match self.bing_once(query, market, limit).await {
-                Ok((results, crate::bing::Relevance::Good)) => return Ok(results),
-                Ok((results, _weak)) => {
-                    // First weak set wins the fallback slot: it came from the
-                    // best-ranked market.
-                    weak_fallback.get_or_insert(results);
-                    continue;
-                }
-                Err(e) => last = e,
-            }
-            if attempt < BING_MAX_ATTEMPTS && !sleep_backoff(attempt, cancel).await {
-                return Err(Unavailable::Transient("cancelled".into()));
-            }
-        }
-        if let Some(results) = weak_fallback {
-            return Ok(results);
-        }
-        Err(last)
-    }
-
-    async fn bing_once(
-        &self,
-        query: &str,
-        market: &str,
-        limit: usize,
-    ) -> Result<(Vec<SearchResult>, crate::bing::Relevance), Unavailable> {
-        let url = crate::bing::search_url(query, market).map_err(Unavailable::Misconfigured)?;
-        let language = crate::bing::language_of(market);
-        let resp = self
-            .client
-            .get(&url)
-            .header("User-Agent", BROWSER_USER_AGENT)
-            .header(
-                "Accept",
-                "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
-            )
-            // Coherent with the market being tried — an `en-US` header on a
-            // `pt-BR` request is one more mismatched signal.
-            .header("Accept-Language", format!("{market},{language};q=0.9"))
-            .send()
-            .await
-            .map_err(|e| Unavailable::Transient(format!("could not reach Bing: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Unavailable::Transient(format!(
-                "Bing returned HTTP {status}"
-            )));
-        }
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| Unavailable::Transient(format!("could not read Bing's response: {e}")))?;
-
-        classify_bing(query, &body, limit, market)
-    }
-
-    /// The same RSS feed, fetched by a real browser.
-    ///
-    /// Worth a tier of its own because it is a genuinely different network
-    /// path — a different TLS stack and HTTP/2 fingerprint — so a host that
-    /// intercepts or fingerprints plain requests can still be searched from.
-    /// Chromium's XML viewer leaves the feed's markup intact in the dumped DOM,
-    /// so this shares [`crate::bing::parse_rss`] with the tier above.
-    async fn search_bing_browser(
-        &self,
-        query: &str,
-        limit: usize,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<SearchResult>, Unavailable> {
-        if !crate::chromium::is_available() {
-            return Err(Unavailable::NotConfigured(
-                "no Chrome/Chromium binary found on PATH, in ~/.smith/runtime, or in \
-                 SMITH_CHROMIUM_PATH"
-                    .into(),
-            ));
-        }
-        let market = crate::bing::markets_to_try(
-            self.settings.market.as_deref(),
-            system_locale().as_deref(),
-            query,
-        )
-        .swap_remove(0);
-        let url = crate::bing::search_url(query, &market).map_err(Unavailable::Misconfigured)?;
-        let dom = crate::chromium::fetch(&url, cancel)
-            .await
-            .map_err(Unavailable::Transient)?;
-        // One browser launch is expensive enough that a weak set is taken
-        // as-is rather than paying for a second one.
-        classify_bing(query, &dom, limit, &market).map(|(results, _relevance)| results)
-    }
-
-    /// Google News' RSS search — keyless, and the one free tier whose
-    /// `published` dates are real. See [`crate::google_news`].
-    async fn search_google_news(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>, Unavailable> {
-        let url = crate::google_news::search_url(query).map_err(Unavailable::Misconfigured)?;
-        let resp = self
-            .client
-            .get(&url)
-            .header("User-Agent", BROWSER_USER_AGENT)
-            .header(
-                "Accept",
-                "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
-            )
-            .send()
-            .await
-            .map_err(|e| Unavailable::Transient(format!("could not reach Google News: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Unavailable::Transient(format!(
-                "Google News returned HTTP {status}"
-            )));
-        }
-        let body = resp.text().await.map_err(|e| {
-            Unavailable::Transient(format!("could not read Google News' response: {e}"))
-        })?;
-        // No poison check here: Google News answers an off-topic query with
-        // an empty feed, not with unrelated results — and empty is a real
-        // answer ("no news about this"), reported as such.
-        Ok(crate::google_news::parse_rss(&body, limit))
-    }
-
-    /// Tavily's search API. `Err` carries why, same contract as Exa.
-    async fn search_tavily(
-        &self,
-        key: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>, Unavailable> {
-        let resp = self
-            .client
-            .post(TAVILY_SEARCH_URL)
-            .header("Authorization", format!("Bearer {key}"))
-            .json(&serde_json::json!({
-                "query": query,
-                "max_results": limit,
-            }))
-            .send()
-            .await
-            .map_err(|e| Unavailable::Transient(format!("could not reach Tavily: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(match status.as_u16() {
-                401 | 403 => {
-                    Unavailable::Misconfigured("the configured API key was rejected".into())
-                }
-                432 | 433 => {
-                    Unavailable::Misconfigured("the account's plan limit was exceeded".into())
-                }
-                429 => Unavailable::Transient("rate limited".into()),
-                _ => Unavailable::Transient(format!("HTTP {status}")),
-            });
-        }
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| Unavailable::Transient(e.to_string()))?;
-        Ok(parse_tavily_response(&body, limit))
-    }
-
-    /// `Err` carries why this tier could not answer, so the caller can tell
-    /// the user what to fix rather than reporting an empty result set.
-    async fn search_exa(
-        &self,
-        key: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>, Unavailable> {
-        let resp = self
-            .client
-            .post(EXA_SEARCH_URL)
-            .header("x-api-key", key)
-            .json(&serde_json::json!({
-                "query": query,
-                "numResults": limit,
-                "contents": { "text": { "maxCharacters": 500 } },
-            }))
-            .send()
-            .await
-            .map_err(|e| Unavailable::Transient(format!("could not reach Exa: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(match status.as_u16() {
-                401 | 403 => {
-                    Unavailable::Misconfigured("the configured API key was rejected".into())
-                }
-                402 => Unavailable::Misconfigured(
-                    "the account is out of credit (HTTP 402 Payment Required)".into(),
-                ),
-                429 => Unavailable::Transient("rate limited".into()),
-                _ => Unavailable::Transient(format!("HTTP {status}")),
-            });
-        }
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| Unavailable::Transient(e.to_string()))?;
-        Ok(parse_exa_response(&body, limit))
-    }
-
-    /// A cached hit for `query`, when at least `limit` results were stored.
-    ///
-    /// A narrower request is served by slicing; a wider one re-searches, since
-    /// serving three results to a caller that asked for ten would silently lose
-    /// the rest.
-    fn cached(&self, query: &str, limit: usize) -> Option<CacheEntry> {
-        let cache = self.cache.lock().ok()?;
-        let entry = cache.get(&cache_key(query))?;
-        (entry.results.len() >= limit).then(|| CacheEntry {
-            source: entry.source.clone(),
-            results: entry.results[..limit].to_vec(),
-        })
-    }
-
-    fn remember(&self, query: &str, source: &str, results: &[SearchResult]) {
-        // An empty result set is not cached: it is the outcome most likely to
-        // be a transient upstream hiccup, and pinning it for the session would
-        // make a query permanently unanswerable.
-        if results.is_empty() {
-            return;
-        }
-        let Ok(mut cache) = self.cache.lock() else {
-            return;
-        };
-        // Crude eviction — dropping everything rather than tracking use order.
-        // At this size the only thing an LRU would buy is complexity.
-        if cache.len() >= CACHE_CAPACITY {
-            cache.clear();
-        }
-        cache.insert(
-            cache_key(query),
-            CacheEntry {
-                source: source.to_string(),
-                results: results.to_vec(),
-            },
-        );
     }
 }
 
@@ -1176,6 +703,249 @@ fn format_results(source: &str, query: &str, today: &str, results: &[SearchResul
          find and then name the gap — don't withhold the whole answer over one uncovered part.)",
     );
     out
+}
+
+impl WebSearchTool {
+    /// Walks the tiers, collecting why each one could not answer.
+    ///
+    /// The first backend that *runs* wins, even when it found nothing —
+    /// "searched and found nothing" is a real answer and must not be retried
+    /// against a weaker engine as if it were a failure.
+    ///
+    /// Each attempted tier reports one progress line through `ctx`, so the
+    /// card in the TUI shows *which* backend a slow search is waiting on
+    /// instead of a bare spinner. A no-op when nothing is attached.
+    async fn run_backends(
+        &self,
+        query: &str,
+        limit: usize,
+        ctx: &ToolContext,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Vec<SearchResult>), Vec<(&'static str, Unavailable)>> {
+        if let Some(pin) = self
+            .settings
+            .backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            return self.run_pinned(pin, query, limit, ctx, cancel).await;
+        }
+
+        let mut failures: Vec<(&'static str, Unavailable)> = Vec::new();
+
+        macro_rules! tier {
+            ($label:expr, $call:expr) => {
+                ctx.report_progress(format!("trying {}…", $label));
+                match $call {
+                    Ok(results) => return Ok(($label.to_string(), results)),
+                    Err(e) => failures.push(($label, e)),
+                }
+            };
+        }
+
+        match &self.settings.searxng_url {
+            Some(url) if !url.trim().is_empty() => {
+                tier!(
+                    "SearXNG",
+                    crate::searxng::search(&self.client, url, query, limit).await
+                );
+            }
+            _ => failures.push((
+                "SearXNG",
+                Unavailable::NotConfigured("no `[search] searxng_url` configured".into()),
+            )),
+        }
+
+        match &self.settings.exa_api_key {
+            Some(key) if !key.trim().is_empty() => {
+                tier!("Exa", self.search_exa(key, query, limit).await);
+            }
+            // Deliberately not probed without a key: measured HTTP 402.
+            _ => failures.push((
+                "Exa",
+                Unavailable::NotConfigured("no `[exa] api_key` configured".into()),
+            )),
+        }
+
+        match &self.settings.tavily_api_key {
+            Some(key) if !key.trim().is_empty() => {
+                tier!("Tavily", self.search_tavily(key, query, limit).await);
+            }
+            _ => failures.push((
+                "Tavily",
+                Unavailable::NotConfigured("no `[tavily] api_key` configured".into()),
+            )),
+        }
+
+        tier!("Bing", self.search_bing(query, limit, cancel).await);
+        tier!(
+            "Bing via headless browser",
+            self.search_bing_browser(query, limit, cancel).await
+        );
+        tier!("Google News", self.search_google_news(query, limit).await);
+        tier!(
+            "DuckDuckGo",
+            search_duckduckgo_lite(&self.client, query, limit).await
+        );
+
+        Err(failures)
+    }
+
+    /// Runs exactly the pinned backend — no fallback, Hermes-style.
+    ///
+    /// The contract is that an explicit pin **wins even when unavailable**: a
+    /// pin to `tavily` with no key fails saying "set `[tavily] api_key`"
+    /// rather than silently searching somewhere else. Silent rerouting is
+    /// worse than the error for exactly the user who pins — someone routing
+    /// queries through their own SearXNG for privacy would have them leak to
+    /// Bing on the first hiccup, and never know.
+    async fn run_pinned(
+        &self,
+        pin: &str,
+        query: &str,
+        limit: usize,
+        ctx: &ToolContext,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Vec<SearchResult>), Vec<(&'static str, Unavailable)>> {
+        // `google_news` and `google-news` are the same intent; so are case
+        // variants. Normalising is cheap and the pin is typed by a human.
+        let normalized = pin.to_ascii_lowercase().replace('_', "-");
+
+        let (label, outcome): (&'static str, Result<Vec<SearchResult>, Unavailable>) =
+            match normalized.as_str() {
+                "searxng" => (
+                    "SearXNG",
+                    match self
+                        .settings
+                        .searxng_url
+                        .as_deref()
+                        .filter(|u| !u.trim().is_empty())
+                    {
+                        Some(url) => {
+                            ctx.report_progress("trying SearXNG…".to_string());
+                            crate::searxng::search(&self.client, url, query, limit).await
+                        }
+                        None => Err(Unavailable::Misconfigured(
+                            "`[search] backend` is pinned to `searxng` but no `[search] \
+                             searxng_url` is set — set one, or remove the pin"
+                                .into(),
+                        )),
+                    },
+                ),
+                "exa" => (
+                    "Exa",
+                    match self
+                        .settings
+                        .exa_api_key
+                        .as_deref()
+                        .filter(|k| !k.trim().is_empty())
+                    {
+                        Some(key) => {
+                            ctx.report_progress("trying Exa…".to_string());
+                            self.search_exa(key, query, limit).await
+                        }
+                        None => Err(Unavailable::Misconfigured(
+                            "`[search] backend` is pinned to `exa` but no `[exa] api_key` is \
+                             set — set one, or remove the pin"
+                                .into(),
+                        )),
+                    },
+                ),
+                "tavily" => (
+                    "Tavily",
+                    match self
+                        .settings
+                        .tavily_api_key
+                        .as_deref()
+                        .filter(|k| !k.trim().is_empty())
+                    {
+                        Some(key) => {
+                            ctx.report_progress("trying Tavily…".to_string());
+                            self.search_tavily(key, query, limit).await
+                        }
+                        None => Err(Unavailable::Misconfigured(
+                            "`[search] backend` is pinned to `tavily` but no `[tavily] api_key` \
+                             is set — set one, or remove the pin"
+                                .into(),
+                        )),
+                    },
+                ),
+                "bing" => {
+                    ctx.report_progress("trying Bing…".to_string());
+                    ("Bing", self.search_bing(query, limit, cancel).await)
+                }
+                "bing-browser" => {
+                    ctx.report_progress("trying Bing via headless browser…".to_string());
+                    (
+                        "Bing via headless browser",
+                        self.search_bing_browser(query, limit, cancel).await,
+                    )
+                }
+                "google-news" => {
+                    ctx.report_progress("trying Google News…".to_string());
+                    ("Google News", self.search_google_news(query, limit).await)
+                }
+                "duckduckgo" | "ddg" => {
+                    ctx.report_progress("trying DuckDuckGo…".to_string());
+                    (
+                        "DuckDuckGo",
+                        search_duckduckgo_lite(&self.client, query, limit).await,
+                    )
+                }
+                _ => (
+                    "web_search config",
+                    Err(Unavailable::Misconfigured(format!(
+                        "`[search] backend = \"{pin}\"` names no backend — valid values: \
+                         searxng, exa, tavily, bing, bing-browser, google-news, duckduckgo \
+                         (or remove the key to use the full chain)"
+                    ))),
+                ),
+            };
+
+        match outcome {
+            Ok(results) => Ok((format!("{label} (pinned)"), results)),
+            Err(e) => Err(vec![(label, e)]),
+        }
+    }
+
+    /// A cached hit for `query`, when at least `limit` results were stored.
+    ///
+    /// A narrower request is served by slicing; a wider one re-searches, since
+    /// serving three results to a caller that asked for ten would silently lose
+    /// the rest.
+    fn cached(&self, query: &str, limit: usize) -> Option<CacheEntry> {
+        let cache = self.cache.lock().ok()?;
+        let entry = cache.get(&cache_key(query))?;
+        (entry.results.len() >= limit).then(|| CacheEntry {
+            source: entry.source.clone(),
+            results: entry.results[..limit].to_vec(),
+        })
+    }
+
+    fn remember(&self, query: &str, source: &str, results: &[SearchResult]) {
+        // An empty result set is not cached: it is the outcome most likely to
+        // be a transient upstream hiccup, and pinning it for the session would
+        // make a query permanently unanswerable.
+        if results.is_empty() {
+            return;
+        }
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        // Crude eviction — dropping everything rather than tracking use order.
+        // At this size the only thing an LRU would buy is complexity.
+        if cache.len() >= CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(
+            cache_key(query),
+            CacheEntry {
+                source: source.to_string(),
+                results: results.to_vec(),
+            },
+        );
+    }
 }
 
 #[cfg(test)]

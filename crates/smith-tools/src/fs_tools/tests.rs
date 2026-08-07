@@ -1,4 +1,6 @@
 use super::*;
+// The path jail moved to `fs_tools/jail.rs`; this reaches it by path.
+use super::jail::lexical_normalize;
 use tokio_util::sync::CancellationToken;
 
 fn ctx(dir: &tempfile::TempDir) -> ToolContext {

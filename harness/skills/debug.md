@@ -1,5 +1,5 @@
 ---
-description: Diagnose a failure with unknown cause: gather evidence, test one hypothesis at a time, instrument before guessing.
+description: Diagnose an unknown failure: gather evidence, test one hypothesis at a time, instrument before guessing.
 ---
 
 # Workflow
