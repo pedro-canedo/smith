@@ -25,11 +25,11 @@ fn model_changed_event_updates_labels_and_clears_stale_resources() {
 fn token_usage_sets_tokens_per_sec_and_meta_includes_it() {
     let mut app = test_app();
     app.waiting_on_assistant = true;
-    app.turn_started_at = Some(Instant::now() - std::time::Duration::from_secs(2));
-    app.stream_started_at = Some(Instant::now() - std::time::Duration::from_secs(2));
+    app.metrics.started_at = Some(Instant::now() - std::time::Duration::from_secs(2));
+    app.metrics.stream_started_at = Some(Instant::now() - std::time::Duration::from_secs(2));
 
     app.on_agent_event(AgentEvent::AssistantTextDelta("hello ".into()));
-    assert!(app.live_tokens_per_sec.is_some());
+    assert!(app.metrics.live_tokens_per_sec.is_some());
     assert!(app.display_tokens_per_sec().is_some());
 
     app.on_agent_event(AgentEvent::TokenUsage(Usage {
@@ -37,7 +37,7 @@ fn token_usage_sets_tokens_per_sec_and_meta_includes_it() {
         output_tokens: 100,
         ..Usage::default()
     }));
-    let rate = app.tokens_per_sec.expect("measured rate");
+    let rate = app.metrics.tokens_per_sec.expect("measured rate");
     assert!(rate > 0.0);
 
     app.on_agent_event(AgentEvent::AssistantTurnComplete {
@@ -46,7 +46,7 @@ fn token_usage_sets_tokens_per_sec_and_meta_includes_it() {
         }]),
         stop_reason: StopReason::EndTurn,
     });
-    assert!(app.live_tokens_per_sec.is_none());
+    assert!(app.metrics.live_tokens_per_sec.is_none());
     assert_eq!(app.display_tokens_per_sec(), Some(rate));
     let meta = app
         .lines

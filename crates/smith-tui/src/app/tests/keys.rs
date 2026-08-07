@@ -96,7 +96,7 @@ fn resubmitting_the_same_prompt_does_not_double_it_in_the_history() {
     app.waiting_on_assistant = false;
     submit(&mut app, "same");
     app.waiting_on_assistant = false;
-    assert_eq!(app.history, vec!["same".to_string()]);
+    assert_eq!(app.history.entries, vec!["same".to_string()]);
 }
 
 #[test]

@@ -1,7 +1,5 @@
 //! The slash commands, from both of the blocks they used to sit in.
 
-use std::time::Instant;
-
 use smith_core::{Action, AgentPhase, McpCommand, PermissionPolicy};
 
 use super::chatline::{ChatLine, ChatRole};
@@ -148,10 +146,7 @@ impl App {
         self.waiting_on_assistant = true;
         self.phase = AgentPhase::Thinking;
         self.in_flight_text = None;
-        self.turn_started_at = Some(Instant::now());
-        self.stream_started_at = None;
-        self.stream_output_chars = 0;
-        self.live_tokens_per_sec = None;
+        self.metrics.begin_turn();
         self.request_count += 1;
         Some(Action::SubmitMessage(prompt))
     }
@@ -208,7 +203,7 @@ impl App {
                 self.waiting_on_assistant = true;
                 self.phase = AgentPhase::Thinking;
                 self.in_flight_text = None;
-                self.turn_started_at = Some(Instant::now());
+                self.metrics.begin_turn();
                 self.request_count += 1;
                 Some(Action::Mcp(McpCommand::Prompt {
                     server,
@@ -580,7 +575,7 @@ impl App {
                 self.waiting_on_assistant = true;
                 self.phase = AgentPhase::Building;
                 self.in_flight_text = None;
-                self.turn_started_at = Some(Instant::now());
+                self.metrics.begin_turn();
                 self.request_count += 1;
                 self.lines
                     .push(ChatLine::new(ChatRole::System, "plan approved — building…"));
@@ -614,7 +609,7 @@ impl App {
                 self.plan_turn_active = true;
                 self.phase = AgentPhase::Planning;
                 self.in_flight_text = None;
-                self.turn_started_at = Some(Instant::now());
+                self.metrics.begin_turn();
                 self.request_count += 1;
                 Some(Action::StartPlan(description.to_string()))
             }
@@ -713,7 +708,7 @@ impl App {
         self.loop_progress = None;
         self.phase = AgentPhase::Looping;
         self.in_flight_text = None;
-        self.turn_started_at = Some(Instant::now());
+        self.metrics.begin_turn();
         self.request_count += 1;
         Some(Action::StartLoop {
             prompt,

@@ -1,7 +1,5 @@
 //! `on_agent_event` — the one place an `AgentEvent` becomes UI state.
 
-use std::time::Instant;
-
 use smith_core::{AgentEvent, AgentPhase, StopReason};
 
 use super::chatline::{ChatLine, ChatRole};
@@ -15,21 +13,10 @@ impl App {
         match event {
             AgentEvent::AssistantTextDelta(delta) => {
                 // First delta of a stream — end any in-flight thinking gap.
-                if self.stream_started_at.is_none() {
+                if self.metrics.stream_started_at.is_none() {
                     self.end_thinking();
-                    self.stream_started_at = Some(Instant::now());
-                    self.stream_output_chars = 0;
                 }
-                self.stream_output_chars = self
-                    .stream_output_chars
-                    .saturating_add(delta.chars().count() as u32);
-                if let Some(started) = self.stream_started_at {
-                    let elapsed = started.elapsed().as_secs_f32().max(0.05);
-                    // Providers rarely stream mid-turn usage; ~4 chars/token is a
-                    // rough live estimate until TokenUsage arrives.
-                    let est_tokens = self.stream_output_chars as f32 / 4.0;
-                    self.live_tokens_per_sec = Some(est_tokens / elapsed);
-                }
+                self.metrics.note_delta(delta.chars().count() as u32);
                 self.in_flight_text
                     .get_or_insert_with(String::new)
                     .push_str(&delta);
@@ -44,9 +31,9 @@ impl App {
 
                 if !text.is_empty() {
                     let meta = if is_final {
-                        self.turn_started_at.map(|t| {
+                        self.metrics.started_at.map(|t| {
                             let secs = t.elapsed().as_secs_f32();
-                            match self.tokens_per_sec {
+                            match self.metrics.tokens_per_sec {
                                 Some(rate) => format!(
                                     "{} · {} · {:.1}s · {:.0} tok/s",
                                     self.provider_label, self.model_label, secs, rate
@@ -94,25 +81,21 @@ impl App {
                 }
 
                 if is_final {
-                    self.stream_started_at = None;
-                    self.stream_output_chars = 0;
-                    self.live_tokens_per_sec = None;
+                    self.metrics.end_stream();
                     if self.loop_active {
                         // Stay busy across iterations — LoopFinished resets
                         // waiting_on_assistant/phase once the whole run ends,
                         // so Esc keeps working in the gap between rounds.
                     } else {
                         self.waiting_on_assistant = false;
-                        self.turn_started_at = None;
+                        self.metrics.started_at = None;
                         if self.modal.is_none() {
                             self.phase = AgentPhase::Idle;
                         }
                     }
                 } else {
                     // Next provider round starts a fresh stream clock.
-                    self.stream_started_at = None;
-                    self.stream_output_chars = 0;
-                    self.live_tokens_per_sec = None;
+                    self.metrics.end_stream();
                     // Model is about to call tools — start thinking timer.
                     self.begin_thinking();
                 }
@@ -250,10 +233,10 @@ impl App {
                 self.usage.input_tokens += usage.input_tokens;
                 self.usage.output_tokens += usage.output_tokens;
                 if usage.output_tokens > 0 {
-                    let started = self.stream_started_at.or(self.turn_started_at);
+                    let started = self.metrics.stream_started_at.or(self.metrics.started_at);
                     if let Some(started) = started {
                         let elapsed = started.elapsed().as_secs_f32().max(0.05);
-                        self.tokens_per_sec = Some(usage.output_tokens as f32 / elapsed);
+                        self.metrics.tokens_per_sec = Some(usage.output_tokens as f32 / elapsed);
                     }
                 }
             }
@@ -354,10 +337,7 @@ impl App {
                 self.loop_active = false;
                 self.loop_progress = None;
                 self.waiting_on_assistant = false;
-                self.turn_started_at = None;
-                self.stream_started_at = None;
-                self.stream_output_chars = 0;
-                self.live_tokens_per_sec = None;
+                self.metrics.clear();
                 if self.modal.is_none() {
                     self.phase = AgentPhase::Idle;
                 }
@@ -460,10 +440,7 @@ impl App {
                 // so anything still marked in-flight would spin forever.
                 self.waiting_on_assistant = false;
                 self.in_flight_text = None;
-                self.turn_started_at = None;
-                self.stream_started_at = None;
-                self.stream_output_chars = 0;
-                self.live_tokens_per_sec = None;
+                self.metrics.clear();
                 self.plan_turn_active = false;
                 self.phase = AgentPhase::Idle;
                 self.lines.push(ChatLine::new(
@@ -474,10 +451,7 @@ impl App {
             AgentEvent::Error(err) => {
                 self.waiting_on_assistant = false;
                 self.in_flight_text = None;
-                self.turn_started_at = None;
-                self.stream_started_at = None;
-                self.stream_output_chars = 0;
-                self.live_tokens_per_sec = None;
+                self.metrics.clear();
                 self.plan_turn_active = false;
                 self.phase = AgentPhase::Idle;
                 // Don't leave any in-flight tool line spinning forever in

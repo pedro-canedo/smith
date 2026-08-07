@@ -46,6 +46,153 @@ const THOUGHT_THRESHOLD_SECS: f32 = 0.5;
 /// ago can't combine with a fresh one to throw the session away.
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
+/// The prompt history and where the user is in it.
+///
+/// One struct because the three fields are meaningless apart and the invariant
+/// that ties them — `draft` holds the user's own half-typed text exactly while
+/// `pos` is `Some` — was written in a doc comment and enforced by nothing.
+#[derive(Default)]
+pub(crate) struct PromptHistory {
+    /// Prompts submitted in this project, oldest last — `entries[0]` is the
+    /// most recent, so "one step back" is a plain index.
+    ///
+    /// Seeded on startup from the resumed session's own user messages rather
+    /// than from a separate history file: the messages are already persisted,
+    /// already scoped to this project, and cannot drift out of sync with the
+    /// conversation they came from.
+    pub(crate) entries: Vec<String>,
+    /// How far back the user has walked, or `None` while editing their own text.
+    pos: Option<usize>,
+    draft: String,
+}
+
+impl PromptHistory {
+    fn new(entries: Vec<String>) -> Self {
+        Self {
+            entries,
+            pos: None,
+            draft: String::new(),
+        }
+    }
+
+    /// One entry further back, given whatever is in the prompt right now.
+    /// `None` means there was nothing to step to.
+    pub(crate) fn back(&mut self, current: &str) -> Option<String> {
+        let next = match self.pos {
+            None => 0,
+            Some(i) => i + 1,
+        };
+        if next >= self.entries.len() {
+            return None;
+        }
+        if self.pos.is_none() {
+            // Set aside whatever was half-typed, so walking forward again
+            // brings it back instead of losing it.
+            self.draft = current.to_string();
+        }
+        self.pos = Some(next);
+        Some(self.entries[next].clone())
+    }
+
+    /// One entry forward; past the newest, the saved draft.
+    pub(crate) fn forward(&mut self) -> Option<String> {
+        let i = self.pos?;
+        if i == 0 {
+            self.pos = None;
+            Some(std::mem::take(&mut self.draft))
+        } else {
+            self.pos = Some(i - 1);
+            Some(self.entries[i - 1].clone())
+        }
+    }
+
+    /// Record a submitted prompt and leave history-walking mode.
+    ///
+    /// Consecutive duplicates collapse — holding Enter on the same message, or
+    /// resubmitting a recalled one, should not make Up press twice to get past
+    /// it.
+    pub(crate) fn remember(&mut self, text: &str) {
+        self.pos = None;
+        self.draft.clear();
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.entries.first().is_some_and(|h| h == text) {
+            return;
+        }
+        self.entries.insert(0, text.to_string());
+        self.entries.truncate(HISTORY_LIMIT);
+    }
+}
+
+/// The clocks and counters behind the status bar's elapsed time and tok/s.
+///
+/// One struct because all five are reset together at a turn boundary — and
+/// before this they were reset at eight scattered sites, only three of which
+/// did the whole job. See `begin_turn`.
+#[derive(Default)]
+pub(crate) struct TurnMetrics {
+    pub(crate) started_at: Option<Instant>,
+    /// First assistant text delta of the current provider stream (per round).
+    pub(crate) stream_started_at: Option<Instant>,
+    /// Characters received in the current stream — for the live tok/s estimate.
+    stream_output_chars: u32,
+    /// Live estimate while streaming (`chars/4 / elapsed`).
+    pub(crate) live_tokens_per_sec: Option<f32>,
+    /// Last measured rate from provider `output_tokens / elapsed`.
+    pub(crate) tokens_per_sec: Option<f32>,
+}
+
+impl TurnMetrics {
+    /// A turn is starting: the clock runs, and nothing about the last stream
+    /// carries over.
+    ///
+    /// The five sites that used to set only the clock — `/compact`, `/plan`,
+    /// plan approval, `/loop`, and the plan-mode submit in `on_key` — left the
+    /// previous turn's live rate on screen until the new turn's first delta
+    /// arrived. They call this now, so they no longer do.
+    pub(crate) fn begin_turn(&mut self) {
+        self.started_at = Some(Instant::now());
+        self.end_stream();
+    }
+
+    /// The stream ended, or never began. `tokens_per_sec` deliberately
+    /// survives: it is the last *measured* rate, and the status bar goes on
+    /// showing it between rounds rather than blanking.
+    pub(crate) fn end_stream(&mut self) {
+        self.stream_started_at = None;
+        self.stream_output_chars = 0;
+        self.live_tokens_per_sec = None;
+    }
+
+    /// The turn is over.
+    pub(crate) fn clear(&mut self) {
+        self.started_at = None;
+        self.end_stream();
+    }
+
+    /// One assistant text delta arrived.
+    pub(crate) fn note_delta(&mut self, chars: u32) {
+        if self.stream_started_at.is_none() {
+            self.stream_started_at = Some(Instant::now());
+            self.stream_output_chars = 0;
+        }
+        self.stream_output_chars = self.stream_output_chars.saturating_add(chars);
+        if let Some(started) = self.stream_started_at {
+            let elapsed = started.elapsed().as_secs_f32().max(0.05);
+            // Providers rarely stream mid-turn usage; ~4 chars/token is a
+            // rough live estimate until TokenUsage arrives.
+            let est_tokens = self.stream_output_chars as f32 / 4.0;
+            self.live_tokens_per_sec = Some(est_tokens / elapsed);
+        }
+    }
+
+    /// Roughly how many output tokens the current stream has produced.
+    pub(crate) fn live_output_tokens_estimate(&self) -> Option<u32> {
+        self.stream_started_at.map(|_| self.stream_output_chars / 4)
+    }
+}
+
 pub struct App {
     pub input: TextInput,
     pub lines: Vec<ChatLine>,
@@ -105,19 +252,7 @@ pub struct App {
     file_index: Option<Vec<String>>,
     /// What the suggestion list is currently offering.
     pub completion_kind: CompletionKind,
-    /// Prompts submitted in this project, oldest last — `history[0]` is the
-    /// most recent, so "one step back" is a plain index.
-    ///
-    /// Seeded on startup from the resumed session's own user messages rather
-    /// than from a separate history file: the messages are already persisted,
-    /// already scoped to this project, and cannot drift out of sync with the
-    /// conversation they came from.
-    history: Vec<String>,
-    /// How far back the user has walked, or `None` while editing their own
-    /// text. `history_draft` holds that text so walking back and forward
-    /// again returns it rather than eating it.
-    history_pos: Option<usize>,
-    history_draft: String,
+    pub(crate) history: PromptHistory,
     /// Prompts typed while a turn was already running, oldest first.
     ///
     /// Being unable to type the next thing until the agent stops is the wrong
@@ -172,15 +307,7 @@ pub struct App {
     pub loop_active: bool,
     /// `(iteration, max_iterations)` of the loop round in flight, if any.
     pub loop_progress: Option<(u32, u32)>,
-    turn_started_at: Option<Instant>,
-    /// First assistant text delta of the current provider stream (per round).
-    stream_started_at: Option<Instant>,
-    /// Characters received in the current stream — for live tok/s estimate.
-    stream_output_chars: u32,
-    /// Live estimate while streaming (`chars/4 / elapsed`).
-    live_tokens_per_sec: Option<f32>,
-    /// Last measured rate from provider `output_tokens / elapsed`.
-    tokens_per_sec: Option<f32>,
+    pub(crate) metrics: TurnMetrics,
     /// When the first of the two `Ctrl+C` presses landed, if the quit is
     /// currently armed — see `quit_pending`.
     quit_armed_at: Option<Instant>,
@@ -221,9 +348,7 @@ impl App {
             message_area: Rect::default(),
             file_index: None,
             completion_kind: CompletionKind::default(),
-            history: config.history,
-            history_pos: None,
-            history_draft: String::new(),
+            history: PromptHistory::new(config.history),
             queued: std::collections::VecDeque::new(),
             overlay: None,
             logs: config.logs,
@@ -241,11 +366,7 @@ impl App {
             tasks: config.tasks,
             loop_active: false,
             loop_progress: None,
-            turn_started_at: None,
-            stream_started_at: None,
-            stream_output_chars: 0,
-            live_tokens_per_sec: None,
-            tokens_per_sec: None,
+            metrics: TurnMetrics::default(),
             quit_armed_at: None,
             transcript: TranscriptCache::default(),
         }
@@ -293,23 +414,25 @@ impl App {
     /// Rate shown in the sidebar: live estimate while streaming, else last measured.
     pub fn display_tokens_per_sec(&self) -> Option<f32> {
         if self.waiting_on_assistant {
-            self.live_tokens_per_sec.or(self.tokens_per_sec)
+            self.metrics
+                .live_tokens_per_sec
+                .or(self.metrics.tokens_per_sec)
         } else {
-            self.tokens_per_sec
+            self.metrics.tokens_per_sec
         }
     }
 
     /// Seconds since the current turn started, for the "thinking… 12s" style
     /// status line — `None` when idle.
     pub fn turn_elapsed_secs(&self) -> Option<f32> {
-        self.turn_started_at.map(|t| t.elapsed().as_secs_f32())
+        self.metrics.started_at.map(|t| t.elapsed().as_secs_f32())
     }
 
     /// Rough output-token estimate for the round currently streaming in
     /// (~4 chars/token), for the same status line — `None` before any text
     /// has arrived this round.
     pub fn live_output_tokens_estimate(&self) -> Option<u32> {
-        self.stream_started_at.map(|_| self.stream_output_chars / 4)
+        self.metrics.live_output_tokens_estimate()
     }
 
     /// Advances the spinner animation; call on a timer while `is_animating()`.
@@ -546,10 +669,7 @@ impl App {
         self.waiting_on_assistant = true;
         self.phase = AgentPhase::Thinking;
         self.in_flight_text = None;
-        self.turn_started_at = Some(Instant::now());
-        self.stream_started_at = None;
-        self.stream_output_chars = 0;
-        self.live_tokens_per_sec = None;
+        self.metrics.begin_turn();
         self.request_count += 1;
         Some(Action::SubmitMessage(text))
     }
@@ -638,39 +758,25 @@ impl App {
     /// Step one entry further back in the prompt history. `false` means there
     /// was nothing to step to, so the caller can give the key its old meaning.
     fn history_back(&mut self) -> bool {
-        let next = match self.history_pos {
-            None => 0,
-            Some(i) => i + 1,
-        };
-        if next >= self.history.len() {
-            return false;
+        let current = self.input.text();
+        match self.history.back(&current) {
+            Some(entry) => {
+                self.input.set(&entry);
+                true
+            }
+            None => false,
         }
-        if self.history_pos.is_none() {
-            // Set aside whatever was half-typed, so walking forward again
-            // brings it back instead of losing it.
-            self.history_draft = self.input.text();
-        }
-        self.history_pos = Some(next);
-        let entry = self.history[next].clone();
-        self.input.set(&entry);
-        true
     }
 
     /// Step one entry forward; past the newest, restore the saved draft.
     fn history_forward(&mut self) -> bool {
-        let Some(i) = self.history_pos else {
-            return false;
-        };
-        if i == 0 {
-            self.history_pos = None;
-            let draft = std::mem::take(&mut self.history_draft);
-            self.input.set(&draft);
-        } else {
-            self.history_pos = Some(i - 1);
-            let entry = self.history[i - 1].clone();
-            self.input.set(&entry);
+        match self.history.forward() {
+            Some(text) => {
+                self.input.set(&text);
+                true
+            }
+            None => false,
         }
-        true
     }
 
     /// Record a submitted prompt and leave history-walking mode.
@@ -679,16 +785,7 @@ impl App {
     /// or resubmitting a recalled one, should not make Up press twice to get
     /// past it.
     fn remember_prompt(&mut self, text: &str) {
-        self.history_pos = None;
-        self.history_draft.clear();
-        if text.trim().is_empty() {
-            return;
-        }
-        if self.history.first().is_some_and(|h| h == text) {
-            return;
-        }
-        self.history.insert(0, text.to_string());
-        self.history.truncate(HISTORY_LIMIT);
+        self.history.remember(text);
     }
 
     /// Move the open modal by `delta` rows, if it has a scroll offset.
