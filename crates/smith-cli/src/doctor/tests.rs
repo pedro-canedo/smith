@@ -585,3 +585,67 @@ async fn a_configured_browser_that_does_not_exist_warns_with_a_fix() {
 async fn a_missing_browser_is_a_warning_not_a_failure() {
     assert_ne!(check_browser(&Config::default()).await.status, Status::Fail);
 }
+
+// ---- the ollama cloud check ------------------------------------------------
+
+fn linked(names: &[(&str, bool)]) -> Vec<smith_provider::OllamaModel> {
+    names
+        .iter()
+        .map(|(name, is_cloud)| smith_provider::OllamaModel {
+            name: (*name).to_string(),
+            is_cloud: *is_cloud,
+            context_window: None,
+            size_bytes: None,
+            supports_tools: true,
+        })
+        .collect()
+}
+
+/// The configured model is what a turn will use, so its entitlement is the
+/// fact worth reporting.
+#[test]
+fn the_configured_cloud_model_is_the_one_probed() {
+    let models = linked(&[("nemotron-3-super:cloud", true), ("qwen3.5:9b", false)]);
+    assert_eq!(
+        pick_cloud_probe("gpt-oss:20b-cloud", &models).as_deref(),
+        Some("gpt-oss:20b-cloud"),
+        "even when it is not linked yet — that is still what a turn asks for"
+    );
+}
+
+/// With a local model configured, the check is only asking "is this daemon
+/// signed in". Probing a paid link would answer a second question nobody
+/// asked, and its refusal reads as a problem with smith rather than as a fact
+/// about an unused link.
+#[test]
+fn a_free_cloud_model_is_preferred_for_the_signin_probe() {
+    let models = linked(&[
+        ("deepseek-v4-flash:cloud", true),
+        ("nemotron-3-super:cloud", true),
+    ]);
+    assert_eq!(
+        pick_cloud_probe("qwen3.5:9b", &models).as_deref(),
+        Some("nemotron-3-super:cloud"),
+        "the free one isolates the question"
+    );
+}
+
+/// With nothing free linked, any cloud model still answers the signin
+/// question — a partial answer beats none.
+#[test]
+fn any_cloud_model_is_used_when_none_of_the_free_ones_are_linked() {
+    let models = linked(&[("deepseek-v4-flash:cloud", true)]);
+    assert_eq!(
+        pick_cloud_probe("qwen3.5:9b", &models).as_deref(),
+        Some("deepseek-v4-flash:cloud")
+    );
+}
+
+/// A machine running local weights must not be told about an account it does
+/// not need — the check does not run at all.
+#[test]
+fn a_machine_with_no_cloud_model_is_not_asked_about_one() {
+    let models = linked(&[("qwen3.5:9b", false), ("llama3.3", false)]);
+    assert_eq!(pick_cloud_probe("qwen3.5:9b", &models), None);
+    assert_eq!(pick_cloud_probe("", &[]), None);
+}

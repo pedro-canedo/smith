@@ -215,6 +215,9 @@ pub async fn diagnose(cwd: &Path, config: &Config) -> Report {
     // zero-cost path someone falls back to, and "can I use it?" is worth
     // answering before they need to.
     report.push(check_ollama(config).await);
+    if let Some(check) = check_ollama_cloud(config).await {
+        report.push(check);
+    }
     // Only when 9router is actually in play (primary or fallback entry):
     // unlike Ollama it is not a thing most machines have, and a permanent
     // warn on every clean install would train people to ignore the report.
@@ -1093,3 +1096,119 @@ async fn check_mcp_server(server: &McpServerConfig) -> Check {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether the daemon can actually reach the cloud models it is linked to.
+///
+/// A separate check because it is a separate failure: `ollama` can be
+/// installed and answering while every `:cloud` model refuses, and the two
+/// have nothing to do with each other. The credential lives in the daemon
+/// (`~/.ollama`), not in smith — so from smith's side these models are
+/// keyless, which is easy to mistake for "nothing is required".
+///
+/// `None` when there is no cloud model in play at all: a machine running
+/// local weights should not be told about an account it does not need.
+async fn check_ollama_cloud(config: &Config) -> Option<Check> {
+    let base = config
+        .ollama
+        .base_url
+        .clone()
+        .unwrap_or_else(|| smith_config::DEFAULT_OLLAMA_BASE_URL.to_string());
+
+    // `[ollama] model` is the fallback-entry one; `[general] model` is the
+    // primary's. Either can be the cloud name in play.
+    let configured = config
+        .ollama
+        .model
+        .clone()
+        .or_else(|| config.general.model.clone())
+        .unwrap_or_default();
+    let linked = smith_provider::ollama_tags(&base).await.unwrap_or_default();
+    let in_play = smith_provider::is_cloud_name(&configured) || linked.iter().any(|m| m.is_cloud);
+    if !in_play {
+        return None;
+    }
+
+    let target = pick_cloud_probe(&configured, &linked)?;
+
+    match probe_ollama_model(&base, &target).await {
+        Ok(()) => Some(Check::ok(
+            "ollama cloud",
+            format!("signed in; `{target}` answering"),
+        )),
+        Err(message) => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("unauthorized") || lower.contains("sign in") {
+                Some(Check::fail(
+                    "ollama cloud",
+                    format!("`{target}` refused: the daemon is not signed in"),
+                    "run `ollama signin` — a free account, no card",
+                ))
+            } else if lower.contains("subscription") || lower.contains("upgrade for access") {
+                Some(Check::warn(
+                    "ollama cloud",
+                    format!("`{target}` needs a paid Ollama plan"),
+                    "pick a free cloud model (`nemotron-3-super:cloud`) or a local one, \
+                     or upgrade at https://ollama.com/upgrade",
+                ))
+            } else {
+                Some(Check::warn(
+                    "ollama cloud",
+                    format!("`{target}` did not answer: {message}"),
+                    "check the daemon with `ollama list`, or pick another model with `/model`",
+                ))
+            }
+        }
+    }
+}
+
+/// One token against a model, non-streaming — the cheapest question that
+/// distinguishes "signed in" from "refused", and the shape that carries the
+/// refusal in a 200 body.
+async fn probe_ollama_model(base_url: &str, model: &str) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "hi" }],
+    });
+    let response = client
+        .post(format!(
+            "{}/chat/completions",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let value: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    match smith_provider::ollama::error_in_success_body(&value) {
+        Some(message) => Err(message.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// Which cloud model to ask.
+///
+/// The configured one when it is a cloud model, because that is what a turn
+/// will actually use and its entitlement is the fact worth reporting.
+///
+/// Otherwise a **free** one, deliberately. Any linked cloud model answers "is
+/// this daemon signed in", but a paid one also answers "are you entitled to
+/// it" — and reporting that about a model nobody chose reads as a problem
+/// with smith's setup rather than as a fact about an unused link. Picking a
+/// free model isolates the question to the one this check is for.
+fn pick_cloud_probe(configured: &str, linked: &[smith_provider::OllamaModel]) -> Option<String> {
+    if smith_provider::is_cloud_name(configured) {
+        return Some(configured.to_string());
+    }
+    let free = smith_store::models::OLLAMA_FREE_CLOUD_MODELS;
+    linked
+        .iter()
+        .find(|m| m.is_cloud && free.contains(&m.name.as_str()))
+        .or_else(|| linked.iter().find(|m| m.is_cloud))
+        .map(|m| m.name.clone())
+}
