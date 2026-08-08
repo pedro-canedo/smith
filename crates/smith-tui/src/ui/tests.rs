@@ -240,23 +240,14 @@ fn resizing_mid_stream_never_leaves_a_row_wider_than_the_pane() {
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
 
-        let pane = page_column(
-            Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: 24,
-            },
-            page_width(width, width >= SIDEBAR_MIN_TERMINAL_WIDTH),
-        );
-        let pane_right = if width >= SIDEBAR_MIN_TERMINAL_WIDTH {
-            pane.width - SIDEBAR_WIDTH - 1
-        } else {
-            pane.width - 1
-        };
+        // Read the pane back from the frame that just drew rather than
+        // recomputing the layout here: `draw_messages` records the rect it
+        // actually used, so this stays true when the layout changes.
+        let pane = app.message_area;
+        let pane_right = pane.x + pane.width - 1;
         let buf = terminal.backend().buffer();
-        for y in 0..20 {
-            if buf.cell(Position::new(0, y)).unwrap().symbol() == "│" {
+        for y in pane.y..pane.y + pane.height.min(20) {
+            if buf.cell(Position::new(pane.x, y)).unwrap().symbol() == "│" {
                 assert_eq!(
                     buf.cell(Position::new(pane_right, y)).unwrap().symbol(),
                     "│",

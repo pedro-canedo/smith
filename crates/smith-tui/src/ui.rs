@@ -56,18 +56,61 @@ const MIN_GAUGE_WIDTH: u16 = 16;
 /// reasonable margin.
 const MAX_CONTENT_WIDTH: u16 = 100;
 
-/// The app's column: the reading measure, plus the sidebar when it is drawn.
+/// Ceiling on the document column when the terminal is wide enough that
+/// holding it to the reading measure leaves more empty screen than document.
 ///
-/// The cap is a reading measure, so it does not grow with the terminal — but
-/// what the terminal *does* get to decide is where the column sits. See
-/// [`page_column`].
-fn page_width(terminal_width: u16, with_sidebar: bool) -> u16 {
-    let wanted = if with_sidebar {
-        MAX_CONTENT_WIDTH + SIDEBAR_WIDTH
+/// Prose reads best around a hundred columns, but a full-screen terminal is
+/// two and a half times that, and a column that ignores the extra looks like
+/// the app failed to notice the window. This is the compromise: grow, but
+/// never to the point where a line of prose becomes a scan across the desk.
+const MAX_WIDE_CONTENT_WIDTH: u16 = 160;
+
+/// How wide the document column is, given the columns left over after the
+/// sidebar has taken its edge.
+///
+/// Below roughly 125 columns of space this is exactly the old behaviour —
+/// the whole width, capped at the reading measure. Above it the column grows
+/// with the terminal (four fifths of it) up to [`MAX_WIDE_CONTENT_WIDTH`].
+fn content_width(available: u16) -> u16 {
+    let wanted = (available * 4 / 5).clamp(MAX_CONTENT_WIDTH, MAX_WIDE_CONTENT_WIDTH);
+    available.min(wanted)
+}
+
+/// The document column for one full-width region: centred in whatever the
+/// sidebar left behind.
+///
+/// Every stacked region — transcript, context strip, slash list, queue,
+/// prompt — goes through this, so they share both edges and read as one
+/// column rather than as separate panes that happen to be near each other.
+fn content_column(area: Rect, sidebar_shown: bool) -> Rect {
+    let available = if sidebar_shown {
+        area.width.saturating_sub(SIDEBAR_WIDTH)
     } else {
-        MAX_CONTENT_WIDTH
+        area.width
     };
-    terminal_width.min(wanted)
+    page_column(
+        Rect {
+            width: available,
+            ..area
+        },
+        content_width(available),
+    )
+}
+
+/// The sidebar's rect: pinned to the *terminal's* right edge, not to the
+/// document column's.
+///
+/// It used to ride inside the centred column, which put it in the middle of
+/// a wide screen with a field of empty cells to its right — a panel that is
+/// visibly not attached to anything. The sidebar is window chrome; chrome
+/// belongs on the window's edge.
+fn sidebar_rect(area: Rect) -> Rect {
+    let width = SIDEBAR_WIDTH.min(area.width);
+    Rect {
+        x: area.x + area.width - width,
+        width,
+        ..area
+    }
 }
 
 /// Centres the app's column in `area`.
@@ -247,15 +290,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
 
     // Whether the sidebar is drawn is a question about the *terminal* — does
-    // it have the columns — so it is asked before the page column narrows
-    // anything, and answered once for both the width and the draw below.
+    // it have the columns — answered once, for the sidebar's own rect and for
+    // how much room the document column has left.
     let sidebar_shown =
         !is_idle && whole_screen.width >= SIDEBAR_MIN_TERMINAL_WIDTH && app.sidebar_visible;
-    let page = page_column(whole_screen, page_width(whole_screen.width, sidebar_shown));
 
+    // The vertical stack is laid out on the whole terminal; only the
+    // *horizontal* placement of each region is the column's business.
     let layout = vertical_layout(
-        page.height,
-        wanted_input_rows(app, page),
+        whole_screen.height,
+        wanted_input_rows(app, content_column(whole_screen, sidebar_shown)),
         wanted_suggest,
         wanted_queue,
         strip_wanted,
@@ -269,7 +313,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(layout.input),
             Constraint::Length(layout.status),
         ])
-        .areas(page);
+        .areas(whole_screen);
     // A modal takes over the interface — the transcript behind it must not
     // stay on screen too. Left up, its unwrapped-at-full-width lines poke
     // out on both sides of the centered popup and compete with it for
@@ -278,39 +322,39 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let modal_open = app.modal.is_some();
     let theme = app.theme.clone();
 
+    // The document column, shared by every stacked region so they line up.
+    let column = |area: Rect| content_column(area, sidebar_shown);
+    let chat_area = column(message_area);
+
     if is_idle {
+        // The splash is centred in the whole terminal: there is no sidebar
+        // beside it and no column below it to line up with yet.
         draw_idle(frame, &*app, message_area);
-    } else if sidebar_shown {
-        let [chat_area, sidebar_area] =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(SIDEBAR_WIDTH)])
-                .areas(message_area);
+    } else {
         if modal_open {
             frame.render_widget(Clear, chat_area);
             frame.render_widget(Block::new().style(theme.base_bg()), chat_area);
         } else {
             draw_transcript(frame, app, chat_area);
         }
-        draw_sidebar(frame, &*app, sidebar_area);
-    } else if modal_open {
-        frame.render_widget(Clear, message_area);
-        frame.render_widget(Block::new().style(theme.base_bg()), message_area);
-    } else {
-        draw_transcript(frame, app, message_area);
+        if sidebar_shown {
+            draw_sidebar(frame, &*app, sidebar_rect(message_area));
+        }
     }
 
     if layout.strip > 0 {
-        draw_context_strip(frame, &*app, strip_area);
+        draw_context_strip(frame, &*app, column(strip_area));
     }
 
     if layout.suggest > 0 {
-        draw_slash_suggestions(frame, app, &suggestions, suggest_area);
+        draw_slash_suggestions(frame, app, &suggestions, column(suggest_area));
     }
 
     if layout.queue > 0 {
-        draw_queue(frame, &*app, queue_area);
+        draw_queue(frame, &*app, column(queue_area));
     }
 
-    draw_input(frame, app, input_area);
+    draw_input(frame, app, column(input_area));
     // Full width, unlike everything above it: the status bar is the window's
     // own chrome rather than part of the document, and a footer that stopped
     // at the column's edge would leave the terminal's corners bare while

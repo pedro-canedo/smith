@@ -240,46 +240,135 @@ fn the_selected_suggestion_stays_on_screen_past_the_first_windowful() {
     );
 }
 
-/// The reading measure is a *measure*, not a left margin. Capping the width
-/// and keeping `x` left every pane hugging the left edge with the rest of a
-/// wide terminal blank beside it — half the screen of dead space on a
-/// full-screen window, which reads as a bug rather than as a margin.
-#[test]
-fn the_app_column_centres_on_a_wide_terminal_and_does_not_move_on_a_narrow_one() {
+/// Renders a session and reports `(column_first, column_last, sidebar_x)` —
+/// the prompt's own borders are the document column's edges, and the
+/// sidebar's left border is where the sidebar starts.
+fn laid_out(w: u16) -> (u16, u16, Option<u16>) {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let column_of = |w: u16| -> (u16, u16) {
-        let mut app = app_with_context(w);
-        app.lines
-            .push(ChatLine::new(ChatRole::User, "layout".to_string()));
-        let mut t = Terminal::new(TestBackend::new(w, 20)).unwrap();
-        t.draw(|f| draw(f, &mut app)).unwrap();
-        let buf = t.backend().buffer().clone();
-        // The input box's own borders are the column's edges.
-        let row = 18;
-        let first = (0..w)
-            .find(|x| buf.cell((*x, row)).unwrap().symbol() != " ")
-            .unwrap();
-        let last = (0..w)
-            .rev()
-            .find(|x| buf.cell((*x, row)).unwrap().symbol() != " ")
-            .unwrap();
-        (first, last)
-    };
+    let mut app = app_with_context(w);
+    app.lines
+        .push(ChatLine::new(ChatRole::User, "layout".to_string()));
+    let mut t = Terminal::new(TestBackend::new(w, 20)).unwrap();
+    t.draw(|f| draw(f, &mut app)).unwrap();
+    let buf = t.backend().buffer().clone();
 
-    // Wide: the column is capped and the slack is split evenly.
-    let (first, last) = column_of(180);
+    let prompt_row = 18;
+    let first = (0..w)
+        .find(|x| buf.cell((*x, prompt_row)).unwrap().symbol() != " ")
+        .unwrap();
+    let last = (0..w)
+        .rev()
+        .find(|x| buf.cell((*x, prompt_row)).unwrap().symbol() != " ")
+        .unwrap();
+    // The sidebar's `Borders::LEFT` rule, on a transcript row.
+    let sidebar = (0..w).find(|x| buf.cell((*x, 1)).unwrap().symbol() == "│" && *x > last);
+    (first, last, sidebar)
+}
+
+/// The sidebar is window chrome, so it belongs on the window's edge. It used
+/// to ride inside the centred column, which on a wide screen put a panel in
+/// the middle of the terminal with a field of empty cells to its right —
+/// visibly attached to nothing.
+#[test]
+fn the_sidebar_hugs_the_terminals_right_edge_on_a_wide_terminal() {
+    let (_, _, sidebar) = laid_out(180);
+    let sidebar = sidebar.expect("the sidebar was not drawn at 180 columns");
+    assert_eq!(
+        sidebar,
+        180 - SIDEBAR_WIDTH,
+        "the sidebar must start exactly its own width from the right edge"
+    );
+}
+
+/// The document column centres in what the sidebar left, and grows with the
+/// terminal instead of holding a hundred columns while the screen goes to
+/// waste — capped, so a line of prose never becomes a scan across the desk.
+#[test]
+fn the_document_column_centres_in_what_the_sidebar_left_and_grows_with_the_screen() {
+    let (first, last, _) = laid_out(180);
     let width = last - first + 1;
-    assert_eq!(width, MAX_CONTENT_WIDTH + SIDEBAR_WIDTH, "column width");
-    assert_eq!(first, (180 - width) / 2, "left margin");
-    assert_eq!(180 - 1 - last, first, "margins must match");
+    let available = 180 - SIDEBAR_WIDTH;
+    assert_eq!(width, content_width(available), "column width");
+    assert!(
+        width > MAX_CONTENT_WIDTH,
+        "a 180-column terminal must buy more than the reading measure, got {width}"
+    );
+    assert!(width <= MAX_WIDE_CONTENT_WIDTH, "past the wide ceiling");
+    // Centred in the space left of the sidebar, not in the whole terminal.
+    assert_eq!(first, (available - width) / 2, "left margin");
 
-    // At or below the cap nothing moves: a narrow terminal lays out exactly
-    // as it did before there was a column at all.
+    // A very wide terminal stops at the ceiling rather than following the
+    // window out.
+    let (first, last, _) = laid_out(400);
+    assert_eq!(last - first + 1, MAX_WIDE_CONTENT_WIDTH);
+}
+
+/// At or below the measure nothing moves: a narrow terminal is laid out
+/// exactly as it was before there was a column at all.
+#[test]
+fn a_narrow_terminal_still_uses_every_column_it_has() {
     for w in [100u16, 80, 60] {
-        let (first, last) = column_of(w);
+        let (first, last, _) = laid_out(w);
+        let available = if w >= SIDEBAR_MIN_TERMINAL_WIDTH {
+            w - SIDEBAR_WIDTH
+        } else {
+            w
+        };
         assert_eq!(first, 0, "w={w} grew a margin it cannot afford");
-        assert_eq!(last, w - 1, "w={w} left a gap at the right edge");
+        assert_eq!(
+            last,
+            available - 1,
+            "w={w} left a gap between the column and the sidebar"
+        );
     }
+}
+
+/// The splash's box has to *look* like a box. One row of the source art
+/// carried a stray space past its right border, and a centred `Paragraph`
+/// centres each row by its own width — so that row sat a cell off from its
+/// neighbours and the frame came out ragged.
+#[test]
+fn the_idle_banner_draws_a_rectangular_box() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = test_app();
+    // The real art, not the fixture's placeholder — the box is the point.
+    app.banner = crate::banner::banner();
+    assert!(app.lines.is_empty(), "the splash needs an idle session");
+    let mut t = Terminal::new(TestBackend::new(200, 30)).unwrap();
+    t.draw(|f| draw(f, &mut app)).unwrap();
+    let buf = t.backend().buffer().clone();
+
+    // Every row of the banner opens and closes in the same two columns.
+    // Scanned above the prompt, whose own box would otherwise join in with
+    // a different (and legitimately different) pair of edges.
+    let mut edges: Vec<(u16, u16)> = Vec::new();
+    for y in 0..30 - (INPUT_MIN_ROWS + 3) {
+        let left = (0..200).find(|x| {
+            matches!(
+                buf.cell((*x, y)).unwrap().symbol(),
+                "\u{250c}" | "\u{2502}" | "\u{2514}"
+            )
+        });
+        let right = (0..200).rev().find(|x| {
+            matches!(
+                buf.cell((*x, y)).unwrap().symbol(),
+                "\u{2510}" | "\u{2502}" | "\u{2518}"
+            )
+        });
+        if let (Some(l), Some(r)) = (left, right) {
+            if r > l + 40 {
+                edges.push((l, r));
+            }
+        }
+    }
+    assert!(edges.len() >= 8, "the banner box did not draw: {edges:?}");
+    let first = edges[0];
+    assert!(
+        edges.iter().all(|e| *e == first),
+        "ragged banner box — rows disagree about their borders: {edges:?}"
+    );
 }
