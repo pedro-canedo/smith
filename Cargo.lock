@@ -2774,7 +2774,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smith-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2813,7 +2813,7 @@ dependencies = [
 
 [[package]]
 name = "smith-config"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "directories",
  "serde",
@@ -2824,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "smith-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -2837,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "smith-mcp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "eventsource-stream",
@@ -2855,7 +2855,7 @@ dependencies = [
 
 [[package]]
 name = "smith-provider"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "smith-store"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rusqlite",
  "serde",
@@ -2885,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "smith-tools"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2911,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "smith-tui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "color-eyre",
  "crossterm",

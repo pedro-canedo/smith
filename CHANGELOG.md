@@ -2,7 +2,7 @@
 
 All notable user-facing changes are tracked here.
 
-## Unreleased
+## 0.3.2 — 2026-08-08
 
 ### Fixed
 
