@@ -94,4 +94,4 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 dialoguer = "0.11"
 rusqlite = { version = "0.32", features = ["bundled"] }
-sysinfo = "0.32"
+sysinfo = "0.39"
