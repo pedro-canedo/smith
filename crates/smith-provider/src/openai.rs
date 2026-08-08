@@ -70,6 +70,40 @@ fn parse_num_ctx(parameters: &str) -> Option<u32> {
     })
 }
 
+/// Extracts each model's context window from the 9Router gateway's
+/// `GET /v1/models`.
+///
+/// A separate parser from OpenRouter's because the shape is genuinely
+/// different, not merely renamed: the gateway nests everything under a
+/// `capabilities` object and spells the field `contextWindow`, where
+/// OpenRouter puts `context_length` at the top level. One parser trying to
+/// accept both would silently accept neither when a field moves.
+///
+/// Entries with no `capabilities` (the gateway's own `COMBO-*` aggregates)
+/// are skipped rather than defaulted — an absent window is "we do not know",
+/// which `known_window`'s conservative fallback already answers correctly.
+fn parse_gateway_catalogue(value: &serde_json::Value) -> HashMap<String, u32> {
+    let mut windows = HashMap::new();
+    let Some(data) = value.get("data").and_then(|d| d.as_array()) else {
+        return windows;
+    };
+    for model in data {
+        let Some(id) = model.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(window) = model
+            .get("capabilities")
+            .and_then(|c| c.get("contextWindow"))
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+        {
+            windows.insert(id.to_string(), window);
+        }
+    }
+    windows
+}
+
 /// Extracts what smith needs from OpenRouter's `GET /models` payload:
 /// `(model -> context_length, free models that support tools)`.
 ///
@@ -229,6 +263,33 @@ impl OpenAiProvider {
             .unwrap_or(OLLAMA_CONTEXT_WINDOW)
     }
 
+    /// A gateway model's real window, or the conservative floor.
+    ///
+    /// Exact first, then **one** catalogue entry ending in `/{model}`. A
+    /// gateway qualifies every id with the upstream that serves it
+    /// (`openrouter/nvidia/nemotron-…`), while a config routinely names the
+    /// model the way its vendor does (`nvidia/nemotron-…`) — so requiring an
+    /// exact key meant the catalogue answered for almost nobody.
+    ///
+    /// Unique or nothing, the same rule `Agent::resolve_tool_name` applies to
+    /// tool names: two upstreams serving the same suffix may disagree about
+    /// the window, and picking one of them is a guess. A guess here is not
+    /// cosmetic — it sets when auto-compaction fires.
+    fn gateway_window(&self, model: &str) -> u32 {
+        let Ok(known) = self.known_windows.read() else {
+            return GATEWAY_CONTEXT_WINDOW;
+        };
+        if let Some(window) = known.get(model) {
+            return *window;
+        }
+        let suffix = format!("/{model}");
+        let mut matches = known.iter().filter(|(id, _)| id.ends_with(&suffix));
+        match (matches.next(), matches.next()) {
+            (Some((_, window)), None) => *window,
+            _ => GATEWAY_CONTEXT_WINDOW,
+        }
+    }
+
     /// Pulls OpenRouter's catalogue once and caches what smith needs from it:
     /// each model's context window, and which `:free` models can call tools.
     ///
@@ -272,6 +333,47 @@ impl OpenAiProvider {
         }
         if let Ok(mut free) = self.free_tool_models.write() {
             *free = free_tools;
+        }
+    }
+
+    /// Pulls the 9Router gateway's catalogue once and caches each model's
+    /// real context window.
+    ///
+    /// Until this existed, every 9Router session reported
+    /// [`GATEWAY_CONTEXT_WINDOW`] no matter what it was talking to — and the
+    /// gateway routes to models with eight and thirty times that. The gauge
+    /// was the visible half of the damage; the expensive half was
+    /// auto-compaction, which fires at a fraction of the window and so
+    /// summarised conversations that still fit comfortably.
+    async fn warm_gateway_catalogue(&self) {
+        if self
+            .catalogue_warmed
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        // Unauthenticated on purpose: the gateway answers `/v1/models`
+        // without a key (only `/chat/completions` demands one), and a session
+        // that has not yet been given a key still deserves a truthful gauge.
+        let recover = || {
+            self.catalogue_warmed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        };
+        let Ok(response) = self.client.get(&url).send().await else {
+            recover();
+            return;
+        };
+        if !response.status().is_success() {
+            recover();
+            return;
+        }
+        let Ok(value) = response.json::<serde_json::Value>().await else {
+            recover();
+            return;
+        };
+        if let Ok(mut known) = self.known_windows.write() {
+            known.extend(parse_gateway_catalogue(&value));
         }
     }
 
@@ -407,6 +509,10 @@ impl LlmProvider for OpenAiProvider {
             self.warm_openrouter_catalogue().await;
             return;
         }
+        if self.flavor == Flavor::NineRouter {
+            self.warm_gateway_catalogue().await;
+            return;
+        }
         if self.flavor != Flavor::Ollama {
             return;
         }
@@ -453,17 +559,12 @@ impl LlmProvider for OpenAiProvider {
         match self.flavor {
             Flavor::OpenAi => openai_capabilities(model),
             Flavor::Ollama => ollama_capabilities(self.known_window(model)),
-            // Same shape as Ollama: a probed window when we have one (the
-            // OpenRouter catalogue warm lands in a later phase), else a
-            // conservative floor. Conservative is the safe way to be wrong —
-            // it only costs an early compaction until the warm answers.
-            Flavor::OpenRouter | Flavor::NineRouter => ollama_capabilities(
-                self.known_windows
-                    .read()
-                    .ok()
-                    .and_then(|known| known.get(model).copied())
-                    .unwrap_or(GATEWAY_CONTEXT_WINDOW),
-            ),
+            // Same shape as Ollama: the catalogue's window when the warm
+            // found one, else a conservative floor. Conservative is the safe
+            // way to be wrong — it only costs an early compaction.
+            Flavor::OpenRouter | Flavor::NineRouter => {
+                ollama_capabilities(self.gateway_window(model))
+            }
         }
     }
 
@@ -793,6 +894,117 @@ mod tests {
         assert_eq!(windows.get("anthropic/claude-sonnet-5"), Some(&200_000));
         assert!(!windows.contains_key("broken/no-context"));
         assert_eq!(free_tools, ["nvidia/nemotron-3-ultra-550b-a55b:free"]);
+    }
+
+    /// Fixture in the 9Router gateway's real `/v1/models` shape (trimmed):
+    /// everything under a nested `capabilities` object, `contextWindow` in
+    /// camelCase, and ids qualified by the upstream that serves them.
+    fn gateway_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "object": "list",
+            "data": [
+                // The gateway's own aggregate: no capabilities at all.
+                { "id": "COMBO-FREE", "object": "model", "owned_by": "combo" },
+                {
+                    "id": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+                    "capabilities": { "tools": true, "contextWindow": 128_000, "maxOutput": 64_000 }
+                },
+                {
+                    "id": "ag/gemini-3.6-flash-high",
+                    "capabilities": { "tools": true, "contextWindow": 1_048_576 }
+                },
+                // Served by two upstreams under one suffix — deliberately
+                // ambiguous, and they disagree about the window.
+                {
+                    "id": "alpha/shared/model-x",
+                    "capabilities": { "contextWindow": 8_000 }
+                },
+                {
+                    "id": "beta/shared/model-x",
+                    "capabilities": { "contextWindow": 200_000 }
+                },
+                { "id": "broken/no-capabilities", "object": "model" }
+            ]
+        })
+    }
+
+    #[test]
+    fn the_gateway_parser_reads_the_nested_camel_case_window() {
+        let windows = parse_gateway_catalogue(&gateway_fixture());
+        assert_eq!(
+            windows.get("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"),
+            Some(&128_000)
+        );
+        assert_eq!(windows.get("ag/gemini-3.6-flash-high"), Some(&1_048_576));
+        // No capabilities object is "we do not know", not zero.
+        assert!(!windows.contains_key("COMBO-FREE"));
+        assert!(!windows.contains_key("broken/no-capabilities"));
+    }
+
+    /// The whole point of the lookup: a gateway qualifies every id with its
+    /// upstream, while a config names the model the way its vendor does. An
+    /// exact-key-only lookup answered for almost nobody — every 9Router
+    /// session reported the conservative floor instead of its real window.
+    #[test]
+    fn a_gateway_window_resolves_through_a_unique_upstream_prefix() {
+        let provider =
+            OpenAiProvider::nine_router("key".to_string(), "http://localhost:20128/v1".to_string());
+        provider
+            .known_windows
+            .write()
+            .unwrap()
+            .extend(parse_gateway_catalogue(&gateway_fixture()));
+
+        // Exact.
+        assert_eq!(
+            provider.gateway_window("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"),
+            128_000
+        );
+        // Unqualified, exactly one upstream serves it.
+        assert_eq!(
+            provider.gateway_window("nvidia/nemotron-3-ultra-550b-a55b:free"),
+            128_000
+        );
+        // ...and it reaches the capability the gauge and compaction read.
+        assert_eq!(
+            provider
+                .capabilities("nvidia/nemotron-3-ultra-550b-a55b:free")
+                .context_window,
+            128_000
+        );
+    }
+
+    /// Unique or nothing. Two upstreams serving one suffix may disagree, and
+    /// this number decides when auto-compaction fires — a guess would
+    /// silently summarise a conversation that still fit.
+    #[test]
+    fn an_ambiguous_or_unknown_model_falls_back_rather_than_guessing() {
+        let provider =
+            OpenAiProvider::nine_router("key".to_string(), "http://localhost:20128/v1".to_string());
+        provider
+            .known_windows
+            .write()
+            .unwrap()
+            .extend(parse_gateway_catalogue(&gateway_fixture()));
+
+        assert_eq!(
+            provider.gateway_window("shared/model-x"),
+            GATEWAY_CONTEXT_WINDOW
+        );
+        assert_eq!(
+            provider.gateway_window("nobody/knows-me"),
+            GATEWAY_CONTEXT_WINDOW
+        );
+    }
+
+    #[test]
+    fn an_alien_gateway_payload_parses_to_nothing_rather_than_panicking() {
+        assert!(parse_gateway_catalogue(&serde_json::json!({})).is_empty());
+        assert!(parse_gateway_catalogue(&serde_json::json!({"data": "?"})).is_empty());
+        assert!(parse_gateway_catalogue(
+            &serde_json::json!({"data": [{"id": "x", "capabilities": {"contextWindow": 0}}]})
+        )
+        .is_empty());
     }
 
     #[test]
