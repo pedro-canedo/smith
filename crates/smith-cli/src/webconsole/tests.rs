@@ -410,3 +410,86 @@ async fn the_meta_route_answers_with_the_session_constants_and_its_links() {
     assert_eq!(ollama["active"], true);
     assert_eq!(ollama["external"], false);
 }
+
+/// A real browser's navigation is admitted.
+///
+/// Every other test here sends a three-header request this code wrote itself,
+/// which proves the predicates and nothing about the client that actually has
+/// to get through. A Chromium-family browser sends about twenty headers and
+/// two kilobytes on a plain top-level navigation, and the console is reached
+/// exactly once per session — by that.
+#[tokio::test]
+async fn a_chromium_top_level_navigation_is_admitted() {
+    let c = console().await;
+    let request = format!(
+        "GET /s/{SESSION}?t={TOKEN} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Connection: keep-alive\r\n\
+         Cache-Control: max-age=0\r\n\
+         sec-ch-ua: \"Brave\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"\r\n\
+         sec-ch-ua-mobile: ?0\r\n\
+         sec-ch-ua-platform: \"Linux\"\r\n\
+         Upgrade-Insecure-Requests: 1\r\n\
+         User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/131.0.0.0 Safari/537.36\r\n\
+         Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,\
+         image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7\r\n\
+         Sec-GPC: 1\r\n\
+         Accept-Language: pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7\r\n\
+         Sec-Fetch-Site: none\r\n\
+         Sec-Fetch-Mode: navigate\r\n\
+         Sec-Fetch-User: ?1\r\n\
+         Sec-Fetch-Dest: document\r\n\
+         Accept-Encoding: gzip, deflate, br, zstd\r\n\r\n",
+        host = c.host,
+    );
+    let response = roundtrip(&c, request).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "the browser was refused: {}",
+        response.lines().next().unwrap_or_default()
+    );
+}
+
+/// A browser refused by the guard gets something it can act on.
+///
+/// The console mints a fresh token and takes a fresh ephemeral port on every
+/// run, so the overwhelmingly likely reason a *browser* is refused is a link
+/// from a previous session — reopened tab, history, bookmark. The bare word
+/// "forbidden" was correct and told the user nothing about which of those it
+/// was, or that `/web` would print the current one.
+#[tokio::test]
+async fn a_browser_refused_with_a_stale_link_is_told_how_to_get_the_current_one() {
+    let c = console().await;
+    let request = format!(
+        "GET /s/{SESSION}?t=a-token-from-a-previous-run HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Sec-Fetch-Site: none\r\n\
+         Sec-Fetch-Mode: navigate\r\n\
+         Sec-Fetch-Dest: document\r\n\r\n",
+        c.host
+    );
+    let response = roundtrip(&c, request).await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(
+        response.contains("/web"),
+        "no way out is offered: {response}"
+    );
+    // Still says nothing a guesser could use: not which predicate failed, not
+    // the real token, not confirmation that the session id was right.
+    assert!(!response.contains("token\n"), "{response}");
+    assert!(
+        !response.contains(TOKEN),
+        "the real token leaked: {response}"
+    );
+}
+
+/// Everything that is not a browser keeps the one-word answer.
+#[tokio::test]
+async fn a_scripted_client_still_gets_the_bare_refusal() {
+    let c = console().await;
+    let response = roundtrip(&c, get(&c, "/api/state", Some("wrong"))).await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(response.contains("forbidden"), "{response}");
+    assert!(!response.contains("<!doctype"), "{response}");
+}

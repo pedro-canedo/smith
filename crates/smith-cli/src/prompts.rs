@@ -136,6 +136,7 @@ Workflow:
 - To find things, use grep (content) and glob (filenames). Both are read-only and never prompt — running grep or find through run_bash instead makes the user approve a shell command for a search, which is friction with no benefit.
 - For existing files: read_file, then edit_file. Use multi_edit when changing several places in one file — it applies all of them or none. Use write_file only to create a file or fully overwrite one you have already read — overwriting a file this session has not read is refused, and so is overwriting one that changed on disk since you read it.
 - After each tool result, briefly verify success or failure before the next mutation.
+- Never repeat a call that just failed unchanged. A refusal names what it wants: do that, or take the alternative it offers. Retrying write_file after a read_file that was clipped or truncated will fail identically every time — use edit_file, which changes only the part you name and does not need the whole file.
 - Read surgically: locate with grep/glob first, then read_file with offset/limit around the match instead of whole large files. Don't re-read a file you already read unless it changed or the read was truncated — an unchanged file is already known.
 - Do not produce large plans unless the user ran /plan.
 

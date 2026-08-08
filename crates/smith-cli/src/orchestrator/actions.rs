@@ -37,6 +37,7 @@ pub(super) async fn run(
     while let Some(action) = action_rx.recv().await {
         match action {
             Action::SubmitMessage(text) => {
+                drop_pending_duplicate(&interjections, &text);
                 let cancel = CancellationToken::new();
                 current_cancel = Some(cancel.clone());
                 let state = state.clone();
@@ -377,5 +378,71 @@ pub(super) async fn run(
                 // Resolved directly by smith-tui via the oneshot channels.
             }
         }
+    }
+}
+
+/// Drops one copy of `text` from the pending interjections, if it is there.
+///
+/// A message typed mid-turn is *both* sent as an interjection and held by the
+/// frontend, because the two can miss each other: `run_turn` folds
+/// interjections in at a round boundary, and a turn already on its last round
+/// never reaches another one. The frontend keeps its copy until
+/// `AgentEvent::UserInterjected` says the agent took it, and resends whatever
+/// is left as its own turn — which is right, and was the only half that
+/// worked. The agent was still holding the original, so the next turn's first
+/// round pushed the same sentence a second time: the model answered it twice
+/// and the user saw two identical bubbles.
+///
+/// One copy, not `clear()`: a `/loop` iteration can legitimately be carrying
+/// an interjection meant for the iteration still to come, and emptying the
+/// queue would swallow it.
+fn drop_pending_duplicate(
+    interjections: &std::sync::Mutex<std::collections::VecDeque<String>>,
+    text: &str,
+) {
+    // A poisoned lock costs a duplicate message, never the turn.
+    let Ok(mut queue) = interjections.lock() else {
+        return;
+    };
+    if let Some(at) = queue.iter().position(|pending| pending == text) {
+        queue.remove(at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_pending_duplicate;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    fn queue(items: &[&str]) -> Mutex<VecDeque<String>> {
+        Mutex::new(items.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    fn contents(queue: &Mutex<VecDeque<String>>) -> Vec<String> {
+        queue.lock().unwrap().iter().cloned().collect()
+    }
+
+    #[test]
+    fn a_resent_message_is_no_longer_pending_as_an_interjection() {
+        let pending = queue(&["also handle the errors"]);
+        drop_pending_duplicate(&pending, "also handle the errors");
+        assert!(contents(&pending).is_empty());
+    }
+
+    #[test]
+    fn only_one_copy_goes_even_when_the_same_thing_was_said_twice() {
+        // Two identical interjections are two messages the user typed, and
+        // resending one of them accounts for exactly one of them.
+        let pending = queue(&["again", "again"]);
+        drop_pending_duplicate(&pending, "again");
+        assert_eq!(contents(&pending), vec!["again"]);
+    }
+
+    #[test]
+    fn an_interjection_meant_for_the_next_loop_iteration_survives() {
+        let pending = queue(&["check the tests too"]);
+        drop_pending_duplicate(&pending, "a different message entirely");
+        assert_eq!(contents(&pending), vec!["check the tests too"]);
     }
 }

@@ -22,6 +22,46 @@ All notable user-facing changes are tracked here.
   constants and that link list — additive, and behind the same token as every
   other route.
 
+- **`/web` prints the console link.** It was on the idle splash and in the
+  sidebar's Session tab, both of which are gone once a conversation is under
+  way — which is exactly when you want to open a browser.
+
+### Fixed
+
+- **`write_file` said a file had not been read when it had.** A `read_file`
+  whose window contained any line over 2,000 characters recorded nothing, so
+  the overwrite gate answered "already exists and has not been read this
+  session" to a model holding the file's contents — and its advice, call
+  `read_file`, produced the identical clipped view. The pair looped until the
+  turn's budget ran out. The refusal now says the read was clipped (or lossy),
+  says re-reading will not help, and points at `edit_file`, which is the call
+  that actually works. Same for undecodable UTF-8.
+
+- **A message typed mid-turn could be delivered twice.** `run_turn` folds
+  interjections in at a round boundary, and a turn already on its last round
+  never reaches another one — so the frontend resent it as its own turn, which
+  is right, while the agent was still holding the original and pushed the same
+  sentence again on the next turn's first round. The model answered it twice
+  and you saw two identical bubbles.
+
+- **The scrollbar never reached the bottom.** `ScrollbarState::content_length`
+  counts scroll *positions*, not content rows; smith passed the row count, so
+  a fully scrolled transcript still showed empty track under the thumb — which
+  reads as "there is more below" when there is nothing. The error was
+  proportional to the pane height, so it was invisible in a small test and
+  obvious on a real terminal.
+
+- **A stale console link is now recoverable.** The console mints a new token
+  and takes a new ephemeral port every run, so a link from a previous session
+  is refused — and the page said only "forbidden". A browser now gets a page
+  explaining that and naming `/web`. Scripted clients still get the bare
+  refusal, and no predicate, token or session id is disclosed either way.
+
+- **`/goal` says what it did not do.** Setting a goal folds it into every
+  later request but starts no turn of its own, so `/goal <task>` on its own
+  looked exactly like a command that silently failed. It now says the goal
+  rides every request from here, and names `/loop goal` for acting on it now.
+
 ## 0.3.2 — 2026-08-08
 
 ### Changed

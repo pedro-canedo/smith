@@ -65,9 +65,18 @@ pub fn vertical(
         .begin_symbol(None)
         .end_symbol(None);
 
-    let mut state = ScrollbarState::new(content_height as usize)
+    // `ScrollbarState::content_length` is the number of *scroll positions*,
+    // not the number of content rows — ratatui adds the viewport length back
+    // when it computes the track extent (`max_position + viewport_length`).
+    // Handing it the row count made the thumb stop short of the bottom by a
+    // whole viewport's worth of track: a fully scrolled transcript still had
+    // empty track under the thumb, which reads as "there is more below" when
+    // there is nothing. The error scaled with the pane, so it was invisible
+    // in a four-row test and obvious on a real terminal.
+    let max_scroll = content_height - viewport_height;
+    let mut state = ScrollbarState::new(max_scroll as usize + 1)
         .viewport_content_length(viewport_height as usize)
-        .position(offset.min(content_height.saturating_sub(1)) as usize);
+        .position(offset.min(max_scroll) as usize);
 
     frame.render_stateful_widget(bar, area, &mut state);
 }
@@ -141,6 +150,42 @@ mod tests {
         let bottom = render(40, 4, 36, true);
         assert!(bottom.ends_with('█'), "{bottom}");
         assert!(bottom.starts_with('│'), "{bottom}");
+    }
+
+    /// Scrolled to the end, the thumb must reach the end — no track under it.
+    ///
+    /// It did not: `ScrollbarState::content_length` is a count of scroll
+    /// *positions*, and passing the row count instead left the thumb short by
+    /// most of a viewport. A four-row pane rounds that away, which is why the
+    /// two tests above missed it; a real transcript pane does not.
+    #[test]
+    fn a_fully_scrolled_pane_leaves_no_track_below_the_thumb() {
+        for (content, viewport) in [(300u16, 30u16), (100, 20), (61, 12), (17, 16)] {
+            let bar = render(content, viewport, content - viewport, true);
+            assert!(
+                bar.ends_with('█'),
+                "content={content} viewport={viewport}: the thumb stops short of \
+                 the bottom, which reads as 'there is more below' — {bar}"
+            );
+        }
+    }
+
+    /// And the thumb's size still says how much of the document is on screen,
+    /// which is the other half of what the track is for.
+    #[test]
+    fn the_thumb_is_proportional_to_the_visible_fraction() {
+        // A tenth of the document visible, so about a tenth of a 30-row track.
+        let bar = render(300, 30, 0, true);
+        let thumb = bar.chars().filter(|c| *c == '█').count();
+        assert!((2..=4).contains(&thumb), "expected ~3 rows of thumb: {bar}");
+
+        // Half visible, so about half the track.
+        let bar = render(40, 20, 0, true);
+        let thumb = bar.chars().filter(|c| *c == '█').count();
+        assert!(
+            (9..=11).contains(&thumb),
+            "expected ~10 rows of thumb: {bar}"
+        );
     }
 
     #[test]

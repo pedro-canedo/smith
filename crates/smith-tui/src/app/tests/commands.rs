@@ -751,3 +751,29 @@ fn a_bare_model_command_asks_for_the_catalogue() {
         Some(Action::ListModels)
     ));
 }
+
+/// The console link is minted per run and the two places it is displayed
+/// (idle splash, sidebar Session tab) are both gone once a conversation is
+/// under way — which is when someone wants to open a browser.
+#[test]
+fn web_prints_the_console_link_when_one_exists() {
+    let mut app = test_app();
+    app.console_url = Some("http://127.0.0.1:40560/s/abc?t=secret".to_string());
+    let action = app.run_slash_command("web");
+    assert!(action.is_none());
+    assert!(app
+        .lines
+        .iter()
+        .any(|l| l.text.contains("http://127.0.0.1:40560/s/abc?t=secret")));
+}
+
+#[test]
+fn web_says_the_console_is_off_rather_than_printing_nothing() {
+    let mut app = test_app();
+    let action = app.run_slash_command("web");
+    assert!(action.is_none());
+    assert!(app
+        .lines
+        .iter()
+        .any(|l| l.text.contains("not running for this session")));
+}

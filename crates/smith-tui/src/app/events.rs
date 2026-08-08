@@ -363,9 +363,21 @@ impl App {
             AgentEvent::GoalChanged(goal) => {
                 self.goal = goal.clone();
                 match goal {
-                    Some(text) => self
-                        .lines
-                        .push(ChatLine::new(ChatRole::System, format!("goal set: {text}"))),
+                    // Says what it did *and did not* do. A goal rides every
+                    // later request's system prompt; it starts no turn of its
+                    // own, so `/goal ship the login page` on its own looks
+                    // exactly like a command that silently failed. Naming the
+                    // one command that acts on it is the difference between a
+                    // confusing no-op and a documented one.
+                    Some(text) => {
+                        self.lines
+                            .push(ChatLine::new(ChatRole::System, format!("goal set: {text}")));
+                        self.lines.push(ChatLine::new(
+                            ChatRole::System,
+                            "it rides every request from here — say what to do next, \
+                             or /loop goal to work on it now",
+                        ));
+                    }
                     None => self
                         .lines
                         .push(ChatLine::new(ChatRole::System, "goal cleared")),

@@ -48,6 +48,22 @@ struct Seen {
     total_lines: usize,
     /// Half-open, 0-based line ranges, sorted and merged.
     covered: Vec<(usize, usize)>,
+    /// Set when a read of these bytes happened but was not a faithful view.
+    /// It contributes no coverage — it exists only so the refusal can say
+    /// *that*, instead of claiming the file was never read.
+    unfaithful: Option<Unfaithful>,
+}
+
+/// Why a read showed the model something the file does not contain.
+///
+/// Re-reading cannot fix either of these — the same call produces the same
+/// view — which is exactly why they need their own refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unfaithful {
+    /// At least one line ran past the per-line cap and was cut.
+    ClippedLines,
+    /// The bytes are not valid UTF-8, so what was shown is a reconstruction.
+    LossyDecode,
 }
 
 /// How much of a file the model can be said to know right now.
@@ -59,9 +75,9 @@ pub enum Knowledge {
     Partial { read_to: usize, total: usize },
     /// Read, but the file has changed since.
     Stale,
-    /// Never read this session, or read in a form that showed nothing
-    /// trustworthy (a clipped line, a lossy decode, a read that skipped the
-    /// beginning).
+    /// Read, but what was shown was not what the file contains.
+    Unfaithful(Unfaithful),
+    /// Never read this session, or read only from the middle.
     Unread,
 }
 
@@ -71,6 +87,7 @@ impl Seen {
             hash: hash.to_string(),
             total_lines,
             covered: Vec::new(),
+            unfaithful: None,
         }
     }
 
@@ -131,6 +148,37 @@ impl ReadSet {
         entry.insert(range);
     }
 
+    /// Records that `path` was read but that the view was not faithful, so
+    /// the read counts for nothing *and the refusal can say why*.
+    ///
+    /// Before this existed such a read simply recorded nothing, and
+    /// `write_file` then answered "has not been read this session" — to a
+    /// model that had just read it. The advice in that message is to call
+    /// `read_file`, which produces the identical clipped view, so the pair
+    /// loops until the turn's tool budget runs out. Observed in the wild on a
+    /// dashboard component with one very long line.
+    ///
+    /// An existing faithful reading is never downgraded: coverage already
+    /// recorded stays, and `knowledge` only consults this flag when there is
+    /// no coverage to consult.
+    pub fn record_unfaithful(
+        &self,
+        session: &str,
+        path: &Path,
+        hash: &str,
+        total_lines: usize,
+        reason: Unfaithful,
+    ) {
+        let mut seen = self.entries();
+        let entry = seen
+            .entry((session.to_string(), path.to_path_buf()))
+            .or_insert_with(|| Seen::new(hash, total_lines));
+        if entry.hash != hash {
+            *entry = Seen::new(hash, total_lines);
+        }
+        entry.unfaithful = Some(reason);
+    }
+
     /// Records `path` as known in full, for content there is nothing left to
     /// learn about: what `write_file` just wrote, or what `read_file`
     /// described in full (an empty or binary file).
@@ -174,9 +222,15 @@ impl ReadSet {
                 read_to,
                 total: entry.total_lines,
             },
-            // Read only from the middle: no more use than never having read
-            // it, and there is no single offset to recommend.
-            _ => Knowledge::Unread,
+            // No coverage from the top. Say *why* if we know — a clipped or
+            // lossy read is a dead end that another read_file will not open,
+            // and telling the model to read again is what put it in a loop.
+            _ => match entry.unfaithful {
+                Some(reason) => Knowledge::Unfaithful(reason),
+                // Read only from the middle: no more use than never having
+                // read it, and there is no single offset to recommend.
+                None => Knowledge::Unread,
+            },
         }
     }
 }

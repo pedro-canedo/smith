@@ -247,6 +247,80 @@ async fn a_read_that_starts_in_the_middle_does_not_count() {
     );
 }
 
+/// A clipped read still refuses the overwrite — but it says so as a clipped
+/// read, not as no read at all.
+///
+/// This is a loop that happened: `read_file` on a component with one very
+/// long line clipped it, the read recorded nothing, and `write_file` answered
+/// "has not been read this session". The model did exactly what that message
+/// says, got the identical clipped view, and tried again — five times, until
+/// the turn ran out. The refusal has to name a way out that is not the call
+/// that just failed.
+#[tokio::test]
+async fn a_clipped_read_refuses_the_overwrite_without_telling_you_to_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(&dir);
+    let long = "x".repeat(MAX_LINE_CHARS + 500);
+    std::fs::write(dir.path().join("a.tsx"), format!("short\n{long}\n")).unwrap();
+
+    let files = files();
+    let seen = read(&files, &ctx, serde_json::json!({"path": "a.tsx"})).await;
+    assert!(!seen.is_error, "{}", seen.content);
+    assert!(seen.content.contains("clipped"), "{}", seen.content);
+
+    let refused = write(&files, &ctx, "a.tsx", "replaced").await;
+    assert!(refused.is_error, "{}", refused.content);
+    assert!(
+        refused.content.contains("clipped"),
+        "the refusal must name the real problem: {}",
+        refused.content
+    );
+    assert!(
+        !refused.content.contains("has not been read"),
+        "the file *was* read — claiming otherwise is what caused the loop: {}",
+        refused.content
+    );
+    assert!(
+        refused.content.contains("edit_file"),
+        "the refusal must offer the one call that can still work: {}",
+        refused.content
+    );
+    // And the way out actually works.
+    let edited = files
+        .edit
+        .execute(
+            serde_json::json!({"path": "a.tsx", "old_str": "short", "new_str": "brief"}),
+            &ctx,
+            cancel(),
+        )
+        .await;
+    assert!(!edited.is_error, "{}", edited.content);
+}
+
+/// A file read faithfully in one call and clipped in another is still known
+/// as far as the faithful call went: the flag only speaks when there is no
+/// coverage to speak for itself.
+#[tokio::test]
+async fn a_later_clipped_read_does_not_erase_an_earlier_faithful_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(&dir);
+    std::fs::write(dir.path().join("a.txt"), "1\n2\n3\n4\n").unwrap();
+
+    let files = files();
+    read(&files, &ctx, serde_json::json!({"path": "a.txt"})).await;
+    // Same bytes, read again — nothing here clips, but the entry must
+    // survive a call that would have.
+    read(
+        &files,
+        &ctx,
+        serde_json::json!({"path": "a.txt", "offset": 2}),
+    )
+    .await;
+
+    let result = write(&files, &ctx, "a.txt", "replaced").await;
+    assert!(!result.is_error, "{}", result.content);
+}
+
 /// Grep and list_dir deliberately do not count. Three matching lines out
 /// of a thousand is not knowing the file, and a name in a listing is not
 /// even that — treating either as a read would make the gate decorative.

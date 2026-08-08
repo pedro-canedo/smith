@@ -26,7 +26,7 @@ impl App {
             "help" | "" => {
                 self.lines.push(ChatLine::new(
                     ChatRole::System,
-                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /compact (summarise old history to reclaim context), /remember <note> (append a standing note to this project's SMITH.md), /mcp [prompt [<server>] <name> [key=value ...]] (list MCP servers, or run one's prompt template),/rewind [<turn>] [confirm] [--force] (undo a turn's file writes — shows the plan first; does NOT undo anything run_bash did), /help (this message)",
+                    "commands: /clear (clear the visible transcript), /model [<name>|<provider>/<name>] [--save] (show or switch model), /permission [ask|session|skip] [--save] (show or set the tool permission policy), /usage (session token/cost/tool-call summary), /plan <task>|approve|reject (plan before executing), /goal [<description>|clear] (set, show, or clear the session goal), /loop [<N>] <task>|goal (repeat a task until done, N iterations, or Esc), /compact (summarise old history to reclaim context), /remember <note> (append a standing note to this project's SMITH.md), /mcp [prompt [<server>] <name> [key=value ...]] (list MCP servers, or run one's prompt template),/rewind [<turn>] [confirm] [--force] (undo a turn's file writes — shows the plan first; does NOT undo anything run_bash did), /web (print this session's web console link), /help (this message)",
                 ));
                 self.show_custom_commands();
                 None
@@ -42,6 +42,7 @@ impl App {
             "plan" => self.run_plan_command(args),
             "rewind" => self.run_rewind_command(args),
             "goal" => self.run_goal_command(args),
+            "web" => self.run_web_command(),
             "loop" => self.run_loop_command(args),
             "compact" => {
                 if self.waiting_on_assistant {
@@ -614,6 +615,25 @@ impl App {
                 Some(Action::StartPlan(description.to_string()))
             }
         }
+    }
+
+    /// Prints the console link, because it is minted per run and there was
+    /// nowhere to ask for it.
+    ///
+    /// The URL appears on the idle splash and in the sidebar's Session tab —
+    /// both of which are gone the moment a conversation is under way, which is
+    /// exactly when someone wants to open a browser. Worse, a link from a
+    /// previous run looks identical and is refused, so "find the link again"
+    /// was a real need with no answer short of restarting smith.
+    fn run_web_command(&mut self) -> Option<Action> {
+        let line = match &self.console_url {
+            Some(url) => format!("web console: {url}"),
+            None => "the web console is not running for this session — start smith with \
+                     --web, or set [web] enabled = true"
+                .to_string(),
+        };
+        self.lines.push(ChatLine::new(ChatRole::System, line));
+        None
     }
 
     fn run_goal_command(&mut self, args: &str) -> Option<Action> {

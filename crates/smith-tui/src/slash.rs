@@ -48,6 +48,7 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "undo a turn's file writes (shell writes not covered)",
     ),
     ("usage", "session token/cost/tool summary"),
+    ("web", "print the web console link for this session"),
 ];
 
 /// Every built-in name, for the loader's reserved list.

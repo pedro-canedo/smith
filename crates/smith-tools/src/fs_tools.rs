@@ -235,14 +235,34 @@ Args: path (required), offset (1-based first line, optional), limit (max lines, 
         // the model was shown characters the file does not contain, and
         // `write_file` must not treat that as having seen the file — the
         // point of the gate is that nothing is destroyed unseen.
-        if !clipped && !lossy {
-            self.reads.record_read(
+        //
+        // Recorded as unfaithful rather than not recorded at all: an
+        // unrecorded read is indistinguishable from no read, so `write_file`
+        // used to answer "has not been read this session" to a model holding
+        // the file's contents, and its advice — call read_file — reproduced
+        // the same clipped view. The pair looped until the turn ran out.
+        let hash = crate::checkpoint::hash_bytes(&bytes);
+        match (lossy, clipped) {
+            // A lossy decode first: it is the more fundamental problem, and
+            // clipping a line of mojibake is not the thing to report.
+            (true, _) => self.reads.record_unfaithful(
                 ctx.reader_id(),
                 &full,
-                &crate::checkpoint::hash_bytes(&bytes),
+                &hash,
                 total,
-                (start, shown_to),
-            );
+                readset::Unfaithful::LossyDecode,
+            ),
+            (false, true) => self.reads.record_unfaithful(
+                ctx.reader_id(),
+                &full,
+                &hash,
+                total,
+                readset::Unfaithful::ClippedLines,
+            ),
+            (false, false) => {
+                self.reads
+                    .record_read(ctx.reader_id(), &full, &hash, total, (start, shown_to))
+            }
         }
 
         // Acceptance criterion #6. `web_fetch` fences every page, because a
@@ -509,6 +529,21 @@ fn unseen_refusal(path: &str, knowledge: Knowledge) -> String {
              read_file with offset={} before overwriting it, or use edit_file to change part \
              of it",
             read_to + 1
+        ),
+        // The one refusal that must not say "read it first": the model
+        // already did, and reading again reproduces the same unfaithful view.
+        // Only `edit_file` gets out of this, so it is the only thing offered.
+        Knowledge::Unfaithful(readset::Unfaithful::ClippedLines) => format!(
+            "{path} was read, but at least one line was longer than {MAX_LINE_CHARS} characters \
+             and was clipped, so what you were shown is not what the file contains — reading it \
+             again gives the same clipped view. Use edit_file to change the part you mean; \
+             write_file would destroy the clipped text"
+        ),
+        Knowledge::Unfaithful(readset::Unfaithful::LossyDecode) => format!(
+            "{path} was read, but it is not valid UTF-8 and undecodable bytes were shown as \
+             U+FFFD, so what you were shown is not what the file contains — reading it again \
+             gives the same lossy view. Use edit_file if you mean to change part of it; \
+             write_file would replace bytes you have not seen"
         ),
         Knowledge::Unread => format!(
             "{path} already exists and has not been read this session — call read_file on it \

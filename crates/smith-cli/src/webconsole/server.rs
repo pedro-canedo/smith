@@ -81,11 +81,73 @@ async fn handle(mut stream: TcpStream, handles: Handles, page: &'static str) {
         },
         // Refusal reasons are never sent — `webguard`'s rule, kept.
         Err(Refusal::NotFound) => (404, "text/plain", "not found\n".to_string()),
+        Err(Refusal::Forbidden(_)) if is_document_navigation(head) => {
+            (403, "text/html; charset=utf-8", STALE_LINK_PAGE.to_string())
+        }
         Err(Refusal::Forbidden(_)) => (403, "text/plain", "forbidden\n".to_string()),
         Err(Refusal::BadRequest(_)) => (400, "text/plain", "bad request\n".to_string()),
     };
     let _ = write_response(&mut stream, status, content_type, &payload).await;
 }
+
+/// Whether this request is a browser loading a page, as opposed to a fetch,
+/// a stream or a script.
+///
+/// Only used to choose between two bodies for the *same* 403 — a human gets
+/// prose, everything else keeps the one-word answer. `Sec-Fetch-Dest` is the
+/// browser's own statement of intent and cannot be forged into telling us
+/// less than the truth about that; nothing is authorised on it.
+fn is_document_navigation(head: &str) -> bool {
+    head.lines()
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("sec-fetch-dest")
+                && value.trim().eq_ignore_ascii_case("document")
+        })
+}
+
+/// What a browser gets instead of the word "forbidden".
+///
+/// The console's URL is minted per run: a new token every time smith starts,
+/// and an ephemeral port that the OS is free to hand out again. So the most
+/// likely reason a *browser* is refused is not an attack, it is a link from a
+/// previous session — out of history, a bookmark, a reopened tab — pointed at
+/// a smith that no longer knows that token. The bare 403 was correct and
+/// unactionable: nothing on the page distinguished "your link expired" from
+/// "smith is broken".
+///
+/// It still names no predicate, echoes no token and confirms no session id —
+/// `webguard`'s rule is about not telling a *guesser* which check they failed,
+/// and this tells nobody anything they did not already send us.
+const STALE_LINK_PAGE: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>smith console — link not accepted</title>
+<style>
+:root{color-scheme:dark}
+body{margin:0;min-height:100dvh;display:grid;place-items:center;background:#101215;color:#e2e5e9;
+font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:34rem;padding:2rem}
+h1{margin:0 0 .75rem;font-size:1.125rem;color:#ff8c3c}
+p{margin:0 0 .75rem;color:#949aa3}
+ul{margin:0;padding-left:1.1rem;color:#949aa3}
+li{margin-bottom:.35rem}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#e2e5e9;
+background:#1e2126;border-radius:.3rem;padding:.1rem .35rem}
+</style></head><body><main>
+<h1>This link isn't accepted</h1>
+<p>The console mints a fresh address every time smith starts, so a link that
+worked before stops working once the session that issued it ends — even if the
+port happens to be reused.</p>
+<ul>
+<li>Run <code>/web</code> in the smith terminal to print the current link.</li>
+<li>It is also on the idle screen and in the sidebar's Session tab.</li>
+<li>If smith is not running, start it — the console lives exactly as long as
+the session does.</li>
+</ul>
+</main></body></html>
+"#;
 
 /// Subscribes, says hello, and hands the socket to the streamer.
 ///
