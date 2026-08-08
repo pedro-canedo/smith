@@ -41,8 +41,17 @@ fi
 
 if git rev-parse "$tag" >/dev/null 2>&1; then
     echo "error: tag $tag already exists." >&2
-    echo "If it was pushed against a stale manifest and never published, drop it:" >&2
-    echo "  git tag -d $tag && git push origin :refs/tags/$tag" >&2
+    # A pushed tag is immutable: the repository's "release tags are immutable"
+    # ruleset refuses deletion, update and non-fast-forward on refs/tags/v*, so
+    # there is no recovering a published version number — the fix is always the
+    # next patch. Only a tag that never left this machine can be dropped.
+    if git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
+        echo "It is already published, and published tags cannot be moved or" >&2
+        echo "deleted. Cut the next patch version instead." >&2
+    else
+        echo "It is local-only, so if it was tagged by mistake you can drop it:" >&2
+        echo "  git tag -d $tag" >&2
+    fi
     exit 1
 fi
 
