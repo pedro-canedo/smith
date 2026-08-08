@@ -2,6 +2,26 @@
 
 All notable user-facing changes are tracked here.
 
+## Unreleased
+
+### Changed
+
+- **The web console has a real shell.** Three columns instead of one narrow
+  centred page: a left rail that navigates the workspace *and* opens the
+  endpoints behind the session — the 9Router dashboard, the Ollama daemon, an
+  OpenRouter activity page, your own SearXNG — and a fixed right sidebar with
+  the statistics the terminal only has room to summarise: a context ring, the
+  four token counters with a cache-hit rate, spend, board counts, tool
+  activity, uptime. Those links come from your layered config rather than
+  hardcoded ports, and nothing unconfigured is offered. Tool cards expand to
+  their full arguments and output, the composer takes multi-line prompts
+  (Enter sends, Shift+Enter breaks), and both panels remember being
+  collapsed.
+
+  New endpoint: `GET /api/meta` (`ConsoleMeta`) carries the session's
+  constants and that link list — additive, and behind the same token as every
+  other route.
+
 ## 0.3.2 — 2026-08-08
 
 ### Changed

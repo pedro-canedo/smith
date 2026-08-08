@@ -303,12 +303,38 @@ privileged socket; zero static routes in the whitelist).
 - **Identity**: the Ember palette from `docs/design-system.md`, hand-copied
   into CSS variables with the doc named as source of truth. A Rust test pins
   the committed HTML against `Theme::token_hex` values — the same mechanism
-  that pins `ui.html` — doubling as a coarse staleness tripwire.
-- **Surfaces (P0)**: Session Live (transcript, tool cards, streaming text,
-  composer that submits when idle and interjects mid-turn, permission and
-  question modals), Approvals (the pending ask, prominent), Kanban (five
-  status columns, `blocked_reason` on the card, `updated_at` recency),
+  that pins `ui.html` — doubling as a coarse staleness tripwire. Everything
+  above the palette is *derived* from it at low alpha (`bg-ember/10`,
+  `border-text/8`), never a new hex, so that one assertion is enough to know
+  the console and the TUI paint the same product. Two type families with a
+  job each: mono for what the agent produced or measured, a system sans stack
+  for the console's own chrome — the bundle may not fetch a font.
+- **Shell**: three columns. A **left rail** for navigation (Session, Board,
+  History; the pending-ask callout) and for the endpoints behind the session —
+  the 9Router dashboard, the Ollama daemon, an OpenRouter activity page. A
+  **right sidebar**, fixed, for the statistics the terminal only has room to
+  summarise: a context ring, the four token counters with a cache-hit rate,
+  spend, board counts, tool activity and runtime. Both panels remember being
+  collapsed (`localStorage`), and the stats panel hides itself below `xl`
+  while the top bar mirrors its two headline numbers — the breakpoint is read
+  once with `matchMedia` so the panel and its mirror cannot disagree.
+- **Surfaces (P0)**: Session Live (transcript, expandable tool cards,
+  streaming text, composer that submits when idle and interjects mid-turn,
+  permission and question prompts pinned above the scroll region), Kanban
+  (five status columns, `blocked_reason` on the card, `updated_at` recency),
   History (session list from `sessions.db`, read-only transcript).
+- **Endpoint links are configuration, not constants** (`webconsole/links.rs`,
+  served by `/api/meta`). A gateway on a custom port or behind a path prefix
+  is ordinary, so the URLs are resolved from the same layered `Config` the
+  provider stack was built from. Nothing unconfigured is offered — an entry
+  appears only when its provider serves this session, is named in
+  `[fallback] providers`, or carries settings of its own — because a link to
+  an Ollama nobody runs is a dead end that looks like a feature.
+- **Nothing off-machine learns this URL.** The page's own address carries the
+  session token in `?t=`, and the rail links out to third-party dashboards.
+  Every external anchor is `rel="noreferrer"` and the document carries
+  `<meta name="referrer" content="no-referrer">`, pinned by
+  `the_console_page_never_offers_its_url_as_a_referrer`.
 - **Dev loop**: `pnpm -C web dev` with a Vite proxy for `/api` to a running
   `smith --web` port; the token comes from the printed URL via
   `VITE_SMITH_TOKEN`. Node is not part of the Rust gates;
@@ -323,6 +349,7 @@ privileged socket; zero static routes in the whitelist).
 | GET | `/` | `?t=` | 302 → `/s/<id>` | 403 |
 | GET | `/s/<id>` | `?t=` | app shell | 403, 404 |
 | GET | `/api/state` | header | `SessionProjection` snapshot | 403 |
+| GET | `/api/meta` | header | `ConsoleMeta` — session constants + rail links | 403 |
 | GET | `/api/events` | `?t=` | SSE stream | 403 |
 | POST | `/api/action` | header | `ActionDto` → orchestrator | 400, 403 |
 | POST | `/api/ask/answer` | header | resolve pending ask | 400, 403, 404 |

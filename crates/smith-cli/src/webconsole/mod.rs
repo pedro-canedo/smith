@@ -26,6 +26,7 @@
 
 pub mod api;
 pub mod dto;
+pub mod links;
 pub mod server;
 pub mod sse;
 pub mod state;
@@ -40,11 +41,33 @@ pub const PAGE: &str = include_str!("../../../../web/dist/index.html");
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::Serialize;
 use smith_core::{Action, SubmittedAnswer};
 use tokio::sync::mpsc;
 
 use crate::webguard::{Guard, RouteAuth, RouteSpec};
 use state::Tee;
+
+/// What a session *is*, as opposed to what it is doing.
+///
+/// Served from `/api/meta`, separately from the projection, because none of
+/// it moves: the client refetches `/api/state` after every event, and folding
+/// constants into that response would re-send the model name, the working
+/// directory and the whole link list once per token delta.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsoleMeta {
+    pub session_id: String,
+    pub provider: String,
+    pub model: String,
+    pub version: &'static str,
+    /// The project the session was started in — the console is per-project,
+    /// and two browser tabs on two projects look identical without it.
+    pub cwd: String,
+    /// Unix milliseconds at startup. The browser derives uptime from this
+    /// rather than being told a duration, so a tab left open stays right.
+    pub started_at_ms: u64,
+    pub links: Vec<links::ConsoleLink>,
+}
 
 /// Everything a request handler may reach. One struct so the server loop
 /// hands each connection a single clone.
@@ -52,6 +75,9 @@ use state::Tee;
 pub struct Handles {
     pub guard: Arc<Guard>,
     pub tee: Tee,
+    /// Behind an `Arc` because every connection clones `Handles` and this is
+    /// the only field with a list in it.
+    pub meta: Arc<ConsoleMeta>,
     pub action_tx: mpsc::UnboundedSender<Action>,
     pub ask_tx: mpsc::UnboundedSender<SubmittedAnswer>,
     /// The live session's id — the one `/s/<id>` must match.
@@ -71,6 +97,8 @@ pub enum Route {
     Shell { session_id: String },
     /// `GET /api/state` — the projection snapshot.
     State,
+    /// `GET /api/meta` — the session's constants and endpoint links.
+    Meta,
     /// `GET /api/events` — the SSE stream.
     Events,
     /// `POST /api/action` — an `ActionDto`.
@@ -95,6 +123,7 @@ impl Route {
         let (route, auth, is_write) = match (method, path) {
             ("GET", "/") => (Self::Root, RouteAuth::QueryToken, false),
             ("GET", "/api/state") => (Self::State, RouteAuth::HeaderToken, false),
+            ("GET", "/api/meta") => (Self::Meta, RouteAuth::HeaderToken, false),
             ("GET", "/api/events") => (Self::Events, RouteAuth::QueryToken, false),
             ("POST", "/api/action") => (Self::SubmitAction, RouteAuth::HeaderToken, true),
             ("POST", "/api/ask/answer") => (Self::AskAnswer, RouteAuth::HeaderToken, true),

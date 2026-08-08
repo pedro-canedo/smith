@@ -63,6 +63,7 @@ fn only_the_link_and_the_event_stream_take_the_query_token() {
         ("GET", "/s/abc", RouteAuth::QueryToken),
         ("GET", "/api/events", RouteAuth::QueryToken),
         ("GET", "/api/state", RouteAuth::HeaderToken),
+        ("GET", "/api/meta", RouteAuth::HeaderToken),
         ("POST", "/api/action", RouteAuth::HeaderToken),
         ("POST", "/api/ask/answer", RouteAuth::HeaderToken),
         ("GET", "/api/sessions", RouteAuth::HeaderToken),
@@ -96,6 +97,18 @@ async fn console() -> Console {
             token: TOKEN.into(),
         }),
         tee: tee.clone(),
+        meta: Arc::new(super::ConsoleMeta {
+            session_id: SESSION.into(),
+            provider: "ollama".into(),
+            model: "qwen".into(),
+            version: "0.0.0-test",
+            cwd: "/tmp/project".into(),
+            started_at_ms: 1_700_000_000_000,
+            links: super::links::links_for(
+                &smith_config::Config::default(),
+                crate::orchestrator::ProviderKind::Ollama,
+            ),
+        }),
         action_tx,
         ask_tx,
         session_id: SESSION.into(),
@@ -143,7 +156,7 @@ fn post(console: &Console, target: &str, body: &str) -> String {
 #[tokio::test]
 async fn every_api_route_refuses_a_request_without_the_token() {
     let c = console().await;
-    for target in ["/api/state", "/api/sessions", "/api/tasks"] {
+    for target in ["/api/state", "/api/meta", "/api/sessions", "/api/tasks"] {
         let response = roundtrip(&c, get(&c, target, None)).await;
         assert!(response.starts_with("HTTP/1.1 403"), "{target}: {response}");
     }
@@ -363,4 +376,37 @@ fn the_console_page_is_a_single_self_contained_document() {
         "external stylesheet link"
     );
     assert!(PAGE.contains("smith console"), "the title is gone");
+}
+
+/// The console's own URL carries the session token in its query string, and
+/// the navigation rail links out to provider dashboards. A referrer policy is
+/// what keeps the second from spending the first: without it a click on
+/// "OpenRouter" is a cross-origin navigation whose `Referer` is up to the
+/// browser's default. Belt and braces — the page also marks every external
+/// anchor `rel="noreferrer"` (`links::ConsoleLink::external`).
+#[test]
+fn the_console_page_never_offers_its_url_as_a_referrer() {
+    assert!(
+        PAGE.contains("no-referrer"),
+        "the referrer policy is gone from the bundle — the page URL carries \
+         the session token"
+    );
+}
+
+#[tokio::test]
+async fn the_meta_route_answers_with_the_session_constants_and_its_links() {
+    let c = console().await;
+    let response = roundtrip(&c, get(&c, "/api/meta", Some(TOKEN))).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response.split_once("\r\n\r\n").unwrap().1;
+    let meta: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(meta["session_id"], SESSION);
+    assert_eq!(meta["model"], "qwen");
+    assert_eq!(meta["cwd"], "/tmp/project");
+    // Ollama is serving this fixture, so its dashboard is offered and marked
+    // as the active one.
+    let links = meta["links"].as_array().unwrap();
+    let ollama = links.iter().find(|l| l["id"] == "ollama").unwrap();
+    assert_eq!(ollama["active"], true);
+    assert_eq!(ollama["external"], false);
 }

@@ -27,6 +27,8 @@ async function request<T>(path: string, body?: unknown): Promise<T> {
 
 export const api = {
   state: () => request<import("./types").SessionProjection>("/api/state"),
+  // Fetched once. Nothing in it moves, and /api/state is refetched per event.
+  meta: () => request<import("./types").ConsoleMeta>("/api/meta"),
   sessions: () => request<import("./types").SessionSummary[]>("/api/sessions"),
   sessionMessages: (id: string) =>
     request<unknown[]>(`/api/sessions/${encodeURIComponent(id)}/messages`),

@@ -154,6 +154,24 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
                     let handles = webconsole::Handles {
                         guard,
                         tee,
+                        meta: std::sync::Arc::new(webconsole::ConsoleMeta {
+                            session_id: session_id.clone(),
+                            provider: startup.provider_kind.label().to_string(),
+                            model: startup.model.clone(),
+                            version: env!("CARGO_PKG_VERSION"),
+                            cwd: startup.cwd.display().to_string(),
+                            started_at_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or_default(),
+                            // Resolved from the layered config the provider
+                            // stack was built from, so a custom gateway port
+                            // is the one the rail offers.
+                            links: webconsole::links::links_for(
+                                &startup.config,
+                                startup.provider_kind,
+                            ),
+                        }),
                         action_tx: action_tx.clone(),
                         ask_tx: ask_tx.clone(),
                         session_id,

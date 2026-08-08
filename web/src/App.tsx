@@ -1,24 +1,36 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Flame, KanbanSquare, MessageSquare, ScrollText, WifiOff } from "lucide-react";
-import type { SessionProjection } from "@/lib/types";
+import { useEffect, useRef, useState } from "react";
+import { Flame } from "lucide-react";
+import type { ConsoleMeta, SessionProjection } from "@/lib/types";
 import { api, openEvents } from "@/lib/api";
-import { Badge } from "@/components/ui/badge";
+import { Rail, type View } from "@/components/layout/Rail";
+import { TopBar } from "@/components/layout/TopBar";
+import { StatsPanel } from "@/components/layout/StatsPanel";
 import { Transcript } from "@/components/Transcript";
 import { Composer } from "@/components/Composer";
 import { PermissionPrompt, QuestionPrompt } from "@/components/Approvals";
 import { Board } from "@/components/Board";
 import { History } from "@/components/History";
-import { cn } from "@/lib/utils";
-
-type Tab = "session" | "board" | "history";
+import { useMediaQuery, usePreference } from "@/lib/hooks";
 
 export default function App() {
   const [state, setState] = useState<SessionProjection | null>(null);
-  const [tab, setTab] = useState<Tab>("session");
+  const [meta, setMeta] = useState<ConsoleMeta | null>(null);
+  const [view, setView] = useState<View>("session");
   const [down, setDown] = useState(false);
+  const [railCollapsed, toggleRail] = usePreference("smith.rail.collapsed", false);
+  const [statsOpen, toggleStats] = usePreference("smith.stats.open", true);
+  // `xl` — the same breakpoint the panel's own class uses.
+  const wideEnough = useMediaQuery("(min-width: 80rem)");
+  const statsVisible = statsOpen && wideEnough;
   // Events that arrive while a resnapshot is in flight are already covered
   // by it — the seq guard drops the stale ones.
   const seqRef = useRef(0);
+
+  useEffect(() => {
+    // Constants, fetched once: nothing in /api/meta changes while the
+    // session runs, so it is deliberately not part of the resync loop.
+    void api.meta().then(setMeta).catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     const resync = () => {
@@ -47,85 +59,75 @@ export default function App() {
     return close;
   }, []);
 
-  const busy = state !== null && state.phase !== "idle";
-  const contextLabel = useMemo(() => {
-    if (!state?.context) return null;
-    const [used, window, estimated] = state.context;
-    const percent = Math.round((used / Math.max(window, 1)) * 100);
-    return `${estimated ? "~" : ""}${percent}% ${Math.round(used / 1000)}k/${Math.round(window / 1000)}k`;
-  }, [state]);
-
   if (state === null) {
     return (
-      <main className="mx-auto max-w-4xl p-6 text-sm text-secondary">
-        {down ? "session ended — restart smith --web and reload" : "connecting…"}
+      <main className="grid h-dvh place-items-center">
+        <div className="flex flex-col items-center gap-3 text-sm text-secondary">
+          <span className="grid size-11 place-items-center rounded-xl bg-ember/12 ring-1 ring-ember/25">
+            <Flame className={down ? "size-5 text-danger" : "size-5 text-ember breathe"} />
+          </span>
+          {down
+            ? "session ended — restart smith and reload"
+            : "connecting to the session…"}
+        </div>
       </main>
     );
   }
 
-  const tabs: { id: Tab; title: string; icon: typeof MessageSquare }[] = [
-    { id: "session", title: "Session", icon: MessageSquare },
-    { id: "board", title: "Board", icon: KanbanSquare },
-    { id: "history", title: "History", icon: ScrollText },
-  ];
+  const busy = state.phase !== "idle";
 
   return (
-    <main className="mx-auto flex h-dvh max-w-4xl flex-col gap-3 p-4">
-      <header className="flex flex-wrap items-center gap-2">
-        <Flame className="size-5 text-ember" />
-        <span className="font-semibold text-ember">smith</span>
-        <span className="text-xs text-secondary">
-          {state.provider} · {state.model}
-        </span>
-        <Badge variant={busy ? "ember" : "default"}>{state.phase}</Badge>
-        {state.plan_gated && <Badge variant="plan">PLAN MODE</Badge>}
-        {contextLabel && <Badge>{contextLabel}</Badge>}
-        {state.cost_usd > 0 && (
-          <Badge variant="amber">~${state.cost_usd.toFixed(4)}</Badge>
+    <div className="flex h-dvh overflow-hidden">
+      <Rail
+        view={view}
+        onView={setView}
+        state={state}
+        meta={meta}
+        collapsed={railCollapsed}
+        onToggle={toggleRail}
+        connected={!down}
+      />
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <TopBar
+          view={view}
+          state={state}
+          down={down}
+          statsOpen={statsVisible}
+          onToggleStats={toggleStats}
+        />
+
+        {/* Asks sit above the scroll region, never inside it: an approval
+            that scrolls out of view is an approval nobody answers. */}
+        {(state.pending_permission || state.pending_question) && (
+          <div className="flex shrink-0 flex-col gap-2 px-5 pt-4">
+            {state.pending_permission && (
+              <PermissionPrompt request={state.pending_permission} />
+            )}
+            {state.pending_question && (
+              <QuestionPrompt question={state.pending_question} />
+            )}
+          </div>
         )}
-        {state.unpriced_turns > 0 && (
-          <Badge variant="warning">+{state.unpriced_turns} unpriced</Badge>
+
+        <main className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          <div className="mx-auto w-full max-w-4xl">
+            {view === "session" && <Transcript state={state} />}
+            {view === "board" && <Board tasks={state.tasks} />}
+            {view === "history" && <History />}
+          </div>
+        </main>
+
+        {view === "session" && (
+          <div className="shrink-0 border-t border-text/8 px-5 py-3">
+            <div className="mx-auto w-full max-w-4xl">
+              <Composer busy={busy} />
+            </div>
+          </div>
         )}
-        {down && (
-          <Badge variant="danger">
-            <WifiOff className="size-3" /> reconnecting
-          </Badge>
-        )}
-        <nav className="ml-auto flex gap-1">
-          {tabs.map(({ id, title, icon: Icon }) => (
-            <button
-              key={id}
-              onClick={() => setTab(id)}
-              className={cn(
-                "flex cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-1 text-sm",
-                tab === id ? "bg-overlay text-ember" : "text-secondary hover:bg-hover",
-              )}
-            >
-              <Icon className="size-4" />
-              {title}
-            </button>
-          ))}
-        </nav>
-      </header>
+      </div>
 
-      {state.goal && (
-        <div className="text-xs text-secondary">
-          goal: <span className="text-text">{state.goal}</span>
-        </div>
-      )}
-
-      {state.pending_permission && (
-        <PermissionPrompt request={state.pending_permission} />
-      )}
-      {state.pending_question && <QuestionPrompt question={state.pending_question} />}
-
-      <section className="min-h-0 flex-1 overflow-y-auto pr-1">
-        {tab === "session" && <Transcript state={state} />}
-        {tab === "board" && <Board tasks={state.tasks} />}
-        {tab === "history" && <History />}
-      </section>
-
-      {tab === "session" && <Composer busy={busy} />}
-    </main>
+      {statsVisible && <StatsPanel state={state} meta={meta} />}
+    </div>
   );
 }

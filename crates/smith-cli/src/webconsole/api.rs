@@ -22,6 +22,10 @@ pub fn error_body(message: &str) -> String {
 pub async fn dispatch(handles: &Handles, route: Route, body: &str) -> (u16, String) {
     match route {
         Route::State => state(handles),
+        Route::Meta => match serde_json::to_string(&*handles.meta) {
+            Ok(json) => (200, json),
+            Err(e) => (500, error_body(&format!("serialize: {e}"))),
+        },
         Route::SubmitAction => submit_action(handles, body),
         Route::AskAnswer => ask_answer(handles, body),
         Route::Sessions => sessions(handles),

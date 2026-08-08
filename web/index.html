@@ -3,6 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The page's own URL carries the session token in `?t=`. Every link out
+         of here (the navigation rail offers provider dashboards) is a
+         cross-origin navigation, and this is what guarantees none of them is
+         told where the click came from. Pinned by a Rust test:
+         `the_console_page_never_offers_its_url_as_a_referrer`. -->
+    <meta name="referrer" content="no-referrer" />
+    <meta name="color-scheme" content="dark" />
     <title>smith console</title>
   </head>
   <body>

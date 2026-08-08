@@ -68,6 +68,33 @@ export interface SessionProjection {
   goal: string | null;
 }
 
+export type LinkGroup = "provider" | "service" | "reference";
+
+/** One entry in the navigation rail's endpoint list. Resolved server-side
+ * from the layered config — see smith-cli/src/webconsole/links.rs. */
+export interface ConsoleLink {
+  id: string;
+  label: string;
+  url: string;
+  detail: string;
+  group: LinkGroup;
+  /** The URL leaves this machine, so the anchor gets rel="noreferrer". */
+  external: boolean;
+  /** The provider serving this session. */
+  active: boolean;
+}
+
+/** What `/api/meta` answers: the half of the session that never changes. */
+export interface ConsoleMeta {
+  session_id: string;
+  provider: string;
+  model: string;
+  version: string;
+  cwd: string;
+  started_at_ms: number;
+  links: ConsoleLink[];
+}
+
 export interface SessionSummary {
   id: string;
   title: string;

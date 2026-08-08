@@ -2,7 +2,12 @@
 
 /* The Ember palette — source of truth: docs/design-system.md (and
    smith-tui/src/theme.rs, which a Rust test pins this file's values
-   against). The web console does not invent a brand. */
+   against). The web console does not invent a brand.
+
+   Everything below the palette is *derived*: surfaces, hairlines and rings
+   are the same colours at low alpha (`border-text/8`, `bg-ember/10`), never
+   new hexes. That is what keeps one Rust assertion enough to know the
+   console and the TUI are painting the same product. */
 @theme {
   --color-base: #101215;
   --color-raised: #16181c;
@@ -18,11 +23,124 @@
   --color-warning: #facc15;
   --color-info: #56b6ff;
   --color-plan: #c684ff;
+
+  /* Two families, with a job each: mono for anything the agent produced or
+     measured (transcript, tool output, counters), sans for the console's own
+     chrome. The TUI has one cell grid and no such choice; a browser does,
+     and mono navigation is what made this page read like a log viewer.
+     System stacks only — the bundle is a single embedded file and may not
+     fetch a font. */
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --radius-panel: 0.875rem;
 }
 
-body {
-  background-color: var(--color-base);
-  color: var(--color-text);
-  font-family: var(--font-mono);
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-base);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    /* Two ember washes, both under 5% — enough that the shell has a light
+       source (top-left, where the brand sits) without tinting text. */
+    background-image:
+      radial-gradient(
+        62rem 42rem at 4% -10%,
+        color-mix(in oklab, var(--color-ember) 7%, transparent),
+        transparent 62%
+      ),
+      radial-gradient(
+        48rem 34rem at 100% 0%,
+        color-mix(in oklab, var(--color-info) 4%, transparent),
+        transparent 60%
+      );
+    background-attachment: fixed;
+  }
+
+  /* Numbers that change every few hundred milliseconds must not reflow the
+     row they sit in. */
+  :where(.tabular, table, output) {
+    font-variant-numeric: tabular-nums;
+  }
+
+  :focus-visible {
+    outline: 2px solid color-mix(in oklab, var(--color-ember) 70%, transparent);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-ember) 30%, transparent);
+  }
+
+  /* The default dark scrollbar is a light-grey slab on every panel edge. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-hover) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--color-hover);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-disabled);
+  }
+}
+
+/* A panel: the one surface treatment the whole console shares. Written as a
+   utility rather than repeated in twelve className strings, because the
+   moment it is repeated it starts to drift. */
+@utility panel {
+  background-color: color-mix(in oklab, var(--color-raised) 82%, transparent);
+  border: 1px solid color-mix(in oklab, var(--color-text) 7%, transparent);
+  border-radius: var(--radius-panel);
+  backdrop-filter: blur(8px);
+}
+
+/* The label above a group of statistics: small, wide, quiet. */
+@utility eyebrow {
+  font-size: 0.6875rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--color-disabled);
+  font-weight: 600;
+}
+
+@keyframes smith-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* A live indicator that does not beg for attention like `animate-pulse`. */
+@utility breathe {
+  animation: smith-breathe 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

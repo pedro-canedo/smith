@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { Send, Square } from "lucide-react";
+import { CornerDownLeft, Send, Square, Zap } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 
 export function Composer({ busy }: { busy: boolean }) {
   const [text, setText] = useState("");
@@ -18,31 +19,59 @@ export function Composer({ busy }: { busy: boolean }) {
 
   return (
     <form
-      className="flex gap-2"
+      className={cn(
+        "panel flex items-end gap-2 p-2 transition-colors",
+        busy && "border-ember/25",
+      )}
       onSubmit={(event) => {
         event.preventDefault();
         send();
       }}
     >
-      <Input
+      <Textarea
         value={text}
+        rows={text.split("\n").length > 3 ? 5 : 2}
         onChange={(event) => setText(event.target.value)}
-        placeholder={busy ? "Interject into the running turn…" : "Ask anything…"}
-        autoComplete="off"
+        // Enter sends, Shift+Enter breaks the line — the convention every
+        // chat surface uses, and the one thing a textarea gets wrong by
+        // default.
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            send();
+          }
+        }}
+        placeholder={
+          busy ? "Interject into the running turn…" : "Ask smith anything…"
+        }
+        className="border-0 bg-transparent focus:bg-transparent"
       />
-      <Button type="submit" title={busy ? "interject" : "send"}>
-        <Send className="size-4" />
-      </Button>
-      {busy && (
+      <div className="flex shrink-0 items-center gap-1.5 pb-1">
+        <span className="hidden items-center gap-1 pr-1 text-[0.625rem] text-disabled sm:flex">
+          <CornerDownLeft className="size-3" />
+          send
+        </span>
+        {busy && (
+          <Button
+            type="button"
+            variant="danger"
+            size="icon"
+            title="stop the turn"
+            onClick={() => void api.cancel()}
+          >
+            <Square />
+          </Button>
+        )}
         <Button
-          type="button"
-          variant="danger"
-          title="cancel the turn"
-          onClick={() => void api.cancel()}
+          type="submit"
+          variant="primary"
+          size="icon"
+          disabled={text.trim().length === 0}
+          title={busy ? "interject" : "send"}
         >
-          <Square className="size-4" />
+          {busy ? <Zap /> : <Send />}
         </Button>
-      )}
+      </div>
     </form>
   );
 }
