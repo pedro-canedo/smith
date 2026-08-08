@@ -675,6 +675,42 @@ impl Config {
 
         Ok(())
     }
+
+    /// Changes one setting in the **global** file and writes only that file.
+    ///
+    /// The layered config a session runs on is the global file with the
+    /// project's merged over it, and `save` writes whatever struct it is
+    /// handed. So `config.clone()` + one field + `save()` — which is what
+    /// `--save` used to do — took every project override with it and made it
+    /// global. A project that set `permission_policy = "skip"` for itself
+    /// then silently disabled the permission prompt for **every other
+    /// project on the machine** the first time someone ran `/model --save`,
+    /// and a project-scoped API key was copied into the global file the same
+    /// way.
+    ///
+    /// Reading the global layer back off disk is what makes the write
+    /// narrow: `edit` sees only what is already global, so nothing merged
+    /// can leak into it. It also picks up a change made in another window
+    /// since this session started, instead of overwriting it with a stale
+    /// snapshot.
+    pub fn update_global(edit: impl FnOnce(&mut Config)) -> Result<(), ConfigError> {
+        let dir = config_dir()?;
+        std::fs::create_dir_all(&dir)?;
+        set_permissions(&dir, 0o700)?;
+        Self::update_at(&config_path()?, edit)
+    }
+
+    /// The half of [`update_global`] that does not resolve a home directory,
+    /// so the narrowing can be tested rather than asserted in a comment.
+    fn update_at(
+        path: &std::path::Path,
+        edit: impl FnOnce(&mut Config),
+    ) -> Result<(), ConfigError> {
+        let mut global = Self::load_path(path)?;
+        edit(&mut global);
+        write_private_atomic(path, &toml::to_string_pretty(&global)?)?;
+        Ok(())
+    }
 }
 
 /// Writes `text` to `path` through a sibling temp file, 0600 before content.
@@ -1265,6 +1301,95 @@ mod tests {
         assert_eq!(
             std::fs::read(target_dir.join("sessions.db")).unwrap(),
             b"current"
+        );
+    }
+}
+
+#[cfg(test)]
+mod update_global_tests {
+    use super::*;
+
+    /// `--save` writes the global file, and only what is already global.
+    ///
+    /// This is the regression: a session runs on the *layered* config — global
+    /// with the project's merged over it — and `--save` used to clone that and
+    /// write the whole thing back. A project setting `permission_policy =
+    /// "skip"` for itself therefore turned the permission prompt off for every
+    /// other project on the machine the first time anyone ran `/model --save`
+    /// in it, silently, with no mention of permissions anywhere in the command
+    /// they typed. Observed in the wild: a global config reading `skip` that
+    /// its owner had never set globally.
+    #[test]
+    fn a_project_override_never_reaches_the_global_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("config.toml");
+        std::fs::write(
+            &global_path,
+            "[general]\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-5\"\n",
+        )
+        .unwrap();
+
+        // What the session is actually running on: the project turned the
+        // prompt off for itself and supplied its own key.
+        let mut layered = Config::load_path(&global_path).unwrap();
+        layered.general.permission_policy = Some("skip".into());
+        layered.anthropic.api_key = Some("a-project-scoped-key".into());
+
+        // The user switches model and asks for it to be remembered.
+        Config::update_at(&global_path, |global| {
+            global.general.model = Some("gpt-4.1".into());
+        })
+        .unwrap();
+
+        let written = std::fs::read_to_string(&global_path).unwrap();
+        assert!(written.contains("gpt-4.1"), "{written}");
+        assert!(
+            !written.contains("skip"),
+            "the project's permission policy became global: {written}"
+        );
+        assert!(
+            !written.contains("a-project-scoped-key"),
+            "the project's API key was copied into the global file: {written}"
+        );
+        // And the layered config the session runs on is untouched by the save.
+        assert_eq!(layered.general.permission_policy.as_deref(), Some("skip"));
+    }
+
+    /// Writing one field leaves every other global setting alone, including
+    /// one another window changed since this session started.
+    #[test]
+    fn only_the_edited_field_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[general]\nprovider = \"ollama\"\nmodel = \"qwen\"\n\n[openrouter]\napi_key = \"keep-me\"\n",
+        )
+        .unwrap();
+
+        Config::update_at(&path, |global| {
+            global.general.permission_policy = Some("ask".into());
+        })
+        .unwrap();
+
+        let reloaded = Config::load_path(&path).unwrap();
+        assert_eq!(reloaded.general.permission_policy.as_deref(), Some("ask"));
+        assert_eq!(reloaded.general.provider.as_deref(), Some("ollama"));
+        assert_eq!(reloaded.openrouter.api_key.as_deref(), Some("keep-me"));
+    }
+
+    /// A first save on a machine with no config file writes one.
+    #[test]
+    fn a_missing_global_file_is_created_rather_than_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::update_at(&path, |global| {
+            global.general.model = Some("qwen".into());
+        })
+        .unwrap();
+        assert_eq!(
+            Config::load_path(&path).unwrap().general.model.as_deref(),
+            Some("qwen")
         );
     }
 }

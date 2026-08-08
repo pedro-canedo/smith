@@ -99,10 +99,14 @@ pub(super) async fn run(
                     match guard.switch_model(provider, model, &config).await {
                         Ok((provider_label, model_label)) => {
                             let saved = if save {
-                                let mut to_save = config.clone();
-                                to_save.general.provider = Some(provider_label.to_string());
-                                to_save.general.model = Some(model_label.clone());
-                                to_save.save().is_ok()
+                                // The global file only, and only these
+                                // two fields — see `update_global`.
+                                let model = model_label.clone();
+                                smith_config::Config::update_global(move |global| {
+                                    global.general.provider = Some(provider_label.to_string());
+                                    global.general.model = Some(model);
+                                })
+                                .is_ok()
                             } else {
                                 false
                             };
@@ -121,15 +125,15 @@ pub(super) async fn run(
             Action::SetPermissionPolicy { policy, save } => {
                 let state = state.clone();
                 let event_tx = event_tx.clone();
-                let config = config.clone();
                 tokio::spawn(async move {
                     let mut guard = state.lock().await;
                     guard.agent.set_permission_policy(policy);
 
                     let saved = if save {
-                        let mut to_save = config.clone();
-                        to_save.general.permission_policy = Some(policy.as_str().to_string());
-                        to_save.save().is_ok()
+                        smith_config::Config::update_global(|global| {
+                            global.general.permission_policy = Some(policy.as_str().to_string());
+                        })
+                        .is_ok()
                     } else {
                         false
                     };

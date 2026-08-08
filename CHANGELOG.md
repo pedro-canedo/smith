@@ -28,6 +28,21 @@ All notable user-facing changes are tracked here.
 
 ### Fixed
 
+- **`--save` no longer makes a project's settings global.** A session runs on
+  the layered config — global with the project's merged over it — and
+  `/model --save` and `/permission --save` wrote that whole merged struct back
+  to `~/.smith/config.toml`. So a project that set `permission_policy = "skip"`
+  for itself turned the permission prompt off for **every other project on the
+  machine** the first time anyone ran `/model --save` in it, silently, with no
+  mention of permissions in the command they typed; a project-scoped API key
+  was copied into the global file the same way. Both now read the global layer
+  back off disk, change one field and write only that.
+
+  **Check your own file.** If `~/.smith/config.toml` says
+  `permission_policy = "skip"` and you did not put it there, that is this bug,
+  and it means tools have been running without asking. `/permission ask --save`
+  restores the default.
+
 - **`write_file` said a file had not been read when it had.** A `read_file`
   whose window contained any line over 2,000 characters recorded nothing, so
   the overwrite gate answered "already exists and has not been read this
