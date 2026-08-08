@@ -4,6 +4,15 @@ All notable user-facing changes are tracked here.
 
 ## 0.3.2 — 2026-08-08
 
+### Changed
+
+- **The web console is a question, not a flag you have to remember.** smith
+  asks once on the first interactive run whether to serve it, saves the
+  answer to `[web] enabled`, and never asks again — after that the console
+  comes up with every session and no extra command is needed. `--web` still
+  forces it on for a single run, and answering no is a real answer that stops
+  the asking. Headless runs neither ask nor serve.
+
 ### Fixed
 
 - **The context gauge told the truth on a gateway.** Every 9Router session
