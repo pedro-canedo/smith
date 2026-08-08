@@ -206,7 +206,12 @@ overwrite it unless you explicitly use `--force`. It never claims to undo
 smith --web
 ```
 
-Starts a local web console beside the TUI and shows its link in the chrome:
+smith asks once, on the first interactive run, whether to serve the console
+and remembers the answer in `[web] enabled` — after that it comes up with
+every session and no flag is needed. `--web` turns it on for a single run
+regardless.
+
+It starts a local web console beside the TUI and shows its link in the chrome:
 the same session, live, in a browser — transcript and tool cards over SSE, a
 composer that submits when idle and interjects mid-turn, the permission and
 question prompts (first answer wins, across the TUI and the browser), the
@@ -372,7 +377,7 @@ smith [OPTIONS] [COMMAND]
 | `--cwd <DIR>` | Run against another project directory |
 | `--allowed-tools <LIST>` | Allow named tools in headless mode |
 | `--persona <NAME>` | Select an output style |
-| `--web` | Serve the local web console for this session |
+| `--web` | Serve the web console for this run (smith asks once and remembers) |
 | `--web-port <PORT>` | Pin the console's port (default: ephemeral) |
 | `setup` | Configure provider, key, and model |
 | `remember` | Add a standing instruction to `SMITH.md` |

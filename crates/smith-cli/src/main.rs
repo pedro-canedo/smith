@@ -107,9 +107,11 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     persona: Option<String>,
 
-    /// Serve the local web console for this session and show its link in
-    /// the TUI. Loopback only, behind a per-run token; also enabled by
-    /// `[web] enabled = true` in the config. Headless runs never start it.
+    /// Serve the local web console for this session, whatever the saved
+    /// preference says. Loopback only, behind a per-run token. smith asks
+    /// once on the first interactive run and remembers the answer in
+    /// `[web] enabled`; this flag is for turning it on for one session.
+    /// Headless runs never start it.
     #[arg(long)]
     web: bool,
 

@@ -28,7 +28,7 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         }
     };
 
-    let web_enabled = cli.web || startup.config.web.enabled.unwrap_or(false);
+    let web_enabled = cli.web || resolve_web_preference(&mut startup.config);
     // The console URL names the session, so a fresh session needs its id
     // *now* rather than lazily on the first message. Persistence keeps its
     // lazy row creation — `ensure_session_id` reuses this id and only
@@ -207,6 +207,64 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
             ExitCode::from(EXIT_TURN_FAILED)
         }
     }
+}
+
+/// Whether this session serves the web console, asking once if nobody has
+/// said yet.
+///
+/// The flag stays, but a flag was the wrong *default* shape: the console is
+/// a standing preference — either you work with a browser open beside the
+/// terminal or you do not — and a preference that has to be re-typed every
+/// session is a feature people forget they have.
+///
+/// So: asked on the first interactive run, saved, and never asked again.
+/// `--web` still forces it on for one run, and `[web] enabled = false` is a
+/// real answer that means "stop asking" rather than "not yet".
+///
+/// The prompt runs *before* the TUI takes the terminal, like the first-run
+/// wizard. A declined or unreadable prompt (no tty, a pipe, Ctrl-C) is a no,
+/// and a config that cannot be written is not fatal — the session still
+/// starts, it just asks again next time.
+fn resolve_web_preference(config: &mut smith_config::Config) -> bool {
+    if let Some(decided) = config.web.enabled {
+        return decided;
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return false;
+    }
+
+    let answer = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(
+            "Serve the web console beside the terminal? It mirrors this session in a browser \
+             on 127.0.0.1 — you can change this later with `[web] enabled` in ~/.smith/config.toml",
+        )
+        .default(false)
+        .interact_opt()
+        .ok()
+        .flatten();
+
+    // Ctrl-C or a closed prompt is not an answer: leave the preference unset
+    // so the next session asks, rather than recording a "no" nobody gave.
+    let Some(answer) = answer else {
+        return false;
+    };
+
+    config.web.enabled = Some(answer);
+    // Written onto a *freshly loaded global* config, not onto the layered one
+    // above: `Config::save` serializes the whole struct into
+    // `~/.smith/config.toml`, so saving a layered config would copy this
+    // project's overrides — its model, its search backend — into the file
+    // every other project reads.
+    match smith_config::Config::load() {
+        Ok(mut global) => {
+            global.web.enabled = Some(answer);
+            if let Err(e) = global.save() {
+                eprintln!("smith: could not save the web console preference: {e}");
+            }
+        }
+        Err(e) => eprintln!("smith: could not read ~/.smith/config.toml: {e}"),
+    }
+    answer
 }
 
 pub(crate) async fn run_headless(cli: Cli) -> u8 {
