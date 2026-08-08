@@ -135,7 +135,7 @@ jobs:
             (cd dist && certutil -hashfile "$STAGE.zip" SHA256 | sed -n 2p | tr -d ' \r' > "$STAGE.zip.sha256")
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: |
