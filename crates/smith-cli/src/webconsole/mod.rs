@@ -100,36 +100,7 @@ impl Route {
             ("POST", "/api/ask/answer") => (Self::AskAnswer, RouteAuth::HeaderToken, true),
             ("GET", "/api/sessions") => (Self::Sessions, RouteAuth::HeaderToken, false),
             ("GET", "/api/tasks") => (Self::Tasks, RouteAuth::HeaderToken, false),
-            ("GET", path) => {
-                if let Some(id) = path.strip_prefix("/s/") {
-                    if valid_session_segment(id) {
-                        (
-                            Self::Shell {
-                                session_id: id.to_string(),
-                            },
-                            RouteAuth::QueryToken,
-                            false,
-                        )
-                    } else {
-                        return None;
-                    }
-                } else if let Some(rest) = path.strip_prefix("/api/sessions/") {
-                    let (id, tail) = rest.split_once('/')?;
-                    if tail == "messages" && valid_session_segment(id) {
-                        (
-                            Self::SessionMessages {
-                                session_id: id.to_string(),
-                            },
-                            RouteAuth::HeaderToken,
-                            false,
-                        )
-                    } else {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-            }
+            ("GET", path) => dynamic_get(path)?,
             _ => return None,
         };
         Some(RouteSpec {
@@ -138,6 +109,38 @@ impl Route {
             is_write,
         })
     }
+}
+
+/// The two GET routes carrying a dynamic segment, split out of the table so
+/// the table stays a table: prefix matching inside a `match` arm buries the
+/// literal routes it sits among, and nesting it cost a clippy lint besides.
+///
+/// `None` — for an unknown prefix, a malformed tail, or an id that is not one
+/// — is a 404 before any header is examined, exactly like a missing literal
+/// route. There is still no path resolver here.
+fn dynamic_get(path: &str) -> Option<(Route, RouteAuth, bool)> {
+    if let Some(id) = path.strip_prefix("/s/") {
+        return valid_session_segment(id).then(|| {
+            (
+                Route::Shell {
+                    session_id: id.to_string(),
+                },
+                RouteAuth::QueryToken,
+                false,
+            )
+        });
+    }
+
+    let (id, tail) = path.strip_prefix("/api/sessions/")?.split_once('/')?;
+    (tail == "messages" && valid_session_segment(id)).then(|| {
+        (
+            Route::SessionMessages {
+                session_id: id.to_string(),
+            },
+            RouteAuth::HeaderToken,
+            false,
+        )
+    })
 }
 
 /// A session id is a UUID our own store minted: hex and hyphens, bounded.
