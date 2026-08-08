@@ -1,0 +1,32 @@
+# Dependency updates.
+#
+# Weekly rather than daily: this is a small project with one maintainer, and
+# a PR queue nobody reads is worse than no PRs. Security updates are the
+# exception and arrive as they are found (enabled in the repository's
+# security settings, not here).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the routine patch churn; anything major still comes
+      # alone, where it can be read properly.
+      patches:
+        update-types: ["patch"]
+
+  # The web console's bundle is committed, so a dependency bump here is only
+  # real once `scripts/build-web.sh` has been re-run — see CONTRIBUTING.md.
+  - package-ecosystem: npm
+    directory: "/web"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  # The workflows pin actions by tag, and a tag can be moved under you.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
