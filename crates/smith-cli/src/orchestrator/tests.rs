@@ -792,3 +792,27 @@ async fn a_turn_persists_its_cost_and_a_resumed_run_starts_from_it() {
     assert_eq!(reader.turn_totals(&session_id).unwrap(), totals);
     resumed.abort();
 }
+
+/// Regression: every session in the wild was called `local-<pid>`.
+///
+/// `setup::wire` allocates the id before the first turn (the scratch
+/// directory needs one) and hands it to `Persistence`, which then
+/// `ensure_session`s *that* id — so `create_session`, the only thing that
+/// minted a UUID, was never reached. Pids are recycled, so two unrelated
+/// conversations could be filed under one row and have their histories
+/// merged into each other.
+#[test]
+fn a_new_session_id_is_a_uuid_and_not_the_process_id() {
+    let id = super::new_session_id();
+    assert!(
+        !id.starts_with("local-"),
+        "a new session must not be named after the process: {id}"
+    );
+    assert_eq!(id.len(), 36, "v4 uuid, hyphens included: {id}");
+    assert_ne!(id, super::new_session_id(), "two runs must not collide");
+
+    // The pid-derived id survives for the one case it is right for: the
+    // store refused to mint anything, so there is nothing to be unique
+    // against and the id only has to name this process's scratch directory.
+    assert!(super::uuid_fallback().starts_with("local-"));
+}

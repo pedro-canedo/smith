@@ -34,7 +34,7 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
     // lazy row creation — `ensure_session_id` reuses this id and only
     // touches the database when something is actually persisted.
     if web_enabled && startup.session_id.is_none() {
-        startup.session_id = Some(uuid::Uuid::new_v4().to_string());
+        startup.session_id = Some(orchestrator::new_session_id());
     }
 
     let commands = std::mem::take(&mut startup.commands);
@@ -129,7 +129,7 @@ pub(crate) async fn run_tui(cli: Cli, logs: smith_tui::LogBuffer) -> ExitCode {
         let session_id = startup
             .session_id
             .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(orchestrator::new_session_id);
         let tee = webconsole::state::Tee::new(
             session_id.clone(),
             startup.provider_kind.label().to_string(),

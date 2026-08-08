@@ -29,6 +29,25 @@ const DEFAULT_LOOP_MAX_ITERATIONS: u32 = 25;
 /// Ceiling an explicit `/loop <N>` count is clamped to, for the same reason.
 const HARD_LOOP_MAX_ITERATIONS: u32 = 100;
 
+/// The id a new session is filed under.
+///
+/// A v4 UUID, the same shape `SessionStore::create_session` mints, because
+/// this — not that — is what a fresh session actually ends up called: the
+/// orchestrator allocates an id before the first turn (the scratch directory
+/// needs one) and hands it to `Persistence`, which then `ensure_session`s
+/// that id rather than creating a new row.
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// The id used when the store itself refuses to mint one.
+///
+/// Process-derived on purpose: at that point the database is unreachable, so
+/// there is nothing to be unique *against* — the id only has to name this
+/// process's scratch directory. It must never be the ordinary path, and was:
+/// every session in the wild is called `local-<pid>`, and pids are recycled,
+/// so two unrelated conversations could be filed under one row and have their
+/// histories merged.
 pub fn uuid_fallback() -> String {
     format!("local-{}", std::process::id())
 }

@@ -21,8 +21,8 @@ use tokio::sync::{mpsc, Mutex};
 use crate::prompts::{context_provider, system_prompt_with};
 
 use super::{
-    build_provider_stack, hook_set, register_mcp_tools, retry_policy_for_chain, secret_redactor,
-    start_mcp_connections, uuid_fallback, web_search_settings, OrchestratorOptions,
+    build_provider_stack, hook_set, new_session_id, register_mcp_tools, retry_policy_for_chain,
+    secret_redactor, start_mcp_connections, web_search_settings, OrchestratorOptions,
     OrchestratorState, ProviderKind,
 };
 
@@ -143,11 +143,14 @@ pub(super) async fn wire(
     }
 
     // Allocate a stable session id up front for staging (and reuse a resumed
-    // id). The DB row is still created lazily on first persist via ensure_session.
+    // id). The DB row is still created lazily on first persist via
+    // ensure_session — which is why this must be a real id and not a
+    // placeholder: `ensure_session` files the session under whatever it is
+    // handed, so this *is* the session's permanent name.
     let session_id = persistence
         .as_ref()
         .and_then(|p| p.session_id.clone())
-        .unwrap_or_else(uuid_fallback);
+        .unwrap_or_else(new_session_id);
     if let Some(p) = persistence.as_mut() {
         if p.session_id.is_none() {
             p.session_id = Some(session_id.clone());
