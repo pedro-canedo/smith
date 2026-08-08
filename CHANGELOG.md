@@ -2,6 +2,37 @@
 
 All notable user-facing changes are tracked here.
 
+## Unreleased
+
+### Fixed
+
+- **The context gauge told the truth on a gateway.** Every 9Router session
+  reported a 32,768-token window whatever it was talking to: the catalogue
+  warm covered OpenRouter and Ollama and skipped the gateway. It now reads
+  the gateway's own `/v1/models` (`capabilities.contextWindow`) and resolves
+  a model named the way its vendor names it — `nvidia/nemotron-…` — through
+  the single catalogue entry that serves it. The gauge was the visible half;
+  the expensive half was auto-compaction firing at a fraction of a window
+  four times larger than smith believed, summarising conversations that
+  still fit.
+
+- **New sessions are named with a UUID, not the process id.** Every session
+  was filed under `local-<pid>`: the id is allocated before the first turn
+  (the scratch directory needs one) and `ensure_session` files the session
+  under whatever it was handed, so `create_session` — the only thing that
+  minted a UUID — was never reached. Pids are recycled, so two unrelated
+  conversations could land in one row and have their histories merged.
+  Existing `local-*` sessions keep resuming.
+
+- **The sidebar sits on the terminal's edge again**, instead of riding inside
+  the centred column with a field of empty cells to its right, and the
+  document column now grows with the terminal (up to 160 columns) rather than
+  holding a hundred while a full-screen window goes to waste.
+
+- **The splash's box closes.** One row of the banner art carried a stray
+  space past its right border, and a centred paragraph centres each row by
+  its own width — so that row sat a cell off and broke the frame.
+
 ## 0.3.1 — 2026-08-07
 
 ### Added
